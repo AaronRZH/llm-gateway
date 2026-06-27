@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  gateway:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - GATEWAY_ENV=production
+    volumes:
+      - ./config.yaml:/root/config.yaml
+    depends_on:
+      - redis
+    networks:
+      - gateway-net
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - gateway-net
+
+networks:
+  gateway-net:
+    driver: bridge

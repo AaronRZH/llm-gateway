@@ -1,0 +1,39 @@
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+/build/
+/bin/
+/dist/
+
+# Go
+*.test
+*.out
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config (local)
+configs/config.local.yaml
+configs/*.local.yaml
+
+# Logs
+*.log
+logs/
+
+# Environment
+.env
+.env.local
+
+# Air (live reload)
+tmp/

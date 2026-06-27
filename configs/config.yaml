@@ -1,0 +1,132 @@
+app:
+  name: "llm-gateway"
+  version: "1.0.0"
+  env: "dev"  # dev | prod
+  port: 8080
+
+log:
+  level: "info"  # debug | info | warn | error
+  format: "json" # json | console
+  output: "stdout" # stdout | file path
+
+# Redis 配置
+redis:
+  addr: "localhost:6379"
+  password: ""
+  db: 0
+  pool_size: 10
+  dial_timeout: 5s
+  read_timeout: 3s
+  write_timeout: 3s
+
+# 模型名映射
+model_mapping:
+  # 对外暴露名 -> 内部真实模型
+  virtual_to_real:
+    "gpt-4":
+      real: "openai/gpt-4o-2024-11-20"
+      aliases: ["gpt-4o"]
+    "gpt-4-mini":
+      real: "openai/gpt-4o-mini-2024-07-18"
+      aliases: ["gpt-4o-mini"]
+    "claude":
+      real: "anthropic/claude-3-5-sonnet-20241022"
+      aliases: ["claude-sonnet"]
+    "deepseek":
+      real: "deepseek/deepseek-chat"
+      aliases: ["deepseek-v3"]
+
+  # 反向映射（响应重写用）
+  real_to_virtual:
+    "openai/gpt-4o-2024-11-20": "gpt-4"
+    "openai/gpt-4o-mini-2024-07-18": "gpt-4-mini"
+    "anthropic/claude-3-5-sonnet-20241022": "claude"
+    "deepseek/deepseek-chat": "deepseek"
+
+# 模型组 & 自动切换策略
+model_groups:
+  "smart-chat":
+    strategy: "priority"  # priority | round_robin | latency_optimized | cost_optimized
+    fallback_chain:
+      - provider: "openai"
+        model: "gpt-4o-2024-11-20"
+        weight: 70
+        timeout: 30s
+        retry: 2
+      - provider: "anthropic"
+        model: "claude-3-5-sonnet-20241022"
+        weight: 30
+        timeout: 30s
+        retry: 1
+      - provider: "deepseek"
+        model: "deepseek-chat"
+        weight: 0
+        timeout: 60s
+        retry: 1
+
+  "fast-chat":
+    strategy: "latency_optimized"
+    fallback_chain:
+      - provider: "openai"
+        model: "gpt-4o-mini-2024-07-18"
+        weight: 50
+        timeout: 15s
+      - provider: "deepseek"
+        model: "deepseek-chat"
+        weight: 50
+        timeout: 20s
+
+# 熔断器配置
+circuit_breaker:
+  max_requests: 3        # 半开状态允许试探请求数
+  interval: 10s          # 统计周期
+  timeout: 5s            # 请求超时
+  failure_threshold: 5   # 连续失败次数触发熔断
+  cooldown: 30s          # 熔断后冷却时间
+
+# 限流配置
+rate_limit:
+  enabled: true
+  requests_per_second: 100
+  burst: 150
+
+# Provider 配置（API Keys 建议通过环境变量注入）
+providers:
+  openai:
+    base_url: "https://api.openai.com/v1"
+    api_key: "${OPENAI_API_KEY}"
+    timeout: 30s
+  anthropic:
+    base_url: "https://api.anthropic.com/v1"
+    api_key: "${ANTHROPIC_API_KEY}"
+    timeout: 30s
+  deepseek:
+    base_url: "https://api.deepseek.com/v1"
+    api_key: "${DEEPSEEK_API_KEY}"
+    timeout: 60s
+
+# Token 计算
+token:
+  # 本地估算模型映射
+  tokenizer_mapping:
+    "gpt-4o-2024-11-20": "cl100k_base"
+    "gpt-4o-mini-2024-07-18": "cl100k_base"
+    "claude-3-5-sonnet-20241022": "claude"
+    "deepseek-chat": "deepseek"
+
+  # 官网同步配置
+  official_sync:
+    enabled: true
+    interval: 5m
+    batch_size: 100
+
+# 监控
+metrics:
+  enabled: true
+  path: "/metrics"
+  port: 9090
+
+# 健康检查
+health:
+  enabled: true
+  path: "/health"

@@ -1,0 +1,13 @@
+app:
+  env: "prod"
+  port: 8080
+
+log:
+  level: "warn"
+
+redis:
+  addr: "redis:6379"
+
+rate_limit:
+  requests_per_second: 1000
+  burst: 1500

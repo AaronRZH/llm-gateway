@@ -1,0 +1,100 @@
+# LLM Gateway 配置文件
+
+# 服务配置
+server:
+  port: 8080
+  mode: "release"  # debug | release | test
+  read_timeout: 30s
+  write_timeout: 30s
+
+# 日志配置
+log:
+  level: "info"    # debug | info | warn | error
+  format: "json"   # json | console
+
+# Redis 配置
+redis:
+  addr: "localhost:6379"
+  password: ""
+  db: 0
+  pool_size: 10
+
+# 模型映射配置
+model_mapping:
+  # 对外暴露名 -> 内部真实模型标识
+  virtual_to_real:
+    "gpt-4":
+      real: "openai/gpt-4o-2024-11-20"
+      provider: "openai"
+    "gpt-4-mini":
+      real: "openai/gpt-4o-mini-2024-07-18"
+      provider: "openai"
+    "claude":
+      real: "anthropic/claude-3-5-sonnet-20241022"
+      provider: "anthropic"
+    "deepseek":
+      real: "deepseek/deepseek-chat"
+      provider: "deepseek"
+
+  # 反向映射
+  real_to_virtual:
+    "openai/gpt-4o-2024-11-20": "gpt-4"
+    "openai/gpt-4o-mini-2024-07-18": "gpt-4-mini"
+    "anthropic/claude-3-5-sonnet-20241022": "claude"
+    "deepseek/deepseek-chat": "deepseek"
+
+# 模型组与自动切换配置
+model_groups:
+  "smart-chat":
+    strategy: "priority"
+    fallback_chain:
+      - provider: "openai"
+        model: "gpt-4o-2024-11-20"
+        timeout: 30s
+        retry: 2
+      - provider: "anthropic"
+        model: "claude-3-5-sonnet-20241022"
+        timeout: 30s
+        retry: 1
+      - provider: "deepseek"
+        model: "deepseek-chat"
+        timeout: 60s
+        retry: 1
+
+  "fast-chat":
+    strategy: "round_robin"
+    models:
+      - provider: "openai"
+        model: "gpt-4o-mini-2024-07-18"
+      - provider: "deepseek"
+        model: "deepseek-chat"
+
+# Provider 配置
+providers:
+  openai:
+    base_url: "https://api.openai.com/v1"
+    api_key: "${OPENAI_API_KEY}"
+    timeout: 30s
+  anthropic:
+    base_url: "https://api.anthropic.com/v1"
+    api_key: "${ANTHROPIC_API_KEY}"
+    timeout: 30s
+  deepseek:
+    base_url: "https://api.deepseek.com/v1"
+    api_key: "${DEEPSEEK_API_KEY}"
+    timeout: 60s
+
+# 限流配置
+rate_limit:
+  enabled: true
+  rps: 10           # 每秒请求数
+  burst: 20         # 突发容量
+
+# 熔断配置
+circuit_breaker:
+  enabled: true
+  max_requests: 3
+  interval: 10s
+  timeout: 5s
+  failure_ratio: 0.6
+  consecutive_failures: 5
