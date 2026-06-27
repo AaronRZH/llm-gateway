@@ -22,6 +22,7 @@ type Config struct {
 	Token           TokenConfig           `mapstructure:"token"`
 	Metrics         MetricsConfig         `mapstructure:"metrics"`
 	Health          HealthConfig          `mapstructure:"health"`
+	APIKeys          []APIKeyConfig        `mapstructure:"api_keys"`
 }
 
 type AppConfig struct {
@@ -110,6 +111,11 @@ type MetricsConfig struct {
 type HealthConfig struct {
 	Enabled bool   `mapstructure:"enabled"`
 	Path    string `mapstructure:"path"`
+}
+
+type APIKeyConfig struct {
+	Key  string `mapstructure:"key"`
+	Name string `mapstructure:"name"`
 }
 
 // Load 加载配置

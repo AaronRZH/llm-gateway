@@ -3,6 +3,7 @@ package stream
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"io"
 	"net/http"
 
@@ -21,14 +22,21 @@ func New(mapper *mapper.Service) *Handler {
 	return &Handler{mapper: mapper}
 }
 
-// RewriteAndForward 重写并转发 SSE 流
-func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadCloser, virtualModel string) {
+// StreamResult 流式处理结果
+type StreamResult struct {
+	// AccumulatedContent 累计的响应内容文本（用于估算输出 token）
+	AccumulatedContent string
+}
+
+// RewriteAndForward 重写并转发 SSE 流，返回累计的响应内容
+func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadCloser, virtualModel string) *StreamResult {
 	defer upstream.Close()
 
+	result := &StreamResult{}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		log.Error().Msg("response writer does not support flushing")
-		return
+		return result
 	}
 
 	scanner := bufio.NewScanner(upstream)
@@ -44,9 +52,19 @@ func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadClose
 			continue
 		}
 
-		// 重写 data: 行中的 model 字段
+		// 重写 data: 行中的 model 字段，同时累计 content
 		if bytes.HasPrefix(line, []byte("data: ")) {
 			payload := line[6:] // 去掉 "data: " 前缀
+
+			// 忽略 [DONE] 标记
+			if bytes.Equal(payload, []byte("[DONE]")) {
+				w.Write([]byte("data: [DONE]\n"))
+				flusher.Flush()
+				continue
+			}
+
+			// 从 JSON 中提取 delta.content 用于累计
+			result.AccumulatedContent += extractContent(payload)
 
 			// 替换 model 字段
 			rewritten := h.rewriteModelField(payload, virtualModel)
@@ -65,6 +83,26 @@ func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadClose
 	if err := scanner.Err(); err != nil {
 		log.Error().Err(err).Msg("stream scan error")
 	}
+
+	return result
+}
+
+// extractContent 从 SSE chunk JSON 中提取 delta.content
+func extractContent(payload []byte) string {
+	var chunk struct {
+		Choices []struct {
+			Delta struct {
+				Content string `json:"content"`
+			} `json:"delta"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(payload, &chunk); err != nil {
+		return ""
+	}
+	if len(chunk.Choices) > 0 {
+		return chunk.Choices[0].Delta.Content
+	}
+	return ""
 }
 
 // rewriteModelField 重写 JSON 中的 model 字段

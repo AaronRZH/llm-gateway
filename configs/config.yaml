@@ -1,11 +1,11 @@
 app:
   name: "llm-gateway"
   version: "1.0.0"
-  env: "dev"  # dev | prod
+  env: "dev" # dev | prod
   port: 8080
 
 log:
-  level: "info"  # debug | info | warn | error
+  level: "info" # debug | info | warn | error
   format: "json" # json | console
   output: "stdout" # stdout | file path
 
@@ -46,7 +46,7 @@ model_mapping:
 # 模型组 & 自动切换策略
 model_groups:
   "smart-chat":
-    strategy: "priority"  # priority | round_robin | latency_optimized | cost_optimized
+    strategy: "priority" # priority | round_robin | latency_optimized | cost_optimized
     fallback_chain:
       - provider: "openai"
         model: "gpt-4o-2024-11-20"
@@ -78,11 +78,11 @@ model_groups:
 
 # 熔断器配置
 circuit_breaker:
-  max_requests: 3        # 半开状态允许试探请求数
-  interval: 10s          # 统计周期
-  timeout: 5s            # 请求超时
-  failure_threshold: 5   # 连续失败次数触发熔断
-  cooldown: 30s          # 熔断后冷却时间
+  max_requests: 3 # 半开状态允许试探请求数
+  interval: 10s # 统计周期
+  timeout: 5s # 请求超时
+  failure_threshold: 5 # 连续失败次数触发熔断
+  cooldown: 30s # 熔断后冷却时间
 
 # 限流配置
 rate_limit:
@@ -101,7 +101,7 @@ providers:
     api_key: "${ANTHROPIC_API_KEY}"
     timeout: 30s
   deepseek:
-    base_url: "https://api.deepseek.com/v1"
+    base_url: "https://api.deepseek.com/"
     api_key: "${DEEPSEEK_API_KEY}"
     timeout: 60s
 
@@ -130,3 +130,11 @@ metrics:
 health:
   enabled: true
   path: "/health"
+
+# API Key 配置（种子 Key，自动同步到 Redis）
+# 生产环境建议通过 Redis 动态管理
+api_keys:
+  - key: "sk-gateway-dev-key-001"
+    name: "dev-client-1"
+  - key: "sk-gateway-dev-key-002"
+    name: "dev-client-2"

@@ -13,12 +13,14 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
+	"llm-gateway/internal/auth"
 	"llm-gateway/internal/config"
 	"llm-gateway/internal/health"
 	"llm-gateway/internal/mapper"
 	"llm-gateway/internal/metrics"
 	"llm-gateway/internal/middleware"
 	"llm-gateway/internal/provider"
+	redisutil "llm-gateway/pkg/redis"
 	"llm-gateway/internal/router"
 	"llm-gateway/internal/stream"
 	"llm-gateway/internal/token"
@@ -47,6 +49,24 @@ func main() {
 	routerService := router.New(cfg.ModelGroups, providerManager, mapperService, tokenService)
 	streamHandler := stream.New(mapperService)
 
+	// 初始化 Redis 客户端
+	redisClient, err := redisutil.New(redisutil.Config{
+		Addr:         cfg.Redis.Addr,
+		Password:     cfg.Redis.Password,
+		DB:           cfg.Redis.DB,
+		PoolSize:     cfg.Redis.PoolSize,
+		DialTimeout:  cfg.Redis.DialTimeout,
+		ReadTimeout:  cfg.Redis.ReadTimeout,
+		WriteTimeout: cfg.Redis.WriteTimeout,
+	})
+	if err != nil {
+		log.Warn().Err(err).Msg("redis connection failed, api key validation will use seed keys only")
+	}
+
+	// 初始化认证服务（加载种子 Key）
+	seedKeys := buildSeedKeys(cfg.APIKeys)
+	authService := auth.New(redisClient, seedKeys)
+
 	// 创建 Gin 引擎
 	if cfg.App.Env == "prod" {
 		gin.SetMode(gin.ReleaseMode)
@@ -58,6 +78,7 @@ func main() {
 	r.Use(middleware.Recovery())
 	r.Use(middleware.CORS())
 	r.Use(middleware.RateLimit(cfg.RateLimit))
+	r.Use(middleware.Auth(authService))
 
 	// 健康检查
 	r.GET(cfg.Health.Path, health.Handler())
@@ -103,6 +124,13 @@ func main() {
 		log.Error().Err(err).Msg("server forced to shutdown")
 	}
 
+	// 关闭 Redis 连接
+	if redisClient != nil {
+		if err := redisClient.Close(); err != nil {
+			log.Error().Err(err).Msg("redis close failed")
+		}
+	}
+
 	log.Info().Msg("server exited")
 }
 
@@ -118,4 +146,15 @@ func setupLogger(cfg *config.Config) {
 	} else {
 		log.Logger = zerolog.New(os.Stderr).With().Timestamp().Logger()
 	}
+}
+
+func buildSeedKeys(apiKeys []config.APIKeyConfig) map[string]*auth.KeyInfo {
+	seedKeys := make(map[string]*auth.KeyInfo, len(apiKeys))
+	for _, k := range apiKeys {
+		seedKeys[k.Key] = &auth.KeyInfo{
+			Key:   k.Key,
+			Name:  k.Name,
+		}
+	}
+	return seedKeys
 }

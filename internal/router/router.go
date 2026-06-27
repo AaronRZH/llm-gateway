@@ -29,10 +29,11 @@ type Service struct {
 
 // Target 路由目标
 type Target struct {
-	Provider provider.Provider
-	Model    string
-	Timeout  time.Duration
-	Retry    int
+	Provider     provider.Provider
+	ProviderName string
+	Model        string
+	Timeout      time.Duration
+	Retry        int
 }
 
 // New 创建路由服务
@@ -98,10 +99,11 @@ func (s *Service) selectFromGroup(ctx context.Context, groupName string, group c
 				continue
 			}
 			return &Target{
-				Provider: p,
-				Model:    item.Model,
-				Timeout:  item.Timeout,
-				Retry:    item.Retry,
+				Provider:     p,
+				ProviderName: item.Provider,
+				Model:        item.Model,
+				Timeout:      item.Timeout,
+				Retry:        item.Retry,
 			}, nil
 		}
 
@@ -128,8 +130,9 @@ func (s *Service) directRoute(ctx context.Context, virtualModel string) (*Target
 	}
 
 	return &Target{
-		Provider: p,
-		Model:    mapped.RealModel,
+		Provider:     p,
+		ProviderName: mapped.Provider,
+		Model:        mapped.RealModel,
 	}, nil
 }
 

@@ -1,9 +1,8 @@
 package token
 
 import (
-	"context"
-	"fmt"
 	"sync"
+	"time"
 
 	"github.com/pkoukk/tiktoken-go"
 	"github.com/rs/zerolog/log"
@@ -17,18 +16,25 @@ type Service struct {
 	encoders  map[string]*tiktoken.Tiktoken
 	mapping   map[string]string // model -> tokenizer name
 	syncQueue chan UsageRecord
+
+	// 校准统计
+	totalEstimates int64
+	totalReal      int64
+	calibrated     bool
 }
 
-// UsageRecord 用量记录
+// UsageRecord 用量记录（包含估算值和上游返回的真实值）
 type UsageRecord struct {
-	RequestID    string
-	Model        string
-	VirtualModel string
-	InputTokens  int
-	OutputTokens int
-	TotalTokens  int
-	Provider     string
-	Timestamp    int64
+	RequestID           string
+	Model               string
+	VirtualModel        string
+	EstimatedInput      int // 本地 tiktoken 估算输入
+	EstimatedOutput     int // 本地 tiktoken 估算输出
+	RealInput           int // 上游 API 返回的 prompt_tokens
+	RealOutput          int // 上游 API 返回的 completion_tokens
+	RealTotal           int // 上游 API 返回的 total_tokens
+	Provider            string
+	Timestamp           int64
 }
 
 // New 创建 Token 服务
@@ -49,7 +55,7 @@ func New(cfg config.TokenConfig) *Service {
 		s.encoders[model] = enc
 	}
 
-	// 启动后台同步 worker
+	// 启动后台 worker：记录用量并校准估算偏差
 	go s.syncWorker()
 
 	return s
@@ -97,14 +103,22 @@ func (s *Service) EstimateOutput(text string, model string) int {
 	return len(enc.EncodeOrdinary(text))
 }
 
-// RecordUsage 记录用量（异步）
-func (s *Service) RecordUsage(requestID, model string, inputTokens, outputTokens int) {
+// RecordUsage 记录用量（异步），包含估算值和上游真实值
+func (s *Service) RecordUsage(requestID, model, virtualModel, provider string,
+	estimatedInput, estimatedOutput int,
+	realInput, realOutput, realTotal int) {
+
 	record := UsageRecord{
-		RequestID:    requestID,
-		Model:        model,
-		InputTokens:  inputTokens,
-		OutputTokens: outputTokens,
-		TotalTokens:  inputTokens + outputTokens,
+		RequestID:       requestID,
+		Model:           model,
+		VirtualModel:    virtualModel,
+		EstimatedInput:  estimatedInput,
+		EstimatedOutput: estimatedOutput,
+		RealInput:       realInput,
+		RealOutput:      realOutput,
+		RealTotal:       realTotal,
+		Provider:        provider,
+		Timestamp:       time.Now().Unix(),
 	}
 
 	select {
@@ -114,21 +128,61 @@ func (s *Service) RecordUsage(requestID, model string, inputTokens, outputTokens
 	}
 }
 
-// syncWorker 后台同步官网用量
+// syncWorker 后台处理用量记录：持久化日志 + 估算校准
 func (s *Service) syncWorker() {
 	for record := range s.syncQueue {
-		// TODO: 调用各平台官方 Usage API 同步真实数据
-		// 1. 查询官方 API 获取精确用量
-		// 2. 对比本地估算 vs 官方数据
-		// 3. 校准偏差系数
-
-		log.Debug().
+		// 1. 记录结构化日志（可接入日志采集系统做后续分析）
+		logEvent := log.Info().
 			Str("request_id", record.RequestID).
 			Str("model", record.Model).
-			Int("estimated_input", record.InputTokens).
-			Int("estimated_output", record.OutputTokens).
-			Msg("usage recorded")
+			Str("virtual_model", record.VirtualModel).
+			Str("provider", record.Provider).
+			Int("estimated_input", record.EstimatedInput).
+			Int("estimated_output", record.EstimatedOutput)
+
+		if record.RealTotal > 0 {
+			// 有上游真实用量，记录并与估算对比
+			logEvent.
+				Int("real_input", record.RealInput).
+				Int("real_output", record.RealOutput).
+				Int("real_total", record.RealTotal).
+				Float64("estimation_error_pct", calcErrorPct(
+					record.EstimatedInput+record.EstimatedOutput,
+					record.RealTotal,
+				)).
+				Msg("usage recorded (with real data)")
+
+			// 累计校准统计
+			s.mu.Lock()
+			s.totalEstimates += int64(record.EstimatedInput + record.EstimatedOutput)
+			s.totalReal += int64(record.RealTotal)
+			s.calibrated = true
+			s.mu.Unlock()
+		} else {
+			// 仅估算值（流式场景或上游未返回 usage）
+			logEvent.
+				Int("estimated_total", record.EstimatedInput+record.EstimatedOutput).
+				Msg("usage recorded (estimated only)")
+		}
 	}
+}
+
+// CalibrationRatio 返回估算/真实用量的累计比例
+// 返回值 > 1 表示估算偏高，< 1 表示估算偏低
+func (s *Service) CalibrationRatio() float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.calibrated || s.totalReal == 0 {
+		return 1.0
+	}
+	return float64(s.totalEstimates) / float64(s.totalReal)
+}
+
+func calcErrorPct(estimated, real int) float64 {
+	if real == 0 {
+		return 0
+	}
+	return float64(estimated-real) * 100.0 / float64(real)
 }
 
 // roughEstimate 粗略估算（fallback）
@@ -148,11 +202,20 @@ type Message struct {
 	Content string `json:"content"`
 }
 
-// SyncOfficialUsage 从官网同步用量（供外部调用）
-func (s *Service) SyncOfficialUsage(ctx context.Context, provider, requestID string) error {
-	// TODO: 实现各平台官方用量查询
-	// OpenAI: GET /v1/usage
-	// Anthropic: 控制台 API
-	// DeepSeek: 官方用量接口
-	return fmt.Errorf("not implemented: sync official usage for %s", provider)
+// CalibrationInfo 返回当前估算校准信息
+func (s *Service) CalibrationInfo() map[string]any {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return map[string]any{
+		"calibrated":       s.calibrated,
+		"total_estimated":  s.totalEstimates,
+		"total_real":       s.totalReal,
+		"calibration_ratio": func() float64 {
+			if !s.calibrated || s.totalReal == 0 {
+				return 1.0
+			}
+			return float64(s.totalEstimates) / float64(s.totalReal)
+		}(),
+	}
 }
+

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 
@@ -113,6 +114,11 @@ func handleChatCompletion(
 
 		// 4. 请求上游
 		upstreamModel := target.Model
+		targetProvider := target.ProviderName
+		if targetProvider == "" {
+			targetProvider = providerName
+		}
+
 		if req.Stream {
 			// 流式响应
 			c.Header("Content-Type", "text/event-stream")
@@ -127,7 +133,12 @@ func handleChatCompletion(
 			}
 			defer upstream.Close()
 
-			streamHandler.RewriteAndForward(c.Writer, upstream, req.Model)
+			result := streamHandler.RewriteAndForward(c.Writer, upstream, req.Model)
+
+			// 5. 流式：根据累计内容估算输出 token，异步记录用量
+			estimatedOutput := tokenService.EstimateOutput(result.AccumulatedContent, realModel)
+			go tokenService.RecordUsage(reqID, realModel, req.Model, targetProvider,
+				inputTokens, estimatedOutput, 0, 0, 0)
 		} else {
 			// 非流式响应
 			resp, err := target.Provider.Chat(c.Request.Context(), upstreamModel, toProviderMessages(req.Messages))
@@ -139,13 +150,16 @@ func handleChatCompletion(
 			defer resp.Body.Close()
 
 			body, _ := io.ReadAll(resp.Body)
-			// 重写响应中的 model 字段
+
+			// 5. 解析上游返回的真实 usage，异步记录用量
+			realInput, realOutput, realTotal := parseUsage(body)
+			go tokenService.RecordUsage(reqID, realModel, req.Model, targetProvider,
+				inputTokens, 0, realInput, realOutput, realTotal)
+
+			// 6. 重写响应中的 model 字段
 			body = mapper.RewriteResponse(body, req.Model)
 			c.Data(resp.StatusCode, "application/json", body)
 		}
-
-		// 5. 异步记录用量（后续接入官网同步）
-		go tokenService.RecordUsage(reqID, req.Model, inputTokens, 0)
 	}
 }
 
@@ -184,4 +198,13 @@ func toTokenMessages(msgs []Message) []token.Message {
 		out[i] = token.Message{Role: m.Role, Content: m.Content}
 	}
 	return out
+}
+
+// parseUsage 从 OpenAI 兼容响应 JSON 中提取 usage 字段
+func parseUsage(body []byte) (promptTokens, completionTokens, totalTokens int) {
+	var resp ChatCompletionResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return 0, 0, 0
+	}
+	return resp.Usage.PromptTokens, resp.Usage.CompletionTokens, resp.Usage.TotalTokens
 }
