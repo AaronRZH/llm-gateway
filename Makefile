@@ -1,8 +1,9 @@
-.PHONY: build run test clean docker
+.PHONY: build run test clean docker docker-run docker-down docker-up-redis
 
 APP_NAME := llm-gateway
 BUILD_DIR := ./build
 GO_FILES := $(shell find . -name '*.go' -not -path './vendor/*')
+DOCKER_COMPOSE := docker-compose -f deployments/docker/docker-compose.yml
 
 build:
 	@mkdir -p $(BUILD_DIR)
@@ -24,10 +25,13 @@ docker:
 	docker build -t $(APP_NAME):latest -f deployments/docker/Dockerfile .
 
 docker-run:
-	docker-compose -f deployments/docker/docker-compose.yml up -d
+	$(DOCKER_COMPOSE) up -d
 
 docker-down:
-	docker-compose -f deployments/docker/docker-compose.yml down
+	$(DOCKER_COMPOSE) down
+
+docker-up-redis:
+	$(DOCKER_COMPOSE) up -d redis
 
 fmt:
 	go fmt ./...

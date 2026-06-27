@@ -18,8 +18,8 @@
 # 1. 安装依赖
 go mod download
 
-# 2. 启动 Redis (本地开发)
-docker-compose -f deployments/docker/docker-compose.yml up -d redis
+# 2. 启动 Redis（本地开发）
+make docker-up-redis
 
 # 3. 运行
 make run
@@ -29,6 +29,22 @@ curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer sk-test" \
   -d '{"model":"gpt-4","messages":[{"role":"user","content":"hello"}]}'
+```
+
+## Docker 部署
+
+所有 Docker 相关文件统一放在 `deployments/docker/`：
+
+```bash
+# 构建镜像
+make docker
+
+# 启动完整栈（gateway + redis + prometheus）
+export OPENAI_API_KEY=your-key
+make docker-run
+
+# 停止
+make docker-down
 ```
 
 ## 项目结构
@@ -52,6 +68,8 @@ llm-gateway/
 │   └── ratelimit/        # 限流器
 ├── configs/              # 配置文件
 ├── deployments/          # 部署配置
+│   ├── docker/           # Docker Compose & Dockerfile
+│   └── k8s/              # Kubernetes 清单
 └── api/                  # API 定义
 ```
 
