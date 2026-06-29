@@ -7,19 +7,27 @@ import (
 	"github.com/sony/gobreaker"
 )
 
+// Settings 熔断器配置参数
+type Settings struct {
+	MaxRequests      uint32
+	Interval         time.Duration
+	Timeout          time.Duration
+	FailureThreshold int
+	Cooldown         time.Duration
+}
+
 // New 创建熔断器
-func New(name string, maxRequests uint32, failureThreshold int, cooldown time.Duration) *gobreaker.CircuitBreaker {
+func New(name string, s Settings) *gobreaker.CircuitBreaker {
 	return gobreaker.NewCircuitBreaker(gobreaker.Settings{
 		Name:        name,
-		MaxRequests: maxRequests,
-		Interval:    10 * time.Second,
-		Timeout:     5 * time.Second,
+		MaxRequests: s.MaxRequests,
+		Interval:    s.Interval,
+		Timeout:     s.Timeout,
 		ReadyToTrip: func(counts gobreaker.Counts) bool {
-			// 失败次数达到阈值即熔断
-			return counts.TotalFailures >= uint32(failureThreshold)
+			return counts.TotalFailures >= uint32(s.FailureThreshold)
 		},
 		OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
-			fmt.Printf("[Breaker] %s: %s -> %s", name, stateName(from), stateName(to))
+			fmt.Printf("[Breaker] %s: %s -> %s\n", name, stateName(from), stateName(to))
 		},
 	})
 }

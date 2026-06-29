@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -286,25 +287,56 @@ func handleAnthropicMessages(
 
 		// 判断是否是 Anthropic 类型的 provider
 		if ap, ok := target.Provider.(*provider.AnthropicProvider); ok {
-			anthropicReq := &provider.AnthropicRequest{
-				Model:         realModel,
-				Messages:      req.Messages,
-				System:        req.System,
-				MaxTokens:     req.MaxTokens,
-				Temperature:   req.Temperature,
-				TopP:          req.TopP,
-				StopSequences: req.StopSequences,
-				Tools:         req.Tools,
-				ToolChoice:    req.ToolChoice,
+			// 上游为 Anthropic 时，直接使用原始 Anthropic 格式消息发送，跳过格式转换
+			extraParams := map[string]interface{}{
+				"max_tokens": func() int { if req.MaxTokens > 0 { return req.MaxTokens }; return 4096 }(),
+			}
+			if req.Temperature > 0 {
+				extraParams["temperature"] = req.Temperature
+			}
+			if req.TopP > 0 {
+				extraParams["top_p"] = req.TopP
+			}
+			if len(req.StopSequences) > 0 {
+				extraParams["stop_sequences"] = req.StopSequences
+			}
+			if len(req.Tools) > 0 {
+				extraParams["tools"] = req.Tools
+			}
+			if req.ToolChoice != nil {
+				extraParams["tool_choice"] = req.ToolChoice
 			}
 
-			resp, err := ap.ChatWithRequest(c.Request.Context(), anthropicReq)
+			// 使用 target 的超时时间设置 context deadline（优先于 provider 默认超时）
+			reqCtx := c.Request.Context()
+			if target.Timeout > 0 {
+				var cancel context.CancelFunc
+				reqCtx, cancel = context.WithTimeout(reqCtx, target.Timeout)
+				defer cancel()
+			}
+
+			resp, err := ap.SendDirect(
+				reqCtx,
+				realModel,
+				req.Messages,
+				req.System,
+				extraParams,
+				false, // /messages 端点当前不支持流式
+			)
 			if err != nil {
 				log.Error().Err(err).Msg("anthropic upstream request failed")
 				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 				return
 			}
 			defer resp.Body.Close()
+
+			// 上游返回错误状态码时，直接转发错误 body
+			if resp.StatusCode >= 400 {
+				body, _ := io.ReadAll(resp.Body)
+				log.Error().Int("status", resp.StatusCode).RawJSON("body", body).Msg("anthropic upstream returned error")
+				c.Data(resp.StatusCode, "application/json", body)
+				return
+			}
 
 			// 记录延迟
 			if targetProvider != "" {

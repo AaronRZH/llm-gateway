@@ -6,10 +6,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/joho/godotenv"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
@@ -27,6 +29,17 @@ import (
 )
 
 func main() {
+	// 加载 .env 文件（优先配置文件所在目录的父目录，再回退到当前工作目录）
+	configDir := filepath.Dir("configs/config.yaml")
+	envFile := filepath.Join(configDir, "..", ".env")
+	if _, err := os.Stat(envFile); err == nil {
+		if err := godotenv.Load(envFile); err != nil {
+			log.Warn().Err(err).Msg("failed to load .env file")
+		}
+	} else if err := godotenv.Load(); err != nil {
+		log.Warn().Err(err).Msg("failed to load .env file, using system environment variables")
+	}
+
 	// 加载配置
 	cfg, err := config.Load("configs/config.yaml")
 	if err != nil {
@@ -46,7 +59,7 @@ func main() {
 	mapperService := mapper.New(cfg.ModelMapping)
 	tokenService := token.New(cfg.Token)
 	providerManager := provider.NewManager(cfg.Providers)
-	routerService := router.New(cfg.ModelGroups, providerManager, mapperService, tokenService)
+	routerService := router.New(cfg.ModelGroups, providerManager, mapperService, tokenService, cfg.CircuitBreaker)
 	streamHandler := stream.New(mapperService)
 
 	// 初始化 Redis 客户端

@@ -129,13 +129,103 @@ func (p *AnthropicProvider) convertTools(tools []Tool) []map[string]interface{} 
 	return converted
 }
 
+// contentToBlocks 将消息内容转换为 Anthropic content blocks 格式
+// 处理所有可能的输入类型：
+//   - string: 包装为 {type: "text", text: v}
+//   - []interface{}: 遍历每个元素，字符串元素转换为 text block，map 元素保留并验证必需字段
+//   - map[string]interface{}: 解包单个 map 对象，保留所有字段
+//   - 其他 (null, float64, bool): 转换为空文本块
+func (p *AnthropicProvider) contentToBlocks(content interface{}) []map[string]interface{} {
+	switch v := content.(type) {
+	case string:
+		return []map[string]interface{}{{"type": "text", "text": v}}
+	case []interface{}:
+		blocks := make([]map[string]interface{}, 0, len(v))
+		for _, block := range v {
+			switch b := block.(type) {
+			case map[string]interface{}:
+				// 对已知的 content block type，补充缺失的必需字段
+				if bt, ok := b["type"].(string); ok {
+					switch bt {
+					case "text":
+						if _, hasText := b["text"]; !hasText {
+							b["text"] = ""
+						}
+					case "image":
+						if _, hasSource := b["source"]; !hasSource {
+							b["source"] = nil
+						}
+					case "tool_use":
+						if _, hasID := b["id"]; !hasID {
+							b["id"] = ""
+						}
+						if _, hasName := b["name"]; !hasName {
+							b["name"] = ""
+						}
+						if _, hasInput := b["input"]; !hasInput {
+							b["input"] = map[string]interface{}{}
+						}
+					case "tool_result":
+						if _, hasToolID := b["tool_use_id"]; !hasToolID {
+							b["tool_use_id"] = ""
+						}
+						if _, hasContent := b["content"]; !hasContent {
+							b["content"] = ""
+						}
+					case "thinking":
+						if _, hasThinking := b["thinking"]; !hasThinking {
+							b["thinking"] = ""
+						}
+					case "document":
+						if _, hasSource := b["source"]; !hasSource {
+							b["source"] = nil
+						}
+					case "input_audio":
+						if _, hasAudio := b["input_audio"]; !hasAudio {
+							b["input_audio"] = nil
+						}
+					}
+				}
+				blocks = append(blocks, b)
+			case string:
+				// 数组中的字符串元素 → 转换为 text block
+				blocks = append(blocks, map[string]interface{}{"type": "text", "text": b})
+			case float64:
+				// 数字 → 转换为字符串表示
+				blocks = append(blocks, map[string]interface{}{"type": "text", "text": fmt.Sprintf("%v", b)})
+			case bool:
+				// 布尔值 → 转换为字符串表示
+				blocks = append(blocks, map[string]interface{}{"type": "text", "text": fmt.Sprintf("%v", b)})
+			case nil:
+				// null → 跳过（不添加到 blocks）
+				continue
+			default:
+				// 其他未知类型（嵌套数组等）→ 忽略
+				continue
+			}
+		}
+		// 如果 blocks 为空（原数组只有字符串等非 map 元素），返回一个空文本块
+		// 避免返回空数组导致 API 422
+		if len(blocks) == 0 {
+			return []map[string]interface{}{{"type": "text", "text": ""}}
+		}
+		return blocks
+	default:
+		// 单个 map 对象（不是数组）→ 解包返回，保留所有字段
+		if m, ok := content.(map[string]interface{}); ok {
+			return []map[string]interface{}{m}
+		}
+		return []map[string]interface{}{{"type": "text", "text": ""}}
+	}
+}
+
 // convertMessages 转换消息格式
 func (p *AnthropicProvider) convertMessages(messages []Message) []map[string]interface{} {
 	var result []map[string]interface{}
 	for _, msg := range messages {
 		result = append(result, map[string]interface{}{
 			"role":    msg.Role,
-			"content": msg.Content,
+			"content": p.contentToBlocks(msg.Content),
 		})
 	}
 	return result
@@ -210,7 +300,7 @@ func (p *AnthropicProvider) convertMessagesToOpenAI(messages []map[string]interf
 	if system != nil {
 		result = append(result, map[string]interface{}{
 			"role":    "system",
-			"content": system,
+			"content": p.contentToBlocks(system),
 		})
 	}
 
@@ -220,7 +310,7 @@ func (p *AnthropicProvider) convertMessagesToOpenAI(messages []map[string]interf
 		if role == "user" || role == "assistant" {
 			result = append(result, map[string]interface{}{
 				"role":    role,
-				"content": msg["content"],
+				"content": p.contentToBlocks(msg["content"]),
 			})
 		}
 	}
@@ -304,9 +394,13 @@ func (p *AnthropicProvider) ConvertResponse(resp *http.Response) ([]byte, error)
 		filteredContent := make([]map[string]interface{}, 0, len(content))
 		for _, block := range content {
 			if blockMap, ok := block.(map[string]interface{}); ok {
-				// 移除 proxy 特有的字段
-				delete(blockMap, "thinking")
-				delete(blockMap, "cache_control")
+				// 跳过 thinking 和 cache_control 整个块，而非仅删除字段
+				// 否则客户端解析到 {type: "thinking"} 会尝试访问 s.thinking.length → undefined
+				if blockType, ok := blockMap["type"].(string); ok {
+					if blockType == "thinking" || blockType == "cache_control" {
+						continue
+					}
+				}
 				filteredContent = append(filteredContent, blockMap)
 			}
 		}
@@ -375,8 +469,13 @@ func (p *AnthropicProvider) ConvertResponseWithModel(resp *http.Response, virtua
 		filteredContent := make([]map[string]interface{}, 0, len(content))
 		for _, block := range content {
 			if blockMap, ok := block.(map[string]interface{}); ok {
-				delete(blockMap, "thinking")
-				delete(blockMap, "cache_control")
+				// 跳过 thinking 和 cache_control 整个块，而非仅删除字段
+				// 否则客户端解析到 {type: "thinking"} 会尝试访问 s.thinking.length → undefined
+				if blockType, ok := blockMap["type"].(string); ok {
+					if blockType == "thinking" || blockType == "cache_control" {
+						continue
+					}
+				}
 				filteredContent = append(filteredContent, blockMap)
 			}
 		}
@@ -408,4 +507,79 @@ func (p *AnthropicProvider) ConvertResponseWithModel(resp *http.Response, virtua
 	}
 
 	return jsonBody, nil
+}
+
+// SendDirect 用已存在的 Anthropic 格式消息直接发送请求到上游，不做 Anthropic ↔ OpenAI 格式转换。
+// 会对每条消息的 content 做规范化处理（补全缺失的必需字段），避免 malformed content block 导致上游 422。
+// 适用于 Claude Code 等已使用 Anthropic 格式客户端 → Anthropic 上游的场景。
+func (p *AnthropicProvider) SendDirect(
+	ctx context.Context,
+	model string,
+	messages []map[string]interface{},
+	system interface{},
+	extraParams map[string]interface{},
+	stream bool,
+) (*http.Response, error) {
+	// 规范化每条消息的 content，确保 content block 格式正确
+	normalizedMessages := make([]map[string]interface{}, len(messages))
+	for i, msg := range messages {
+		normalized := make(map[string]interface{}, len(msg))
+		for k, v := range msg {
+			if k == "content" {
+				// 用 contentToBlocks 规范化 content，确保所有 block 格式有效
+				normalized[k] = p.contentToBlocks(v)
+			} else {
+				normalized[k] = v
+			}
+		}
+		normalizedMessages[i] = normalized
+	}
+
+	reqBody := map[string]interface{}{
+		"model":    model,
+		"messages": normalizedMessages,
+		"max_tokens": 4096,
+	}
+
+	if system != nil {
+		reqBody["system"] = system
+	}
+
+	// 从 extraParams 复制额外参数（temperature, top_p, stop_sequences, tools 等）
+	for k, v := range extraParams {
+		if v != nil {
+			reqBody[k] = v
+		}
+	}
+
+	if stream {
+		reqBody["stream"] = true
+	}
+
+	jsonBody, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, err
+	}
+
+	url := p.baseURL + "/messages"
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonBody))
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", p.apiKey)
+	req.Header.Set("anthropic-version", "2023-06-01")
+	if stream {
+		req.Header.Set("Accept", "text/event-stream")
+	}
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	// 上游返回错误状态码时，不直接 return，而是将 response 传给调用方处理
+	// 这样调用方可以读取 body 并转发给客户端，而不是丢失错误详情
+	return resp, nil
 }

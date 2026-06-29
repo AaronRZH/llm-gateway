@@ -52,6 +52,7 @@ func New(
 	pm *provider.Manager,
 	mapSvc *mapper.Service,
 	ts *token.Service,
+	cbCfg config.CircuitBreakerConfig,
 ) *Service {
 	s := &Service{
 		groups:          groups,
@@ -71,12 +72,13 @@ func New(
 	for groupName, group := range groups {
 		for _, item := range group.FallbackChain {
 			key := s.breakerKey(groupName, item.Provider, item.Model)
-			s.breakers[key] = breaker.New(
-				key,
-				3,    // maxRequests
-				5,    // failureThreshold
-				30*time.Second, // cooldown
-			)
+			s.breakers[key] = breaker.New(key, breaker.Settings{
+				MaxRequests:      uint32(cbCfg.MaxRequests),
+				Interval:         cbCfg.Interval,
+				Timeout:          cbCfg.Timeout,
+				FailureThreshold: cbCfg.FailureThreshold,
+				Cooldown:         cbCfg.Cooldown,
+			})
 		}
 	}
 

@@ -47,19 +47,19 @@ model_groups:
       - provider: "openai"
         model: "Qwen3.6-35B-A3B-4bit"
         weight: 70
-        timeout: 30s
+        timeout: 3000s
         retry: 2
         cost: 0.03
       - provider: "anthropic"
         model: "Qwen3.6-35B-A3B-4bit"
         weight: 30
-        timeout: 30s
+        timeout: 3000s
         retry: 1
         cost: 0.015
       - provider: "deepseek"
         model: "Qwen3.6-35B-A3B-4bit"
         weight: 0
-        timeout: 60s
+        timeout: 3000s
         retry: 1
         cost: 0.001
 
@@ -69,12 +69,12 @@ model_groups:
       - provider: "openai"
         model: "Qwen3.6-35B-A3B-4bit"
         weight: 50
-        timeout: 15s
+        timeout: 3000s
         cost: 0.0006
       - provider: "deepseek"
         model: "Qwen3.6-35B-A3B-4bit"
         weight: 50
-        timeout: 20s
+        timeout: 3000s
 
 # 熔断器配置
 circuit_breaker:
@@ -95,15 +95,15 @@ providers:
   openai:
     base_url: "http://192.168.31.238:8000/v1"
     api_key: "${ANTHROPIC_AUTH_TOKEN}"
-    timeout: 30s
+    timeout: 3000s
   anthropic:
     base_url: "http://192.168.31.238:8000/v1"
     api_key: "${ANTHROPIC_AUTH_TOKEN}"
-    timeout: 30s
+    timeout: 3000s
   deepseek:
     base_url: "http://192.168.31.238:8000/v1"
     api_key: "${ANTHROPIC_AUTH_TOKEN}"
-    timeout: 60s
+    timeout: 3000s
 
 # Token 计算
 token:
