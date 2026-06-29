@@ -2,7 +2,6 @@ package provider
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"net/http"
 
@@ -26,7 +25,6 @@ type ToolFunc struct {
 type Provider interface {
 	Chat(ctx context.Context, model string, messages []Message, tools []Tool) (*http.Response, error)
 	StreamChat(ctx context.Context, model string, messages []Message, tools []Tool) (io.ReadCloser, error)
-	HealthCheck(ctx context.Context, model string) error
 }
 
 // Message 消息结构
@@ -87,24 +85,3 @@ func newBaseProvider(cfg config.ProviderConfig) baseProvider {
 	}
 }
 
-// HealthCheck 通用健康检查（发送一个轻量级请求）
-func (p *baseProvider) HealthCheck(ctx context.Context, model string) error {
-	// 简化实现：尝试发送一个 max_tokens=1 的请求
-	// 实际生产环境可以更轻量
-	req, err := http.NewRequestWithContext(ctx, "GET", p.baseURL+"/models", nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+p.apiKey)
-
-	resp, err := p.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 500 {
-		return fmt.Errorf("health check failed: status %d", resp.StatusCode)
-	}
-	return nil
-}

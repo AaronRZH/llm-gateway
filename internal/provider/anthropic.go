@@ -583,3 +583,23 @@ func (p *AnthropicProvider) SendDirect(
 	// 这样调用方可以读取 body 并转发给客户端，而不是丢失错误详情
 	return resp, nil
 }
+
+// CountTokens 调用上游的 /v1/messages/count_tokens 端点
+func (p *AnthropicProvider) CountTokens(ctx context.Context, body []byte) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/messages/count_tokens", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", p.apiKey)
+	req.Header.Set("anthropic-version", "2023-06-01")
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	// 错误状态码也原样返回，由 handler 转发给客户端
+	return resp, nil
+}

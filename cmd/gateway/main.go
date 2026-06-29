@@ -63,7 +63,7 @@ func main() {
 	streamHandler := stream.New(mapperService)
 
 	// 初始化 Redis 客户端
-	redisClient, err := redisutil.New(redisutil.Config{
+	redisClient := redisutil.New(redisutil.Config{
 		Addr:         cfg.Redis.Addr,
 		Password:     cfg.Redis.Password,
 		DB:           cfg.Redis.DB,
@@ -72,9 +72,6 @@ func main() {
 		ReadTimeout:  cfg.Redis.ReadTimeout,
 		WriteTimeout: cfg.Redis.WriteTimeout,
 	})
-	if err != nil {
-		log.Warn().Err(err).Msg("redis connection failed, api key validation will use seed keys only")
-	}
 
 	// 初始化认证服务（加载种子 Key）
 	seedKeys := buildSeedKeys(cfg.APIKeys)
@@ -107,6 +104,7 @@ func main() {
 		api.POST("/chat/completions", handleChatCompletion(mapperService, routerService, streamHandler, tokenService))
 		api.POST("/completions", handleCompletion(mapperService, routerService, streamHandler, tokenService))
 		api.POST("/messages", handleAnthropicMessages(mapperService, routerService, streamHandler, tokenService))
+		api.POST("/messages/count_tokens", handleCountTokens(providerManager))
 		api.GET("/models", handleListModels(mapperService))
 	}
 

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -10,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
+	"github.com/sony/gobreaker"
 
 	"llm-gateway/internal/mapper"
 	"llm-gateway/internal/provider"
@@ -111,35 +114,67 @@ func handleChatCompletion(
 		}
 		log.Debug().Int("input_tokens", inputTokens).Msg("token estimated")
 
-		// 3. 路由选择（如果配置了模型组）
-		target, err := router.Select(c.Request.Context(), req.Model, inputTokens)
+		// 3. 路由选择 — 获取候选列表（支持 fallback 重试）
+		sel, err := router.SelectCandidates(c.Request.Context(), req.Model, inputTokens)
 		if err != nil {
 			log.Error().Err(err).Msg("router selection failed")
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no available model"})
 			return
 		}
 
-		// 4. 请求上游
-		upstreamModel := target.Model
-		targetProvider := target.ProviderName
-		if targetProvider == "" {
-			targetProvider = providerName
-		}
-
 		if req.Stream {
-			// 流式响应
-			c.Header("Content-Type", "text/event-stream")
-			c.Header("Cache-Control", "no-cache")
-			c.Header("Connection", "keep-alive")
+			// 流式响应 — 遍历候选直到连接成功
+			var upstream io.ReadCloser
+			var targetProvider string
+			var upstreamModel string
+			var start time.Time
 
-			start := time.Now()
-			upstream, err := target.Provider.StreamChat(c.Request.Context(), upstreamModel, toProviderMessages(req.Messages), toProviderTools(req.Tools))
-			if err != nil {
-				log.Error().Err(err).Msg("upstream stream failed")
-				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			for target := sel.Next(); target != nil; target = sel.Next() {
+				upstreamModel = target.Model
+				targetProvider = target.ProviderName
+				if targetProvider == "" {
+					targetProvider = providerName
+				}
+
+				start = time.Now()
+				var execErr error
+
+				if target.Breaker != nil {
+					result, err := target.Breaker.Execute(func() (interface{}, error) {
+						return target.Provider.StreamChat(c.Request.Context(), upstreamModel,
+							toProviderMessages(req.Messages), toProviderTools(req.Tools))
+					})
+					if err != nil {
+						if err == gobreaker.ErrOpenState || err == gobreaker.ErrTooManyRequests {
+							log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
+							continue
+						}
+						execErr = err
+					} else {
+						upstream = result.(io.ReadCloser)
+					}
+				} else {
+					upstream, execErr = target.Provider.StreamChat(c.Request.Context(), upstreamModel,
+						toProviderMessages(req.Messages), toProviderTools(req.Tools))
+				}
+
+				if execErr != nil {
+					log.Error().Err(execErr).Str("provider", targetProvider).Msg("stream connect failed, trying next")
+					continue
+				}
+				break
+			}
+
+			if upstream == nil {
+				log.Error().Msg("all upstream models failed for stream")
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "all upstream models failed"})
 				return
 			}
 			defer upstream.Close()
+
+			c.Header("Content-Type", "text/event-stream")
+			c.Header("Cache-Control", "no-cache")
+			c.Header("Connection", "keep-alive")
 
 			result := streamHandler.RewriteAndForward(c.Writer, upstream, req.Model)
 
@@ -155,17 +190,57 @@ func handleChatCompletion(
 			go tokenService.RecordUsage(reqID, realModel, req.Model, targetProvider,
 				inputTokens, estimatedOutput, 0, 0, 0, estimatedToolCalls)
 		} else {
-			// 非流式响应
-			start := time.Now()
-			resp, err := target.Provider.Chat(c.Request.Context(), upstreamModel, toProviderMessages(req.Messages), toProviderTools(req.Tools))
-			if err != nil {
-				log.Error().Err(err).Msg("upstream request failed")
-				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			// 非流式响应 — 遍历候选直到请求成功
+			var resp *http.Response
+			var body []byte
+			var targetProvider string
+			var upstreamModel string
+			var start time.Time
+
+			for target := sel.Next(); target != nil; target = sel.Next() {
+				upstreamModel = target.Model
+				targetProvider = target.ProviderName
+				if targetProvider == "" {
+					targetProvider = providerName
+				}
+
+				start = time.Now()
+				var execErr error
+
+				if target.Breaker != nil {
+					result, err := target.Breaker.Execute(func() (interface{}, error) {
+						return target.Provider.Chat(c.Request.Context(), upstreamModel,
+							toProviderMessages(req.Messages), toProviderTools(req.Tools))
+					})
+					if err != nil {
+						if err == gobreaker.ErrOpenState || err == gobreaker.ErrTooManyRequests {
+							log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
+							continue
+						}
+						execErr = err
+					} else {
+						resp = result.(*http.Response)
+					}
+				} else {
+					resp, execErr = target.Provider.Chat(c.Request.Context(), upstreamModel,
+						toProviderMessages(req.Messages), toProviderTools(req.Tools))
+				}
+
+				if execErr != nil {
+					log.Error().Err(execErr).Str("provider", targetProvider).Msg("upstream request failed, trying next")
+					continue
+				}
+				break
+			}
+
+			if resp == nil {
+				log.Error().Msg("all upstream models failed for non-stream")
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "all upstream models failed"})
 				return
 			}
 			defer resp.Body.Close()
 
-			body, _ := io.ReadAll(resp.Body)
+			body, _ = io.ReadAll(resp.Body)
 
 			// 记录延迟（用于 latency_optimized 策略）
 			if targetProvider != "" {
@@ -208,6 +283,7 @@ type AnthropicRequest struct {
 	Messages      []map[string]interface{} `json:"messages"`
 	System        interface{}              `json:"system,omitempty"`
 	MaxTokens     int                      `json:"max_tokens"`
+	Stream        bool                     `json:"stream,omitempty"`
 	Temperature   float64                  `json:"temperature,omitempty"`
 	TopP          float64                  `json:"top_p,omitempty"`
 	StopSequences []string                 `json:"stop_sequences,omitempty"`
@@ -222,6 +298,40 @@ func handleListModels(mapper *mapper.Service) gin.HandlerFunc {
 			"object": "list",
 			"data":   models,
 		})
+	}
+}
+
+// handleCountTokens 代理 /v1/messages/count_tokens 请求到上游 Anthropic 端点
+func handleCountTokens(providerManager *provider.Manager) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		p, ok := providerManager.Get("anthropic")
+		if !ok {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "anthropic provider not available"})
+			return
+		}
+
+		ap, ok := p.(*provider.AnthropicProvider)
+		if !ok {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "provider is not an AnthropicProvider"})
+			return
+		}
+
+		body, err := io.ReadAll(c.Request.Body)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+
+		resp, err := ap.CountTokens(c.Request.Context(), body)
+		if err != nil {
+			log.Error().Err(err).Msg("count_tokens upstream request failed")
+			c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+			return
+		}
+		defer resp.Body.Close()
+
+		respBody, _ := io.ReadAll(resp.Body)
+		c.Data(resp.StatusCode, "application/json", respBody)
 	}
 }
 
@@ -269,27 +379,44 @@ func handleAnthropicMessages(
 		}
 		log.Debug().Int("input_tokens", inputTokens).Msg("anthropic token estimated")
 
-		// 3. 路由选择
-		target, err := router.Select(c.Request.Context(), req.Model, inputTokens)
+		// 3. 路由选择 — 获取候选列表（支持 fallback 重试）
+		sel, err := router.SelectCandidates(c.Request.Context(), req.Model, inputTokens)
 		if err != nil {
 			log.Error().Err(err).Msg("anthropic router selection failed")
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no available model"})
 			return
 		}
 
-		// 4. 调用 AnthropicProvider 的 ChatWithRequest（已包含格式转换）
-		start := time.Now()
-		upstreamModel := req.Model
-		targetProvider := target.ProviderName
-		if targetProvider == "" {
-			targetProvider = providerName
-		}
+		// 4. 遍历候选，带断路器保护和 fallback 重试
+		var resp *http.Response
+		var targetProvider string
+		var upstreamModel string
+		var start time.Time
+		var ap *provider.AnthropicProvider
 
-		// 判断是否是 Anthropic 类型的 provider
-		if ap, ok := target.Provider.(*provider.AnthropicProvider); ok {
-			// 上游为 Anthropic 时，直接使用原始 Anthropic 格式消息发送，跳过格式转换
+		for target := sel.Next(); target != nil; target = sel.Next() {
+			upstreamModel = target.Model
+			targetProvider = target.ProviderName
+			if targetProvider == "" {
+				targetProvider = providerName
+			}
+
+			// 非 Anthropic provider 不支持 /messages 端点，跳过
+			var ok bool
+			ap, ok = target.Provider.(*provider.AnthropicProvider)
+			if !ok {
+				log.Debug().Str("provider", targetProvider).Msg("provider does not support /messages, skipping")
+				continue
+			}
+
+			// 构建额外参数
 			extraParams := map[string]interface{}{
-				"max_tokens": func() int { if req.MaxTokens > 0 { return req.MaxTokens }; return 4096 }(),
+				"max_tokens": func() int {
+					if req.MaxTokens > 0 {
+						return req.MaxTokens
+					}
+					return 4096
+				}(),
 			}
 			if req.Temperature > 0 {
 				extraParams["temperature"] = req.Temperature
@@ -307,7 +434,7 @@ func handleAnthropicMessages(
 				extraParams["tool_choice"] = req.ToolChoice
 			}
 
-			// 使用 target 的超时时间设置 context deadline（优先于 provider 默认超时）
+			// 使用 target 的超时时间设置 context deadline
 			reqCtx := c.Request.Context()
 			if target.Timeout > 0 {
 				var cancel context.CancelFunc
@@ -315,49 +442,122 @@ func handleAnthropicMessages(
 				defer cancel()
 			}
 
-			resp, err := ap.SendDirect(
-				reqCtx,
-				realModel,
-				req.Messages,
-				req.System,
-				extraParams,
-				false, // /messages 端点当前不支持流式
-			)
-			if err != nil {
-				log.Error().Err(err).Msg("anthropic upstream request failed")
-				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-				return
-			}
-			defer resp.Body.Close()
+			start = time.Now()
+			var execErr error
 
-			// 上游返回错误状态码时，直接转发错误 body
-			if resp.StatusCode >= 400 {
-				body, _ := io.ReadAll(resp.Body)
-				log.Error().Int("status", resp.StatusCode).RawJSON("body", body).Msg("anthropic upstream returned error")
-				c.Data(resp.StatusCode, "application/json", body)
-				return
+			if target.Breaker != nil {
+				result, err := target.Breaker.Execute(func() (interface{}, error) {
+					return ap.SendDirect(
+						reqCtx,
+						realModel,
+						req.Messages,
+						req.System,
+						extraParams,
+						req.Stream,
+					)
+				})
+				if err != nil {
+					if err == gobreaker.ErrOpenState || err == gobreaker.ErrTooManyRequests {
+						log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
+						continue
+					}
+					execErr = err
+				} else {
+					resp = result.(*http.Response)
+				}
+			} else {
+				resp, execErr = ap.SendDirect(
+					reqCtx,
+					realModel,
+					req.Messages,
+					req.System,
+					extraParams,
+					req.Stream,
+				)
 			}
 
-			// 记录延迟
+			if execErr != nil {
+				log.Error().Err(execErr).Str("provider", targetProvider).Msg("anthropic upstream request failed, trying next")
+				continue
+			}
+			break
+		}
+
+		if resp == nil {
+			log.Error().Msg("all upstream models failed for anthropic /messages")
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "all upstream models failed"})
+			return
+		}
+		defer resp.Body.Close()
+
+		// 上游返回错误状态码时，直接转发错误 body
+		if resp.StatusCode >= 400 {
+			body, _ := io.ReadAll(resp.Body)
+			log.Error().Int("status", resp.StatusCode).RawJSON("body", body).Msg("anthropic upstream returned error")
+			c.Data(resp.StatusCode, "application/json", body)
+			return
+		}
+
+		if req.Stream {
+			// 流式响应：转发 SSE，并替换 model 字段为虚拟模型名
+			c.Header("Content-Type", "text/event-stream")
+			c.Header("Cache-Control", "no-cache")
+			c.Header("Connection", "keep-alive")
+
+			// 记录延迟（在流开始后记录，而不是结束后）
 			if targetProvider != "" {
 				router.RecordLatency(req.Model, targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
 			}
 
-			// 5. 将后端响应转为 Anthropic 格式（使用虚拟模型名替换 real 模型名）
-			anthropicResp, err := ap.ConvertResponseWithModel(resp, req.Model)
-			if err != nil {
-				log.Error().Err(err).Msg("anthropic response conversion failed")
-				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-				return
+			scanner := bufio.NewScanner(resp.Body)
+			scanner.Split(bufio.ScanLines)
+
+			for scanner.Scan() {
+				line := scanner.Bytes()
+
+				// 空行是 SSE 分隔符
+				if len(line) == 0 {
+					c.Writer.Write([]byte("\n"))
+					c.Writer.Flush()
+					continue
+				}
+
+				if bytes.HasPrefix(line, []byte("data: ")) {
+					payload := line[6:]
+					// 替换 data 中的真实模型名为虚拟模型名
+					if realModel != req.Model {
+						payload = bytes.ReplaceAll(payload, []byte(realModel), []byte(req.Model))
+					}
+					c.Writer.Write([]byte("data: "))
+					c.Writer.Write(payload)
+					c.Writer.Write([]byte("\n"))
+				} else {
+					c.Writer.Write(line)
+					c.Writer.Write([]byte("\n"))
+				}
+				c.Writer.Flush()
 			}
 
-			c.Data(resp.StatusCode, "application/json", anthropicResp)
+			if err := scanner.Err(); err != nil {
+				log.Error().Err(err).Msg("anthropic stream scan error")
+			}
 			return
 		}
 
-		// 非 Anthropic provider 不支持 /messages 端点
-		log.Warn().Str("provider", targetProvider).Msg("provider does not support /messages endpoint, use /chat/completions instead")
-		c.JSON(http.StatusNotImplemented, gin.H{"error": "/messages endpoint only supports Anthropic provider"})
+		// 记录延迟（非流式）
+		if targetProvider != "" {
+			router.RecordLatency(req.Model, targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
+		}
+
+		// 5. 将后端响应转为 Anthropic 格式（使用虚拟模型名替换 real 模型名）
+		anthropicResp, err := ap.ConvertResponseWithModel(resp, req.Model)
+		if err != nil {
+			log.Error().Err(err).Msg("anthropic response conversion failed")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+
+		c.Data(resp.StatusCode, "application/json", anthropicResp)
 	}
 }
 

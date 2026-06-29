@@ -124,7 +124,6 @@ token:
 metrics:
   enabled: true
   path: "/metrics"
-  port: 9090
 
 # 健康检查
 health:

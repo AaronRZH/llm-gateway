@@ -24,8 +24,7 @@ type Service struct {
 	providerManager *provider.Manager
 	mapper          *mapper.Service
 	tokenService    *token.Service
-	breakers        map[string]*gobreaker.CircuitBreaker
-	healthStatus    map[string]bool // provider/model -> healthy?
+	breakers map[string]*gobreaker.CircuitBreaker
 
 	// round_robin 策略状态
 	roundRobinCounter map[string]int // group -> current index
@@ -44,6 +43,23 @@ type Target struct {
 	Model        string
 	Timeout      time.Duration
 	Retry        int
+	Breaker      *gobreaker.CircuitBreaker // 断路器，用于保护实际请求；directRoute 时为 nil
+}
+
+// Selection 路由候选列表，handler 通过 Next() 遍历以在请求失败时重试下一个候选
+type Selection struct {
+	targets  []*Target
+	position int
+}
+
+// Next 返回下一个候选 Target，如果没有更多候选则返回 nil
+func (sel *Selection) Next() *Target {
+	if sel.position >= len(sel.targets) {
+		return nil
+	}
+	t := sel.targets[sel.position]
+	sel.position++
+	return t
 }
 
 // New 创建路由服务
@@ -55,12 +71,11 @@ func New(
 	cbCfg config.CircuitBreakerConfig,
 ) *Service {
 	s := &Service{
-		groups:          groups,
-		providerManager: pm,
-		mapper:          mapSvc,
-		tokenService:    ts,
-		breakers:        make(map[string]*gobreaker.CircuitBreaker),
-		healthStatus:    make(map[string]bool),
+		groups:            groups,
+		providerManager:   pm,
+		mapper:            mapSvc,
+		tokenService:      ts,
+		breakers:          make(map[string]*gobreaker.CircuitBreaker),
 		roundRobinCounter: make(map[string]int),
 		latencyTracker:   make(map[string]float64),
 		latencyEMAAlpha:  0.1,
@@ -105,62 +120,70 @@ func (s *Service) latencyWorker() {
 	}
 }
 
-// Select 选择目标模型
+// Select 选择目标模型（保持 API 兼容，返回第一个可用候选）
 func (s *Service) Select(ctx context.Context, virtualModel string, estimatedTokens int) (*Target, error) {
-	group, ok := s.groups[virtualModel]
-	if !ok {
-		// 未配置模型组，尝试直接路由
-		return s.directRoute(ctx, virtualModel)
+	sel, err := s.SelectCandidates(ctx, virtualModel, estimatedTokens)
+	if err != nil {
+		return nil, err
 	}
-
-	return s.selectFromGroup(ctx, virtualModel, group, estimatedTokens)
+	return sel.Next(), nil
 }
 
-// selectFromGroup 根据策略从模型组中选择目标
-func (s *Service) selectFromGroup(ctx context.Context, groupName string, group config.ModelGroup, estimatedTokens int) (*Target, error) {
+// SelectCandidates 返回路由候选列表，handler 通过 Next() 遍历以在请求失败时重试下一个候选
+func (s *Service) SelectCandidates(ctx context.Context, virtualModel string, estimatedTokens int) (*Selection, error) {
+	group, ok := s.groups[virtualModel]
+	if !ok {
+		// 未配置模型组，直接路由（单个候选，无断路器、无 fallback）
+		target, err := s.directRoute(ctx, virtualModel)
+		if err != nil {
+			return nil, err
+		}
+		return &Selection{targets: []*Target{target}}, nil
+	}
+
+	chain := s.getOrderedChain(virtualModel, group)
+	var candidates []*Target
+	for _, item := range chain {
+		target, err := s.tryProvider(ctx, virtualModel, item)
+		if err != nil {
+			log.Debug().
+				Str("provider", item.Provider).
+				Str("model", item.Model).
+				Str("reason", err.Error()).
+				Msg("model unavailable, skipping")
+			continue
+		}
+		candidates = append(candidates, target)
+	}
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("no available model in group")
+	}
+	return &Selection{targets: candidates}, nil
+}
+
+// getOrderedChain 根据策略返回排序后的 fallback chain
+func (s *Service) getOrderedChain(groupName string, group config.ModelGroup) []config.FallbackItem {
 	strategy := group.Strategy
 	if strategy == "" {
-		strategy = "priority" // 默认策略
+		strategy = "priority"
 	}
 
 	switch strategy {
 	case "round_robin":
-		return s.selectRoundRobin(ctx, groupName, group)
+		return s.roundRobinOrder(groupName, group)
 	case "latency_optimized":
-		return s.selectLatencyOptimized(ctx, groupName, group)
+		return s.sortedByLatency(group.FallbackChain)
 	case "cost_optimized":
-		return s.selectCostOptimized(ctx, groupName, group)
+		return s.sortedByCost(group.FallbackChain)
 	default:
-		return s.selectPriority(ctx, groupName, group)
+		return group.FallbackChain
 	}
 }
 
-// selectPriority 按 fallback_chain 顺序，依次检查熔断器（默认策略）
-func (s *Service) selectPriority(ctx context.Context, groupName string, group config.ModelGroup) (*Target, error) {
-	return s.selectByFallbackChain(ctx, groupName, group, group.FallbackChain)
-}
-
-// selectByFallbackChain 通用 fallback 逻辑（按指定顺序）
-func (s *Service) selectByFallbackChain(ctx context.Context, groupName string, group config.ModelGroup, orderedChain []config.FallbackItem) (*Target, error) {
-	for _, item := range orderedChain {
-		target, err := s.tryProvider(ctx, groupName, item)
-		if err == nil {
-			return target, nil
-		}
-		log.Debug().
-			Str("provider", item.Provider).
-			Str("model", item.Model).
-			Str("reason", err.Error()).
-			Msg("model unavailable, trying next")
-	}
-	return nil, fmt.Errorf("no available model in group")
-}
-
-// selectRoundRobin 加权轮询策略
-func (s *Service) selectRoundRobin(ctx context.Context, groupName string, group config.ModelGroup) (*Target, error) {
+// roundRobinOrder 返回加权轮询排序后的 chain
+func (s *Service) roundRobinOrder(groupName string, group config.ModelGroup) []config.FallbackItem {
 	chain := group.FallbackChain
 
-	// 收集权重 > 0 的 provider
 	var eligible []int
 	for i, item := range chain {
 		if item.Weight > 0 {
@@ -168,8 +191,7 @@ func (s *Service) selectRoundRobin(ctx context.Context, groupName string, group 
 		}
 	}
 	if len(eligible) == 0 {
-		// 没有权重，退化为 priority
-		return s.selectByFallbackChain(ctx, groupName, group, chain)
+		return chain
 	}
 
 	s.mu.Lock()
@@ -177,42 +199,20 @@ func (s *Service) selectRoundRobin(ctx context.Context, groupName string, group 
 	s.roundRobinCounter[groupName]++
 	s.mu.Unlock()
 
-	// 从选中位置开始，尝试最多 len(chain) 次（覆盖所有 provider）
-	for i := 0; i < len(chain); i++ {
-		pos := (idx + i) % len(chain)
-		item := chain[pos]
-
-		// 只有权重 > 0 的才参与轮询，否则跳过（但可以作为 fallback）
-		if item.Weight <= 0 {
-			// 尝试作为 fallback
-			target, err := s.tryProvider(ctx, groupName, item)
-			if err == nil {
-				return target, nil
-			}
-			continue
-		}
-
-		target, err := s.tryProvider(ctx, groupName, item)
-		if err == nil {
-			return target, nil
-		}
-		log.Debug().
-			Str("provider", item.Provider).
-			Str("model", item.Model).
-			Msg("round_robin: model unavailable, trying next")
+	// 从选中位置开始，重排 chain
+	ordered := make([]config.FallbackItem, 0, len(chain))
+	// 先添加权重>0的，从 idx 开始
+	for i := 0; i < len(eligible); i++ {
+		pos := eligible[(idx+i)%len(eligible)]
+		ordered = append(ordered, chain[pos])
 	}
-
-	return nil, fmt.Errorf("no available model in group (round_robin)")
-}
-
-// selectLatencyOptimized 延迟优先策略
-func (s *Service) selectLatencyOptimized(ctx context.Context, groupName string, group config.ModelGroup) (*Target, error) {
-	chain := group.FallbackChain
-
-	// 按最近延迟排序（延迟低的在前），相同延迟按权重排序
-	sorted := s.sortedByLatency(chain)
-
-	return s.selectByFallbackChain(ctx, groupName, group, sorted)
+	// 再追加权重=0的作为最后的 fallback
+	for i, item := range chain {
+		if item.Weight <= 0 {
+			ordered = append(ordered, chain[i])
+		}
+	}
+	return ordered
 }
 
 // sortedByLatency 按延迟从低到高排序，延迟相同时按权重从高到低
@@ -247,11 +247,8 @@ func (s *Service) sortedByLatency(chain []config.FallbackItem) []config.Fallback
 	return sorted
 }
 
-// selectCostOptimized 成本优先策略
-func (s *Service) selectCostOptimized(ctx context.Context, groupName string, group config.ModelGroup) (*Target, error) {
-	chain := group.FallbackChain
-
-	// 按成本从低到高排序，成本相同的按权重排序
+// sortedByCost 按成本从低到高排序，成本相同时按权重从高到低
+func (s *Service) sortedByCost(chain []config.FallbackItem) []config.FallbackItem {
 	sorted := make([]config.FallbackItem, len(chain))
 	copy(sorted, chain)
 
@@ -260,22 +257,21 @@ func (s *Service) selectCostOptimized(ctx context.Context, groupName string, gro
 		costJ := sorted[j].Cost
 
 		if costI == 0 && costJ == 0 {
-			// 都没有成本数据，按权重
 			return sorted[i].Weight > sorted[j].Weight
 		}
 		if costI == 0 {
-			return false // 无成本数据的排后面
+			return false
 		}
 		if costJ == 0 {
-			return true // 有成本数据的排前面
+			return true
 		}
 		return costI < costJ
 	})
 
-	return s.selectByFallbackChain(ctx, groupName, group, sorted)
+	return sorted
 }
 
-// tryProvider 尝试单个 provider，包含熔断器检查和健康检查
+// tryProvider 检查单个 provider 的断路器状态，返回可用的 Target（不做健康检查）
 func (s *Service) tryProvider(ctx context.Context, groupName string, item config.FallbackItem) (*Target, error) {
 	key := s.breakerKey(groupName, item.Provider, item.Model)
 	cb := s.breakers[key]
@@ -283,13 +279,11 @@ func (s *Service) tryProvider(ctx context.Context, groupName string, item config
 		return nil, fmt.Errorf("circuit breaker not found")
 	}
 
-	// 检查熔断器状态（发送一个轻量级探测请求）
-	_, err := cb.Execute(func() (interface{}, error) {
-		return nil, s.healthCheck(ctx, item.Provider, item.Model)
-	})
-
-	if err != nil {
-		return nil, err
+	// 只检查断路器状态，不发送健康检查请求。
+	// 断路器为 open 时跳过此 provider，closed/half-open 都放行。
+	// 实际请求由 handler 通过 target.Breaker.Execute() 包裹，由 gobreaker 自动计数和状态转换。
+	if cb.State() == gobreaker.StateOpen {
+		return nil, fmt.Errorf("circuit breaker open")
 	}
 
 	// 获取 Provider
@@ -298,16 +292,16 @@ func (s *Service) tryProvider(ctx context.Context, groupName string, item config
 		return nil, fmt.Errorf("provider not found: %s", item.Provider)
 	}
 
-	// 记录本次请求的延迟到 latency tracker
 	target := &Target{
 		Provider:     p,
 		ProviderName: item.Provider,
 		Model:        item.Model,
 		Timeout:      item.Timeout,
 		Retry:        item.Retry,
+		Breaker:      cb,
 	}
 
-	// 记录请求开始时间（在返回后计算延迟）
+	// 记录请求开始时间（在 handler 返回后计算延迟）
 	latencyKey := s.breakerKey(groupName, item.Provider, item.Model)
 	s.mu.Lock()
 	s.lastRequestTimes[latencyKey] = time.Now()
@@ -350,16 +344,6 @@ func (s *Service) directRoute(ctx context.Context, virtualModel string) (*Target
 		ProviderName: mapped.Provider,
 		Model:        mapped.RealModel,
 	}, nil
-}
-
-// healthCheck 健康检查
-func (s *Service) healthCheck(ctx context.Context, providerName, model string) error {
-	p, ok := s.providerManager.Get(providerName)
-	if !ok {
-		return fmt.Errorf("provider not found: %s", providerName)
-	}
-	// 发送一个轻量级探测请求
-	return p.HealthCheck(ctx, model)
 }
 
 // RecordLatency 供 handler 调用，记录请求延迟

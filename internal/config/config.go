@@ -11,18 +11,18 @@ import (
 
 // Config 全局配置
 type Config struct {
-	App             AppConfig             `mapstructure:"app"`
-	Log             LogConfig             `mapstructure:"log"`
-	Redis           RedisConfig           `mapstructure:"redis"`
-	ModelMapping    ModelMappingConfig    `mapstructure:"model_mapping"`
-	ModelGroups     map[string]ModelGroup `mapstructure:"model_groups"`
-	CircuitBreaker  CircuitBreakerConfig  `mapstructure:"circuit_breaker"`
-	RateLimit       RateLimitConfig       `mapstructure:"rate_limit"`
-	Providers       map[string]ProviderConfig `mapstructure:"providers"`
-	Token           TokenConfig           `mapstructure:"token"`
-	Metrics         MetricsConfig         `mapstructure:"metrics"`
-	Health          HealthConfig          `mapstructure:"health"`
-	APIKeys          []APIKeyConfig        `mapstructure:"api_keys"`
+	App            AppConfig                 `mapstructure:"app"`
+	Log            LogConfig                 `mapstructure:"log"`
+	Redis          RedisConfig               `mapstructure:"redis"`
+	ModelMapping   ModelMappingConfig        `mapstructure:"model_mapping"`
+	ModelGroups    map[string]ModelGroup     `mapstructure:"model_groups"`
+	CircuitBreaker CircuitBreakerConfig      `mapstructure:"circuit_breaker"`
+	RateLimit      RateLimitConfig           `mapstructure:"rate_limit"`
+	Providers      map[string]ProviderConfig `mapstructure:"providers"`
+	Token          TokenConfig               `mapstructure:"token"`
+	Metrics        MetricsConfig             `mapstructure:"metrics"`
+	Health         HealthConfig              `mapstructure:"health"`
+	APIKeys        []APIKeyConfig            `mapstructure:"api_keys"`
 }
 
 type AppConfig struct {
@@ -33,9 +33,9 @@ type AppConfig struct {
 }
 
 type LogConfig struct {
-	Level   string `mapstructure:"level"`
-	Format  string `mapstructure:"format"`
-	Output  string `mapstructure:"output"`
+	Level  string `mapstructure:"level"`
+	Format string `mapstructure:"format"`
+	Output string `mapstructure:"output"`
 }
 
 type RedisConfig struct {
@@ -54,13 +54,13 @@ type ModelMappingConfig struct {
 }
 
 type VirtualModel struct {
-	Real      string   `mapstructure:"real"`
-	Aliases   []string `mapstructure:"aliases"`
+	Real    string   `mapstructure:"real"`
+	Aliases []string `mapstructure:"aliases"`
 }
 
 type ModelGroup struct {
-	Strategy       string          `mapstructure:"strategy"`
-	FallbackChain  []FallbackItem  `mapstructure:"fallback_chain"`
+	Strategy      string         `mapstructure:"strategy"`
+	FallbackChain []FallbackItem `mapstructure:"fallback_chain"`
 }
 
 type FallbackItem struct {
@@ -73,40 +73,39 @@ type FallbackItem struct {
 }
 
 type CircuitBreakerConfig struct {
-	MaxRequests       uint          `mapstructure:"max_requests"`
-	Interval          time.Duration `mapstructure:"interval"`
-	Timeout           time.Duration `mapstructure:"timeout"`
-	FailureThreshold  int           `mapstructure:"failure_threshold"`
-	Cooldown          time.Duration `mapstructure:"cooldown"`
+	MaxRequests      uint          `mapstructure:"max_requests"`
+	Interval         time.Duration `mapstructure:"interval"`
+	Timeout          time.Duration `mapstructure:"timeout"`
+	FailureThreshold int           `mapstructure:"failure_threshold"`
+	Cooldown         time.Duration `mapstructure:"cooldown"`
 }
 
 type RateLimitConfig struct {
-	Enabled             bool  `mapstructure:"enabled"`
-	RequestsPerSecond   int   `mapstructure:"requests_per_second"`
-	Burst               int   `mapstructure:"burst"`
+	Enabled           bool `mapstructure:"enabled"`
+	RequestsPerSecond int  `mapstructure:"requests_per_second"`
+	Burst             int  `mapstructure:"burst"`
 }
 
 type ProviderConfig struct {
-	BaseURL string `mapstructure:"base_url"`
-	APIKey  string `mapstructure:"api_key"`
+	BaseURL string        `mapstructure:"base_url"`
+	APIKey  string        `mapstructure:"api_key"`
 	Timeout time.Duration `mapstructure:"timeout"`
 }
 
 type TokenConfig struct {
-	TokenizerMapping map[string]string `mapstructure:"tokenizer_mapping"`
+	TokenizerMapping map[string]string  `mapstructure:"tokenizer_mapping"`
 	OfficialSync     OfficialSyncConfig `mapstructure:"official_sync"`
 }
 
 type OfficialSyncConfig struct {
-	Enabled    bool          `mapstructure:"enabled"`
-	Interval   time.Duration `mapstructure:"interval"`
-	BatchSize  int           `mapstructure:"batch_size"`
+	Enabled   bool          `mapstructure:"enabled"`
+	Interval  time.Duration `mapstructure:"interval"`
+	BatchSize int           `mapstructure:"batch_size"`
 }
 
 type MetricsConfig struct {
 	Enabled bool   `mapstructure:"enabled"`
 	Path    string `mapstructure:"path"`
-	Port    int    `mapstructure:"port"`
 }
 
 type HealthConfig struct {
