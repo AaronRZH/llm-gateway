@@ -133,6 +133,10 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("app.port", 8080)
 	v.SetDefault("log.level", "info")
 	v.SetDefault("redis.addr", "localhost:6379")
+	v.SetDefault("health.enabled", true)
+	v.SetDefault("health.path", "/health")
+	v.SetDefault("metrics.enabled", true)
+	v.SetDefault("metrics.path", "/metrics")
 
 	if err := v.ReadInConfig(); err != nil {
 		return nil, fmt.Errorf("read config failed: %w", err)

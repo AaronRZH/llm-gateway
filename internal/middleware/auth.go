@@ -10,9 +10,18 @@ import (
 )
 
 // Auth API Key 认证中间件
-// 验证 Bearer Token 有效性（查 Redis + 本地种子 Key）
-func Auth(authService *auth.Service) gin.HandlerFunc {
+// 支持白名单路径（如 /health、/metrics）跳过认证
+func Auth(authService *auth.Service, publicPaths ...string) gin.HandlerFunc {
+	publicPathSet := make(map[string]struct{}, len(publicPaths))
+	for _, p := range publicPaths {
+		publicPathSet[p] = struct{}{}
+	}
 	return func(c *gin.Context) {
+		if _, skip := publicPathSet[c.Request.URL.Path]; skip {
+			c.Next()
+			return
+		}
+
 		authHeader := c.GetHeader("Authorization")
 		if authHeader == "" {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing authorization header"})

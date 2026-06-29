@@ -83,17 +83,15 @@ func main() {
 	}
 	r := gin.New()
 
-	// 全局中间件
+	// 全局中间件（Auth 支持 /health、/metrics 白名单）
 	r.Use(middleware.Logger())
 	r.Use(middleware.Recovery())
 	r.Use(middleware.CORS())
 	r.Use(middleware.RateLimit(cfg.RateLimit))
-	r.Use(middleware.Auth(authService))
+	r.Use(middleware.Auth(authService, cfg.Health.Path, cfg.Metrics.Path))
 
-	// 健康检查
+	// 注册公开路由
 	r.GET(cfg.Health.Path, health.Handler())
-
-	// Prometheus 指标
 	if cfg.Metrics.Enabled {
 		r.GET(cfg.Metrics.Path, metrics.Handler())
 	}
