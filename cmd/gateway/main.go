@@ -93,6 +93,7 @@ func main() {
 	{
 		api.POST("/chat/completions", handleChatCompletion(mapperService, routerService, streamHandler, tokenService))
 		api.POST("/completions", handleCompletion(mapperService, routerService, streamHandler, tokenService))
+		api.POST("/messages", handleAnthropicMessages(mapperService, routerService, streamHandler, tokenService))
 		api.GET("/models", handleListModels(mapperService))
 	}
 

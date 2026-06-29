@@ -9,10 +9,23 @@ import (
 	"llm-gateway/internal/config"
 )
 
+// Tool 工具定义（OpenAI 格式）
+type Tool struct {
+	Type     string    `json:"type"`
+	Function ToolFunc  `json:"function"`
+}
+
+// ToolFunc 工具函数定义
+type ToolFunc struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Parameters  any    `json:"parameters,omitempty"`
+}
+
 // Provider 上游 Provider 接口
 type Provider interface {
-	Chat(ctx context.Context, model string, messages []Message) (*http.Response, error)
-	StreamChat(ctx context.Context, model string, messages []Message) (io.ReadCloser, error)
+	Chat(ctx context.Context, model string, messages []Message, tools []Tool) (*http.Response, error)
+	StreamChat(ctx context.Context, model string, messages []Message, tools []Tool) (io.ReadCloser, error)
 	HealthCheck(ctx context.Context, model string) error
 }
 

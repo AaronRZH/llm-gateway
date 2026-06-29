@@ -24,10 +24,14 @@ func NewDeepSeekProvider(cfg config.ProviderConfig) *DeepSeekProvider {
 }
 
 // Chat 非流式请求
-func (p *DeepSeekProvider) Chat(ctx context.Context, model string, messages []Message) (*http.Response, error) {
+func (p *DeepSeekProvider) Chat(ctx context.Context, model string, messages []Message, tools []Tool) (*http.Response, error) {
 	reqBody := map[string]interface{}{
 		"model":    model,
 		"messages": messages,
+	}
+
+	if len(tools) > 0 {
+		reqBody["tools"] = tools
 	}
 
 	jsonBody, err := json.Marshal(reqBody)
@@ -58,11 +62,15 @@ func (p *DeepSeekProvider) Chat(ctx context.Context, model string, messages []Me
 }
 
 // StreamChat 流式请求
-func (p *DeepSeekProvider) StreamChat(ctx context.Context, model string, messages []Message) (io.ReadCloser, error) {
+func (p *DeepSeekProvider) StreamChat(ctx context.Context, model string, messages []Message, tools []Tool) (io.ReadCloser, error) {
 	reqBody := map[string]interface{}{
 		"model":    model,
 		"messages": messages,
 		"stream":   true,
+	}
+
+	if len(tools) > 0 {
+		reqBody["tools"] = tools
 	}
 
 	jsonBody, err := json.Marshal(reqBody)

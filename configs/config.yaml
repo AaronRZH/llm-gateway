@@ -24,55 +24,55 @@ model_mapping:
   # 对外暴露名 -> 内部真实模型
   virtual_to_real:
     "gpt-4":
-      real: "openai/gpt-4o-2024-11-20"
+      real: "anthropic/Qwen3.6-35B-A3B-4bit"
       aliases: ["gpt-4o"]
     "gpt-4-mini":
-      real: "openai/gpt-4o-mini-2024-07-18"
+      real: "anthropic/Qwen3.6-35B-A3B-4bit"
       aliases: ["gpt-4o-mini"]
     "claude":
-      real: "anthropic/claude-3-5-sonnet-20241022"
-      aliases: ["claude-sonnet"]
+      real: "anthropic/Qwen3.6-35B-A3B-4bit"
+      aliases: ["claude-sonnet", "claude"]
     "deepseek":
-      real: "deepseek/deepseek-chat"
+      real: "anthropic/Qwen3.6-35B-A3B-4bit"
       aliases: ["deepseek-v3"]
 
-  # 反向映射（响应重写用）
-  real_to_virtual:
-    "openai/gpt-4o-2024-11-20": "gpt-4"
-    "openai/gpt-4o-mini-2024-07-18": "gpt-4-mini"
-    "anthropic/claude-3-5-sonnet-20241022": "claude"
-    "deepseek/deepseek-chat": "deepseek"
+  # 反向映射（响应重写用，你的代理模型名含.导致Viper解析异常，先注释）
+  # "anthropic/Qwen3.6-35B-A3B-4bit": "Qwen3.6-35B-A3B-4bit"
 
 # 模型组 & 自动切换策略
 model_groups:
   "smart-chat":
-    strategy: "priority" # priority | round_robin | latency_optimized | cost_optimized
+    strategy: "round_robin" # priority | round_robin | latency_optimized | cost_optimized
     fallback_chain:
       - provider: "openai"
-        model: "gpt-4o-2024-11-20"
+        model: "Qwen3.6-35B-A3B-4bit"
         weight: 70
         timeout: 30s
         retry: 2
+        cost: 0.03
       - provider: "anthropic"
-        model: "claude-3-5-sonnet-20241022"
+        model: "Qwen3.6-35B-A3B-4bit"
         weight: 30
         timeout: 30s
         retry: 1
+        cost: 0.015
       - provider: "deepseek"
-        model: "deepseek-chat"
+        model: "Qwen3.6-35B-A3B-4bit"
         weight: 0
         timeout: 60s
         retry: 1
+        cost: 0.001
 
   "fast-chat":
     strategy: "latency_optimized"
     fallback_chain:
       - provider: "openai"
-        model: "gpt-4o-mini-2024-07-18"
+        model: "Qwen3.6-35B-A3B-4bit"
         weight: 50
         timeout: 15s
+        cost: 0.0006
       - provider: "deepseek"
-        model: "deepseek-chat"
+        model: "Qwen3.6-35B-A3B-4bit"
         weight: 50
         timeout: 20s
 
@@ -93,16 +93,16 @@ rate_limit:
 # Provider 配置（API Keys 建议通过环境变量注入）
 providers:
   openai:
-    base_url: "https://api.openai.com/v1"
-    api_key: "${OPENAI_API_KEY}"
+    base_url: "http://192.168.31.238:8000/v1"
+    api_key: "${ANTHROPIC_AUTH_TOKEN}"
     timeout: 30s
   anthropic:
-    base_url: "https://api.anthropic.com/v1"
-    api_key: "${ANTHROPIC_API_KEY}"
+    base_url: "http://192.168.31.238:8000/v1"
+    api_key: "${ANTHROPIC_AUTH_TOKEN}"
     timeout: 30s
   deepseek:
-    base_url: "https://api.deepseek.com/"
-    api_key: "${DEEPSEEK_API_KEY}"
+    base_url: "http://192.168.31.238:8000/v1"
+    api_key: "${ANTHROPIC_AUTH_TOKEN}"
     timeout: 60s
 
 # Token 计算

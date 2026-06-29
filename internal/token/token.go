@@ -34,6 +34,7 @@ type UsageRecord struct {
 	RealOutput          int // 上游 API 返回的 completion_tokens
 	RealTotal           int // 上游 API 返回的 total_tokens
 	Provider            string
+	ToolCalls           int // tool call 次数
 	Timestamp           int64
 }
 
@@ -106,7 +107,7 @@ func (s *Service) EstimateOutput(text string, model string) int {
 // RecordUsage 记录用量（异步），包含估算值和上游真实值
 func (s *Service) RecordUsage(requestID, model, virtualModel, provider string,
 	estimatedInput, estimatedOutput int,
-	realInput, realOutput, realTotal int) {
+	realInput, realOutput, realTotal int, toolCalls int) {
 
 	record := UsageRecord{
 		RequestID:       requestID,
@@ -118,6 +119,7 @@ func (s *Service) RecordUsage(requestID, model, virtualModel, provider string,
 		RealOutput:      realOutput,
 		RealTotal:       realTotal,
 		Provider:        provider,
+		ToolCalls:       toolCalls,
 		Timestamp:       time.Now().Unix(),
 	}
 

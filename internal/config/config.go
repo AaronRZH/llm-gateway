@@ -69,6 +69,7 @@ type FallbackItem struct {
 	Weight   int           `mapstructure:"weight"`
 	Timeout  time.Duration `mapstructure:"timeout"`
 	Retry    int           `mapstructure:"retry"`
+	Cost     float64       `mapstructure:"cost"` // 单位请求成本（元），用于 cost_optimized 策略
 }
 
 type CircuitBreakerConfig struct {
