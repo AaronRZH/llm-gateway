@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"time"
@@ -319,23 +320,56 @@ func handleListModels(mapper *mapper.Service) gin.HandlerFunc {
 }
 
 // handleCountTokens 代理 /v1/messages/count_tokens 请求到上游 Anthropic 端点
-func handleCountTokens(providerManager *provider.Manager) gin.HandlerFunc {
+func handleCountTokens(mapper *mapper.Service, router *router.Service, providerManager *provider.Manager) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		body, err := io.ReadAll(c.Request.Body)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+
+		// 解析虚拟模型名，解析到真实模型名并注入请求体
+		var parseReq struct {
+			Model string `json:"model"`
+		}
+		if err := json.Unmarshal(body, &parseReq); err == nil && parseReq.Model != "" {
+			// 模型未配置则直接 404
+			if _, err := mapper.Resolve(parseReq.Model); err != nil {
+				log.Warn().Str("model", parseReq.Model).Msg("count_tokens model not found in mapping")
+				c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("model '%s' not found in mapping", parseReq.Model)})
+				return
+			}
+
+			// 通过路由获取真实模型（支持 fallback chain）
+			sel, err := router.SelectCandidates(c.Request.Context(), parseReq.Model, 0)
+			if err != nil {
+				log.Warn().Str("model", parseReq.Model).Msg("count_tokens router selection failed")
+				c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("model '%s' has no available target", parseReq.Model)})
+				return
+			}
+			target := sel.Next()
+			if target == nil {
+				c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("model '%s' has no available target", parseReq.Model)})
+				return
+			}
+
+			// 将请求体中的 model 字段替换为真实模型名
+			var reqMap map[string]interface{}
+			if json.Unmarshal(body, &reqMap) == nil {
+				reqMap["model"] = target.Model
+				body, _ = json.Marshal(reqMap)
+			}
+		}
+
+		// 调用上游的 /messages/count_tokens 端点
 		p, ok := providerManager.Get("anthropic")
 		if !ok {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "anthropic provider not available"})
 			return
 		}
-
 		ap, ok := p.(*provider.AnthropicProvider)
 		if !ok {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "provider is not an AnthropicProvider"})
-			return
-		}
-
-		body, err := io.ReadAll(c.Request.Body)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
 
@@ -537,59 +571,88 @@ func handleAnthropicMessages(
 			scanner := bufio.NewScanner(resp.Body)
 			scanner.Split(bufio.ScanLines)
 
-			// 累计 Anthropic 流式 token 用量
-			var anthropicInputTokens, anthropicOutputTokens int
+				// 累计 Anthropic 流式 token 用量
+				// 同时支持 Anthropic 格式（input_tokens/output_tokens）和 OpenAI 格式（prompt_tokens/completion_tokens）
+				var anthropicInputTokens, anthropicOutputTokens int
+				// 累计状态（流式拆分：input 在 message_start，output 在 message_delta）
+				var hasInput, hasOutput bool
 
-			for scanner.Scan() {
-				line := scanner.Bytes()
+				for scanner.Scan() {
+					line := scanner.Bytes()
 
-				// 空行是 SSE 分隔符
-				if len(line) == 0 {
-					c.Writer.Write([]byte("\n"))
+					// 空行是 SSE 分隔符
+					if len(line) == 0 {
+						c.Writer.Write([]byte("\n"))
+						c.Writer.Flush()
+						continue
+					}
+
+					if bytes.HasPrefix(line, []byte("data: ")) {
+						payload := line[6:]
+
+						// 尝试 OpenAI 格式: {"choices":[...],"usage":{"prompt_tokens":N,"completion_tokens":M}}
+						var openAIChunk struct {
+							Usage struct {
+								PromptTokens     int `json:"prompt_tokens"`
+								CompletionTokens int `json:"completion_tokens"`
+							} `json:"usage"`
+						}
+						if json.Unmarshal(payload, &openAIChunk) == nil {
+							if openAIChunk.Usage.PromptTokens > 0 && !hasInput {
+								anthropicInputTokens = openAIChunk.Usage.PromptTokens
+								hasInput = true
+							}
+							if openAIChunk.Usage.CompletionTokens > 0 {
+								anthropicOutputTokens = openAIChunk.Usage.CompletionTokens
+								hasOutput = true
+							}
+						}
+
+						// 尝试 Anthropic 格式: message_start 含 "input_tokens"
+						var startChunk struct {
+							Type string `json:"type"`
+							Message struct {
+								InputTokens int `json:"input_tokens"`
+							} `json:"message"`
+						}
+						if json.Unmarshal(payload, &startChunk) == nil && startChunk.Type == "message_start" {
+							if startChunk.Message.InputTokens > 0 && !hasInput {
+								anthropicInputTokens = startChunk.Message.InputTokens
+								hasInput = true
+							}
+						}
+
+						// 尝试 Anthropic 格式: message_delta 中的 "usage.output_tokens"
+						var deltaChunk struct {
+							Type  string `json:"type"`
+							Usage struct {
+								OutputTokens int `json:"output_tokens"`
+							} `json:"usage"`
+						}
+						if json.Unmarshal(payload, &deltaChunk) == nil && deltaChunk.Type == "message_delta" {
+							if deltaChunk.Usage.OutputTokens > 0 && !hasOutput {
+								anthropicOutputTokens = deltaChunk.Usage.OutputTokens
+								hasOutput = true
+							}
+							// 输出 tokens 提取完毕，记录用量
+							go tokenService.RecordUsageNow(reqID, realModel, req.Model, targetProvider,
+								inputTokens, 0, anthropicInputTokens, anthropicOutputTokens,
+								anthropicInputTokens+anthropicOutputTokens, 0, apiKey)
+						}
+
+						// 替换 data 中的真实模型名为虚拟模型名
+						if realModel != req.Model {
+							payload = bytes.ReplaceAll(payload, []byte(realModel), []byte(req.Model))
+						}
+						c.Writer.Write([]byte("data: "))
+						c.Writer.Write(payload)
+						c.Writer.Write([]byte("\n"))
+					} else {
+						c.Writer.Write(line)
+						c.Writer.Write([]byte("\n"))
+					}
 					c.Writer.Flush()
-					continue
 				}
-
-				if bytes.HasPrefix(line, []byte("data: ")) {
-					payload := line[6:]
-
-					// 提取 usage 数据（Anthropic 流式拆分：input 在 message_start，output 在 message_delta）
-					var startChunk struct {
-						Type string `json:"type"`
-						Message struct {
-							InputTokens int `json:"input_tokens"`
-						} `json:"message"`
-					}
-					if json.Unmarshal(payload, &startChunk) == nil && startChunk.Type == "message_start" {
-						anthropicInputTokens = startChunk.Message.InputTokens
-					}
-					var deltaChunk struct {
-						Type  string `json:"type"`
-						Usage struct {
-							OutputTokens int `json:"output_tokens"`
-						} `json:"usage"`
-					}
-					if json.Unmarshal(payload, &deltaChunk) == nil && deltaChunk.Type == "message_delta" {
-						anthropicOutputTokens = deltaChunk.Usage.OutputTokens
-						// 输出 tokens 提取完毕，记录用量
-						go tokenService.RecordUsageNow(reqID, realModel, req.Model, targetProvider,
-							inputTokens, 0, anthropicInputTokens, anthropicOutputTokens,
-							anthropicInputTokens+anthropicOutputTokens, 0, apiKey)
-					}
-
-					// 替换 data 中的真实模型名为虚拟模型名
-					if realModel != req.Model {
-						payload = bytes.ReplaceAll(payload, []byte(realModel), []byte(req.Model))
-					}
-					c.Writer.Write([]byte("data: "))
-					c.Writer.Write(payload)
-					c.Writer.Write([]byte("\n"))
-				} else {
-					c.Writer.Write(line)
-					c.Writer.Write([]byte("\n"))
-				}
-				c.Writer.Flush()
-			}
 
 			if err := scanner.Err(); err != nil {
 				log.Error().Err(err).Msg("anthropic stream scan error")
@@ -610,7 +673,7 @@ func handleAnthropicMessages(
 			return
 		}
 
-		// 提取用量并记录（Anthropic 响应格式: {"usage":{"input_tokens":N,"output_tokens":M}}）
+		// 提取用量并记录（同时支持 Anthropic 格式 input_tokens/output_tokens 和 OpenAI 格式 prompt_tokens/completion_tokens）
 		var anthropicUsage struct {
 			Usage struct {
 				InputTokens  int `json:"input_tokens"`
@@ -621,6 +684,23 @@ func handleAnthropicMessages(
 		if json.Unmarshal(anthropicResp, &anthropicUsage) == nil {
 			realInput = anthropicUsage.Usage.InputTokens
 			realOutput = anthropicUsage.Usage.OutputTokens
+		}
+		// 回退：如果 Anthropic 格式没有值，尝试 OpenAI 格式
+		if realInput == 0 || realOutput == 0 {
+			var openAIUsage struct {
+				Usage struct {
+					PromptTokens     int `json:"prompt_tokens"`
+					CompletionTokens int `json:"completion_tokens"`
+				} `json:"usage"`
+			}
+			if json.Unmarshal(anthropicResp, &openAIUsage) == nil {
+				if realInput == 0 {
+					realInput = openAIUsage.Usage.PromptTokens
+				}
+				if realOutput == 0 {
+					realOutput = openAIUsage.Usage.CompletionTokens
+				}
+			}
 		}
 		// 记录用量（无论解析是否成功，都写入存储层）
 		tokenService.RecordUsageNow(reqID, realModel, req.Model, targetProvider,
@@ -648,12 +728,39 @@ func toTokenMessages(msgs []Message) []token.Message {
 }
 
 // parseUsage 从 OpenAI 兼容响应 JSON 中提取 usage 字段
+// 同时支持 OpenAI 格式（prompt_tokens/completion_tokens）和 Anthropic 格式（input_tokens/output_tokens）
 func parseUsage(body []byte) (promptTokens, completionTokens, totalTokens int) {
+	// 优先尝试 OpenAI 格式: {"usage":{"prompt_tokens":N,"completion_tokens":M,"total_tokens":T}}
 	var resp ChatCompletionResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return 0, 0, 0
+	if err := json.Unmarshal(body, &resp); err == nil {
+		if resp.Usage.PromptTokens > 0 || resp.Usage.CompletionTokens > 0 {
+			return resp.Usage.PromptTokens, resp.Usage.CompletionTokens, resp.Usage.TotalTokens
+		}
 	}
-	return resp.Usage.PromptTokens, resp.Usage.CompletionTokens, resp.Usage.TotalTokens
+	// 回退：尝试 Anthropic 格式 {"usage":{"input_tokens":N,"output_tokens":M}}
+	var anthropicResp map[string]interface{}
+	if err := json.Unmarshal(body, &anthropicResp); err == nil {
+		if usage, ok := anthropicResp["usage"].(map[string]interface{}); ok {
+			if v, ok := usage["input_tokens"]; ok {
+				if f, ok := v.(float64); ok {
+					promptTokens = int(f)
+				}
+			}
+			if v, ok := usage["output_tokens"]; ok {
+				if f, ok := v.(float64); ok {
+					completionTokens = int(f)
+				}
+			}
+			if v, ok := usage["total_tokens"]; ok {
+				if f, ok := v.(float64); ok {
+					totalTokens = int(f)
+				}
+			} else {
+				totalTokens = promptTokens + completionTokens
+			}
+		}
+	}
+	return promptTokens, completionTokens, totalTokens
 }
 
 // toProviderTools 将网关的 Tool 转为 Provider 格式的 Tool
