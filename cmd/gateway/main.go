@@ -93,7 +93,7 @@ func main() {
 	r.Use(middleware.Recovery())
 	r.Use(middleware.CORS())
 	r.Use(middleware.RateLimit(cfg.RateLimit))
-	r.Use(middleware.Auth(authService, cfg.Health.Path, cfg.Metrics.Path))
+	r.Use(middleware.Auth(authService, cfg.Health.Path, cfg.Metrics.Path, "/v1/usage/*", "/v1/admin/*"))
 
 	// 注册公开路由
 	r.GET(cfg.Health.Path, health.Handler())
@@ -112,7 +112,7 @@ func main() {
 	}
 
 	// Token 用量统计查询路由
-	api.GET("/usage", handleUsageQuery(tokenService))
+	api.GET("/usage", handleUsageQuery(tokenService, authService))
 	api.GET("/usage/:request_id", handleUsageByID(tokenService))
 	api.GET("/usage/stats", handleUsageStats(tokenService))
 	api.GET("/admin/usage", handleAdminUsage(tokenService))

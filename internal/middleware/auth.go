@@ -11,15 +11,28 @@ import (
 
 // Auth API Key 认证中间件
 // 支持白名单路径（如 /health、/metrics）跳过认证
+// 以 /* 结尾的路径作为前缀匹配（如 /v1/usage/* 匹配 /v1/usage/xxx）
 func Auth(authService *auth.Service, publicPaths ...string) gin.HandlerFunc {
-	publicPathSet := make(map[string]struct{}, len(publicPaths))
+	exactSet := make(map[string]struct{}, len(publicPaths))
+	prefixes := make([]string, 0, len(publicPaths))
 	for _, p := range publicPaths {
-		publicPathSet[p] = struct{}{}
+		if len(p) > 2 && p[len(p)-2:] == "/*" {
+			prefixes = append(prefixes, p[:len(p)-2])
+		} else {
+			exactSet[p] = struct{}{}
+		}
 	}
 	return func(c *gin.Context) {
-		if _, skip := publicPathSet[c.Request.URL.Path]; skip {
+		path := c.Request.URL.Path
+		if _, skip := exactSet[path]; skip {
 			c.Next()
 			return
+		}
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(path, prefix) {
+				c.Next()
+				return
+			}
 		}
 
 		authHeader := c.GetHeader("Authorization")

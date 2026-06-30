@@ -14,6 +14,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/sony/gobreaker"
 
+	"llm-gateway/internal/auth"
 	"llm-gateway/internal/mapper"
 	"llm-gateway/internal/metrics"
 	"llm-gateway/internal/storage"
@@ -810,14 +811,20 @@ func rewriteAnthropicToolCalls(body []byte, providerName string) []byte {
 // ================= Token 用量查询 API =================
 
 // handleUsageQuery 按 API Key 查询自己的用量记录
-func handleUsageQuery(tokenService *token.Service) gin.HandlerFunc {
+func handleUsageQuery(tokenService *token.Service, authService *auth.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		apiKeyVal, _ := c.Get("api_key")
-		apiKeyStr, _ := apiKeyVal.(string)
-
+		apiKeyStr := c.Query("api_key")
+		name := c.Query("name")
 		model := c.Query("model")
 		startTime := c.Query("start_time")
 		endTime := c.Query("end_time")
+
+		// 如果传了 name，先解析为实际 API Key
+		if name != "" && apiKeyStr == "" {
+			if info, ok := authService.FindKeyByName(name); ok {
+				apiKeyStr = info.Key
+			}
+		}
 
 		records, err := tokenService.QueryByAPIKey(apiKeyStr, model, startTime, endTime)
 		if err != nil {

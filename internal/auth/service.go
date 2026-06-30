@@ -54,6 +54,18 @@ func New(rdb *redis.Client, seedKeys map[string]*KeyInfo) *Service {
 	return svc
 }
 
+// FindKeyByName 根据 Key 名称查找 API Key（遍历种子 Key）
+func (s *Service) FindKeyByName(name string) (*KeyInfo, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, info := range s.seedKeys {
+		if info.Name == name {
+			return info, true
+		}
+	}
+	return nil, false
+}
+
 // Validate 验证 API Key 是否有效
 // 返回 KeyInfo 和是否有效
 func (s *Service) Validate(key string) (*KeyInfo, bool) {

@@ -285,10 +285,17 @@ type RedisStorage struct {
 	ctx   context.Context
 }
 
-// NewRedisStorage 创建 Redis 存储，如果 redisClient 为 nil 则降级到文件存储
+// NewRedisStorage 创建 Redis 存储，如果 redis 不可用则降级到文件存储
 func NewRedisStorage(redisClient *redis.Client) UsageStorage {
 	if redisClient == nil {
 		log.Info().Msg("redis not configured, falling back to file storage")
+		return NewFileStorage("")
+	}
+	// 测试连通性
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := redisClient.Ping(ctx).Err(); err != nil {
+		log.Warn().Err(err).Msg("redis unreachable, falling back to file storage")
 		return NewFileStorage("")
 	}
 	log.Info().Msg("token usage redis storage enabled")
