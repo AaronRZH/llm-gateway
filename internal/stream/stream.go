@@ -29,6 +29,15 @@ type StreamResult struct {
 	AccumulatedContent string
 	// AccumulatedToolCalls 累计的 tool_calls 列表
 	AccumulatedToolCalls []ToolCallChunk
+	// Usage 从 SSE 最后一个 chunk 提取的真实 token 用量
+	Usage *StreamUsage
+}
+
+// StreamUsage 流式 token 用量（从最后一个 SSE chunk 的 usage 字段提取）
+type StreamUsage struct {
+	PromptTokens     int
+	CompletionTokens int
+	TotalTokens      int
 }
 
 // ToolCallChunk 流式 tool_call chunk
@@ -86,6 +95,16 @@ func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadClose
 			// 提取并累计 tool_calls
 			extractToolCalls(payload, result)
 
+			// 提取 usage（OpenAI 在最后一个 chunk 的 usage 字段返回真实 token 数）
+			if result.Usage == nil {
+				if usage := extractUsage(payload); usage != nil {
+					result.Usage = usage
+				}
+			} else {
+				// 合并增量 usage（Anthropic 格式）
+				mergeUsage(result.Usage, extractUsage(payload))
+			}
+
 			// 替换 model 字段
 			rewritten := h.rewriteModelField(payload, virtualModel)
 
@@ -105,6 +124,77 @@ func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadClose
 	}
 
 	return result
+}
+
+// extractUsage 从 SSE chunk 提取真实 token 用量
+// OpenAI 格式: {"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150}}
+// Anthropic 格式: message_start 含 "input_tokens", message_delta 含 "usage.output_tokens"
+func extractUsage(payload []byte) *StreamUsage {
+	// 尝试 OpenAI 格式: {"choices":[...],"usage":{"prompt_tokens":...}}
+	var resp struct {
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+			TotalTokens      int `json:"total_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(payload, &resp); err == nil {
+		if resp.Usage.PromptTokens > 0 || resp.Usage.CompletionTokens > 0 {
+			return &StreamUsage{
+				PromptTokens:     resp.Usage.PromptTokens,
+				CompletionTokens: resp.Usage.CompletionTokens,
+				TotalTokens:      resp.Usage.TotalTokens,
+			}
+		}
+	}
+
+	// 尝试 Anthropic 格式: message_start 中的 "input_tokens"
+	var startChunk struct {
+		Type       string `json:"type"`
+		Message    struct {
+			InputTokens int `json:"input_tokens"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(payload, &startChunk); err == nil && startChunk.Type == "message_start" {
+		if startChunk.Message.InputTokens > 0 {
+			return &StreamUsage{
+				PromptTokens: startChunk.Message.InputTokens,
+			}
+		}
+	}
+
+	// 尝试 Anthropic 格式: message_delta 中的 "usage.output_tokens"
+	var deltaChunk struct {
+		Type    string `json:"type"`
+		Usage   struct {
+			OutputTokens int `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(payload, &deltaChunk); err == nil && deltaChunk.Type == "message_delta" {
+		if deltaChunk.Usage.OutputTokens > 0 {
+			return &StreamUsage{
+				CompletionTokens: deltaChunk.Usage.OutputTokens,
+			}
+		}
+	}
+
+	return nil
+}
+
+// mergeUsage 合并增量 usage（Anthropic 流式拆分 input/output）
+func mergeUsage(existing *StreamUsage, incoming *StreamUsage) {
+	if incoming == nil {
+		return
+	}
+	if incoming.PromptTokens > 0 {
+		existing.PromptTokens = incoming.PromptTokens
+	}
+	if incoming.CompletionTokens > 0 {
+		existing.CompletionTokens = incoming.CompletionTokens
+	}
+	if incoming.TotalTokens > 0 {
+		existing.TotalTokens = incoming.TotalTokens
+	}
 }
 
 // ExtractToolCalls 从 StreamResult 中提取 tool_calls

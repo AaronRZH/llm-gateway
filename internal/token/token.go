@@ -8,6 +8,8 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"llm-gateway/internal/config"
+	"llm-gateway/internal/metrics"
+	"llm-gateway/internal/storage"
 )
 
 // Service Token 计算服务
@@ -17,10 +19,19 @@ type Service struct {
 	mapping   map[string]string // model -> tokenizer name
 	syncQueue chan UsageRecord
 
+	// 持久化存储
+	storage storage.UsageStorage
+
 	// 校准统计
 	totalEstimates int64
 	totalReal      int64
 	calibrated     bool
+}
+
+// SetStorage 设置持久化存储（graceful degradation: storage 可为 nil）
+func (s *Service) SetStorage(st storage.UsageStorage) {
+	s.storage = st
+	log.Info().Bool("enabled", st != nil).Msg("token storage configured")
 }
 
 // UsageRecord 用量记录（包含估算值和上游返回的真实值）
@@ -35,6 +46,7 @@ type UsageRecord struct {
 	RealTotal           int // 上游 API 返回的 total_tokens
 	Provider            string
 	ToolCalls           int // tool call 次数
+	APIKey              string // 请求使用的 API Key
 	Timestamp           int64
 }
 
@@ -107,7 +119,7 @@ func (s *Service) EstimateOutput(text string, model string) int {
 // RecordUsage 记录用量（异步），包含估算值和上游真实值
 func (s *Service) RecordUsage(requestID, model, virtualModel, provider string,
 	estimatedInput, estimatedOutput int,
-	realInput, realOutput, realTotal int, toolCalls int) {
+	realInput, realOutput, realTotal int, toolCalls int, apiKey string) {
 
 	record := UsageRecord{
 		RequestID:       requestID,
@@ -120,6 +132,7 @@ func (s *Service) RecordUsage(requestID, model, virtualModel, provider string,
 		RealTotal:       realTotal,
 		Provider:        provider,
 		ToolCalls:       toolCalls,
+		APIKey:          apiKey,
 		Timestamp:       time.Now().Unix(),
 	}
 
@@ -128,6 +141,107 @@ func (s *Service) RecordUsage(requestID, model, virtualModel, provider string,
 	default:
 		log.Warn().Msg("usage sync queue full, dropping record")
 	}
+
+	// 实时写入 Prometheus 指标（仅当有真实 token 数据时）
+	if realInput > 0 || realOutput > 0 {
+		metrics.RecordTokenUsage(model, realInput, realOutput)
+	}
+}
+
+// RecordUsageNow 同步记录用量 + 持久化（适用于非流式，直接写存储）
+func (s *Service) RecordUsageNow(requestID, model, virtualModel, provider string,
+	estimatedInput, estimatedOutput int,
+	realInput, realOutput, realTotal int, toolCalls int, apiKey string) {
+
+	// 先通过异步队列记录日志和指标
+	s.RecordUsage(requestID, model, virtualModel, provider,
+		estimatedInput, estimatedOutput, realInput, realOutput, realTotal, toolCalls, apiKey)
+
+	// 同步持久化到存储层
+	if s.storage != nil {
+		rec := storage.UsageRecord{
+			RequestID:    requestID,
+			VirtualModel: virtualModel,
+			RealModel:    model,
+			Provider:     provider,
+			InputTokens:  realInput,
+			OutputTokens: realOutput,
+			TotalTokens:  realTotal,
+			EstInput:     estimatedInput,
+			EstOutput:    estimatedOutput,
+			APIKey:       apiKey,
+			CreatedAt:    time.Now(),
+		}
+		if err := s.storage.Persist(rec); err != nil {
+			log.Error().Err(err).Str("request_id", requestID).Msg("persist usage failed")
+		}
+	}
+}
+
+// ---- 查询方法（全部委托给 storage） ----
+
+// QueryByAPIKey 按 API Key 查询用量
+func (s *Service) QueryByAPIKey(apiKey, model, startTime, endTime string) ([]storage.UsageRecord, error) {
+	if s.storage == nil {
+		return nil, nil
+	}
+	return s.storage.QueryByAPIKey(apiKey, model, startTime, endTime)
+}
+
+// QueryByTimeRange 查询所有用量记录
+func (s *Service) QueryByTimeRange(startTime, endTime string) ([]storage.UsageRecord, error) {
+	if s.storage == nil {
+		return nil, nil
+	}
+	return s.storage.QueryByTimeRange(startTime, endTime)
+}
+
+// QueryByRequestID 按请求 ID 查询
+func (s *Service) QueryByRequestID(requestID string) (*storage.UsageRecord, error) {
+	if s.storage == nil {
+		return nil, nil
+	}
+	return s.storage.QueryByRequestID(requestID)
+}
+
+// AggregateDaily 按日聚合统计
+func (s *Service) AggregateDaily(startTime, endTime string) ([]storage.UsageSummary, error) {
+	if s.storage == nil {
+		return nil, nil
+	}
+	return s.storage.AggregateDaily(startTime, endTime)
+}
+
+// AggregateWeekly 按周聚合统计
+func (s *Service) AggregateWeekly(startTime, endTime string) ([]storage.UsageSummary, error) {
+	if s.storage == nil {
+		return nil, nil
+	}
+	return s.storage.AggregateWeekly(startTime, endTime)
+}
+
+// AggregateMonthly 按月聚合统计
+func (s *Service) AggregateMonthly(startTime, endTime string) ([]storage.UsageSummary, error) {
+	if s.storage == nil {
+		return nil, nil
+	}
+	return s.storage.AggregateMonthly(startTime, endTime)
+}
+
+// AdminTotalStats 管理员总统计
+func (s *Service) AdminTotalStats(startTime, endTime string) (map[string]int64, error) {
+	if s.storage == nil {
+		return nil, nil
+	}
+	return s.storage.AdminTotalStats(startTime, endTime)
+}
+
+// AdminDailyStats 管理员按日统计
+func (s *Service) AdminDailyStats(startTime, endTime string) ([]storage.UsageSummary, error) {
+	if s.storage == nil {
+		return nil, nil
+	}
+	return s.storage.AdminDailyStats(startTime, endTime)
 }
 
 // syncWorker 后台处理用量记录：持久化日志 + 估算校准
@@ -165,6 +279,25 @@ func (s *Service) syncWorker() {
 			logEvent.
 				Int("estimated_total", record.EstimatedInput+record.EstimatedOutput).
 				Msg("usage recorded (estimated only)")
+			// 持久化到存储层（如果已配置）
+			if s.storage != nil {
+				stoRec := storage.UsageRecord{
+					RequestID:    record.RequestID,
+					VirtualModel: record.VirtualModel,
+					RealModel:    record.Model,
+					Provider:     record.Provider,
+					InputTokens:  record.RealInput,
+					OutputTokens: record.RealOutput,
+					TotalTokens:  record.RealTotal,
+					EstInput:     record.EstimatedInput,
+					EstOutput:    record.EstimatedOutput,
+					APIKey:       record.APIKey,
+					CreatedAt:    time.Unix(record.Timestamp, 0),
+				}
+				if err := s.storage.Persist(stoRec); err != nil {
+					log.Error().Err(err).Str("request_id", record.RequestID).Msg("storage persist failed")
+				}
+			}
 		}
 	}
 }

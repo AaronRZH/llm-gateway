@@ -24,7 +24,8 @@ import (
 	"llm-gateway/internal/provider"
 	redisutil "llm-gateway/pkg/redis"
 	"llm-gateway/internal/router"
-	"llm-gateway/internal/stream"
+	"llm-gateway/internal/storage"
+		"llm-gateway/internal/stream"
 	"llm-gateway/internal/token"
 )
 
@@ -77,6 +78,10 @@ func main() {
 	seedKeys := buildSeedKeys(cfg.APIKeys)
 	authService := auth.New(redisClient, seedKeys)
 
+	// 初始化存储层（Redis → 文件降级）
+	usageStorage := storage.NewRedisStorage(redisClient)
+	tokenService.SetStorage(usageStorage)
+
 	// 创建 Gin 引擎
 	if cfg.App.Env == "prod" {
 		gin.SetMode(gin.ReleaseMode)
@@ -105,6 +110,15 @@ func main() {
 		api.POST("/messages/count_tokens", handleCountTokens(providerManager))
 		api.GET("/models", handleListModels(mapperService))
 	}
+
+	// Token 用量统计查询路由
+	api.GET("/usage", handleUsageQuery(tokenService))
+	api.GET("/usage/:request_id", handleUsageByID(tokenService))
+	api.GET("/usage/stats", handleUsageStats(tokenService))
+	api.GET("/admin/usage", handleAdminUsage(tokenService))
+	api.GET("/admin/usage/daily", handleAdminDailyUsage(tokenService))
+	api.GET("/admin/usage/stats", handleAdminStats(tokenService))
+	api.GET("/admin/calibration", handleAdminCalibration(tokenService))
 
 	// 启动 HTTP 服务
 	srv := &http.Server{

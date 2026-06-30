@@ -15,6 +15,8 @@ import (
 	"github.com/sony/gobreaker"
 
 	"llm-gateway/internal/mapper"
+	"llm-gateway/internal/metrics"
+	"llm-gateway/internal/storage"
 	"llm-gateway/internal/provider"
 	"llm-gateway/internal/router"
 	"llm-gateway/internal/stream"
@@ -88,6 +90,8 @@ func handleChatCompletion(
 	return func(c *gin.Context) {
 		reqID := uuid.New().String()
 		log := log.With().Str("request_id", reqID).Logger()
+		apiKeyVal, _ := c.Get("api_key")
+		apiKey, _ := apiKeyVal.(string)
 
 		var req ChatCompletionRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
@@ -187,8 +191,18 @@ func handleChatCompletion(
 			estimatedOutput := tokenService.EstimateOutput(result.AccumulatedContent, realModel)
 			toolCalls := streamHandler.ExtractToolCalls(result)
 			estimatedToolCalls := len(toolCalls)
+
+			// 优先使用从 SSE 提取的真实 token 数，没有则回退到 0
+			var realInput, realOutput, realTotal int
+			if result.Usage != nil {
+				realInput = result.Usage.PromptTokens
+				realOutput = result.Usage.CompletionTokens
+				realTotal = result.Usage.TotalTokens
+			}
 			go tokenService.RecordUsage(reqID, realModel, req.Model, targetProvider,
-				inputTokens, estimatedOutput, 0, 0, 0, estimatedToolCalls)
+				inputTokens, estimatedOutput, realInput, realOutput, realTotal, estimatedToolCalls, apiKey)
+
+			metrics.RecordRequest("POST", "/v1/chat/completions", http.StatusOK, req.Model, time.Since(start).Seconds())
 		} else {
 			// 非流式响应 — 遍历候选直到请求成功
 			var resp *http.Response
@@ -252,8 +266,10 @@ func handleChatCompletion(
 			// 解析 tool_calls
 			toolCalls := parseToolCalls(body, targetProvider)
 			_ = realTotal // 保留用于未来的扩展
-			go tokenService.RecordUsage(reqID, realModel, req.Model, targetProvider,
-				inputTokens, 0, realInput, realOutput, realTotal, len(toolCalls))
+			tokenService.RecordUsageNow(reqID, realModel, req.Model, targetProvider,
+				inputTokens, 0, realInput, realOutput, realTotal, len(toolCalls), apiKey)
+
+			metrics.RecordRequest("POST", "/v1/chat/completions", resp.StatusCode, req.Model, time.Since(start).Seconds())
 
 			// 重写响应中的 model 字段
 			body = mapper.RewriteResponse(body, req.Model)
@@ -344,6 +360,8 @@ func handleAnthropicMessages(
 	return func(c *gin.Context) {
 		reqID := uuid.New().String()
 		log := log.With().Str("request_id", reqID).Logger()
+		apiKeyVal, _ := c.Get("api_key")
+		apiKey, _ := apiKeyVal.(string)
 		log.Info().Msg("anthropic /messages request")
 
 		var req AnthropicRequest
@@ -512,6 +530,9 @@ func handleAnthropicMessages(
 			scanner := bufio.NewScanner(resp.Body)
 			scanner.Split(bufio.ScanLines)
 
+			// 累计 Anthropic 流式 token 用量
+			var anthropicInputTokens, anthropicOutputTokens int
+
 			for scanner.Scan() {
 				line := scanner.Bytes()
 
@@ -524,6 +545,31 @@ func handleAnthropicMessages(
 
 				if bytes.HasPrefix(line, []byte("data: ")) {
 					payload := line[6:]
+
+					// 提取 usage 数据（Anthropic 流式拆分：input 在 message_start，output 在 message_delta）
+					var startChunk struct {
+						Type string `json:"type"`
+						Message struct {
+							InputTokens int `json:"input_tokens"`
+						} `json:"message"`
+					}
+					if json.Unmarshal(payload, &startChunk) == nil && startChunk.Type == "message_start" {
+						anthropicInputTokens = startChunk.Message.InputTokens
+					}
+					var deltaChunk struct {
+						Type  string `json:"type"`
+						Usage struct {
+							OutputTokens int `json:"output_tokens"`
+						} `json:"usage"`
+					}
+					if json.Unmarshal(payload, &deltaChunk) == nil && deltaChunk.Type == "message_delta" {
+						anthropicOutputTokens = deltaChunk.Usage.OutputTokens
+						// 输出 tokens 提取完毕，记录用量
+						go tokenService.RecordUsage(reqID, realModel, req.Model, targetProvider,
+							inputTokens, 0, anthropicInputTokens, anthropicOutputTokens,
+							anthropicInputTokens+anthropicOutputTokens, 0, apiKey)
+					}
+
 					// 替换 data 中的真实模型名为虚拟模型名
 					if realModel != req.Model {
 						payload = bytes.ReplaceAll(payload, []byte(realModel), []byte(req.Model))
@@ -557,11 +603,28 @@ func handleAnthropicMessages(
 			return
 		}
 
-		c.Data(resp.StatusCode, "application/json", anthropicResp)
-	}
-}
+		// 提取用量并记录（Anthropic 响应格式: {"usage":{"input_tokens":N,"output_tokens":M}}）
+		var anthropicUsage struct {
+			Usage struct {
+				InputTokens  int `json:"input_tokens"`
+				OutputTokens int `json:"output_tokens"`
+			} `json:"usage"`
+		}
+		if json.Unmarshal(anthropicResp, &anthropicUsage) == nil {
+			inputTok := anthropicUsage.Usage.InputTokens
+			outputTok := anthropicUsage.Usage.OutputTokens
+			if inputTok > 0 || outputTok > 0 {
+									tokenService.RecordUsageNow(reqID, realModel, req.Model, targetProvider,
+						inputTokens, 0, inputTok, outputTok, inputTok+outputTok, 0, apiKey)
+				}
+			}
 
-func toProviderMessages(msgs []Message) []provider.Message {
+			metrics.RecordRequest("POST", "/v1/messages", resp.StatusCode, req.Model, time.Since(start).Seconds())
+			c.Data(resp.StatusCode, "application/json", anthropicResp)
+		}
+	}
+
+	func toProviderMessages(msgs []Message) []provider.Message {
 	out := make([]provider.Message, len(msgs))
 	for i, m := range msgs {
 		out[i] = provider.Message{Role: m.Role, Content: m.Content}
@@ -742,4 +805,123 @@ func rewriteAnthropicToolCalls(body []byte, providerName string) []byte {
 
 	result, _ := json.Marshal(openAIResp)
 	return result
+}
+
+// ================= Token 用量查询 API =================
+
+// handleUsageQuery 按 API Key 查询自己的用量记录
+func handleUsageQuery(tokenService *token.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		apiKeyVal, _ := c.Get("api_key")
+		apiKeyStr, _ := apiKeyVal.(string)
+
+		model := c.Query("model")
+		startTime := c.Query("start_time")
+		endTime := c.Query("end_time")
+
+		records, err := tokenService.QueryByAPIKey(apiKeyStr, model, startTime, endTime)
+		if err != nil {
+			log.Error().Err(err).Msg("query usage failed")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "query failed"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"data": records, "total": len(records)})
+	}
+}
+
+// handleUsageByID 按 request_id 查询用量（只返回自己的）
+func handleUsageByID(tokenService *token.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		requestID := c.Param("request_id")
+		record, err := tokenService.QueryByRequestID(requestID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "query failed"})
+			return
+		}
+		if record == nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "record not found"})
+			return
+		}
+		c.JSON(http.StatusOK, record)
+	}
+}
+
+// handleUsageStats 按 API Key 查询自己的聚合统计
+func handleUsageStats(tokenService *token.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		granularity := c.DefaultQuery("granularity", "daily")
+		startTime := c.Query("start_time")
+		endTime := c.Query("end_time")
+
+		var summaries []storage.UsageSummary
+		var err error
+		switch granularity {
+		case "daily":
+			summaries, err = tokenService.AggregateDaily(startTime, endTime)
+		case "weekly":
+			summaries, err = tokenService.AggregateWeekly(startTime, endTime)
+		case "monthly":
+			summaries, err = tokenService.AggregateMonthly(startTime, endTime)
+		default:
+			summaries, err = tokenService.AggregateDaily(startTime, endTime)
+		}
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "aggregation failed"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"data": summaries, "granularity": granularity})
+	}
+}
+
+// handleAdminUsage 管理员查询所有用量记录
+func handleAdminUsage(tokenService *token.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		startTime := c.Query("start_time")
+		endTime := c.Query("end_time")
+
+		records, err := tokenService.QueryByTimeRange(startTime, endTime)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "query failed"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"data": records, "total": len(records)})
+	}
+}
+
+// handleAdminDailyUsage 管理端按日统计
+func handleAdminDailyUsage(tokenService *token.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		startTime := c.Query("start_time")
+		endTime := c.Query("end_time")
+
+		summaries, err := tokenService.AdminDailyStats(startTime, endTime)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "query failed"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"data": summaries})
+	}
+}
+
+// handleAdminStats 管理端总统计
+func handleAdminStats(tokenService *token.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		startTime := c.Query("start_time")
+		endTime := c.Query("end_time")
+
+		stats, err := tokenService.AdminTotalStats(startTime, endTime)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "query failed"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"data": stats})
+	}
+}
+
+// handleAdminCalibration 管理端校准信息
+func handleAdminCalibration(tokenService *token.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		info := tokenService.CalibrationInfo()
+		c.JSON(http.StatusOK, info)
+	}
 }

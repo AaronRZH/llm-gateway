@@ -1,6 +1,8 @@
 package metrics
 
 import (
+	"fmt"
+
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -80,4 +82,16 @@ func Handler() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		h.ServeHTTP(c.Writer, c.Request)
 	}
+}
+
+// RecordRequest 记录请求级别指标 (RequestTotal + RequestDuration)
+func RecordRequest(method, path string, status int, model string, duration float64) {
+	RequestTotal.WithLabelValues(method, path, fmt.Sprintf("%d", status), model).Inc()
+	RequestDuration.WithLabelValues(method, path, model).Observe(duration)
+}
+
+// RecordTokenUsage 记录 token 用量指标
+func RecordTokenUsage(model string, input, output int) {
+	TokenUsage.WithLabelValues(model, "input").Add(float64(input))
+	TokenUsage.WithLabelValues(model, "output").Add(float64(output))
 }
