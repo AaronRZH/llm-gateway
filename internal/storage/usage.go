@@ -246,6 +246,7 @@ func (s *FileStorage) summarizeDaily(records []UsageRecord) ([]UsageSummary, err
 		b, ok := buckets[key]
 		if !ok {
 			buckets[key] = &UsageSummary{Date: key.Date, Model: key.Model, Provider: key.Provider}
+			b = buckets[key]
 		}
 		b.TotalInput += r.InputTokens
 		b.TotalOutput += r.OutputTokens
@@ -269,6 +270,7 @@ func (s *FileStorage) summarizeWeekly(records []UsageRecord) ([]UsageSummary, er
 		b, ok := buckets[key]
 		if !ok {
 			buckets[key] = &UsageSummary{Date: key.Week, Model: key.Model, Provider: key.Provider}
+			b = buckets[key]
 		}
 		b.TotalInput += r.InputTokens
 		b.TotalOutput += r.OutputTokens
@@ -543,6 +545,7 @@ func (s *RedisStorage) summarizeRecordsDaily(raw []string, startTime, endTime st
 		b, ok := buckets[key]
 		if !ok {
 			buckets[key] = &UsageSummary{Date: key.Date, Model: key.Model, Provider: key.Provider}
+			b = buckets[key]
 		}
 		b.TotalInput += rec.InputTokens
 		b.TotalOutput += rec.OutputTokens
@@ -573,6 +576,7 @@ func (s *RedisStorage) summarizeRecordsWeekly(raw []string, startTime, endTime s
 		b, ok := buckets[key]
 		if !ok {
 			buckets[key] = &UsageSummary{Date: key.Week, Model: key.Model, Provider: key.Provider}
+			b = buckets[key]
 		}
 		b.TotalInput += rec.InputTokens
 		b.TotalOutput += rec.OutputTokens
@@ -602,6 +606,7 @@ func (s *RedisStorage) summarizeRecordsMonthly(raw []string, startTime, endTime 
 		b, ok := buckets[key]
 		if !ok {
 			buckets[key] = &UsageSummary{Date: key.Month, Model: key.Model, Provider: key.Provider}
+			b = buckets[key]
 		}
 		b.TotalInput += rec.InputTokens
 		b.TotalOutput += rec.OutputTokens
