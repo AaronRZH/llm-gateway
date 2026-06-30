@@ -411,19 +411,26 @@ func (p *AnthropicProvider) ConvertResponse(resp *http.Response) ([]byte, error)
 		anthropicResp["content"] = ""
 	}
 
-	// usage（直接映射后端已返回的字段）
+	// usage：支持 Anthropic 格式（input_tokens/output_tokens）和后端代理的 OpenAI 格式（prompt_tokens/completion_tokens）
+	var inputTokens, outputTokens, totalTokens float64
 	if usage, ok := respBody["usage"].(map[string]interface{}); ok {
-		inputTokens, _ := usage["input_tokens"].(float64)
-		outputTokens, _ := usage["output_tokens"].(float64)
-		totalTokens, ok := usage["total_tokens"].(float64)
-		if !ok || totalTokens == 0 {
+		inputTokens, _ = usage["input_tokens"].(float64)
+		outputTokens, _ = usage["output_tokens"].(float64)
+		if inputTokens == 0 {
+			inputTokens, _ = usage["prompt_tokens"].(float64)
+		}
+		if outputTokens == 0 {
+			outputTokens, _ = usage["completion_tokens"].(float64)
+		}
+		totalTokens, _ = usage["total_tokens"].(float64)
+		if totalTokens == 0 {
 			totalTokens = inputTokens + outputTokens
 		}
-		anthropicResp["usage"] = map[string]interface{}{
-			"input_tokens":  int(inputTokens),
-			"output_tokens": int(outputTokens),
-			"total_tokens":  int(totalTokens),
-		}
+	}
+	anthropicResp["usage"] = map[string]interface{}{
+		"input_tokens":  int(inputTokens),
+		"output_tokens": int(outputTokens),
+		"total_tokens":  int(totalTokens),
 	}
 
 	jsonBody, err := json.Marshal(anthropicResp)
@@ -486,19 +493,26 @@ func (p *AnthropicProvider) ConvertResponseWithModel(resp *http.Response, virtua
 		anthropicResp["content"] = ""
 	}
 
-	// usage：如果 total_tokens 为 null，从 input + output 计算
+	// usage：支持 Anthropic 格式（input_tokens/output_tokens）和后端代理的 OpenAI 格式（prompt_tokens/completion_tokens）
+	var inputTokens, outputTokens, totalTokens float64
 	if usage, ok := respBody["usage"].(map[string]interface{}); ok {
-		inputTokens, _ := usage["input_tokens"].(float64)
-		outputTokens, _ := usage["output_tokens"].(float64)
-		totalTokens, ok := usage["total_tokens"].(float64)
-		if !ok || totalTokens == 0 {
+		inputTokens, _ = usage["input_tokens"].(float64)
+		outputTokens, _ = usage["output_tokens"].(float64)
+		if inputTokens == 0 {
+			inputTokens, _ = usage["prompt_tokens"].(float64)
+		}
+		if outputTokens == 0 {
+			outputTokens, _ = usage["completion_tokens"].(float64)
+		}
+		totalTokens, _ = usage["total_tokens"].(float64)
+		if totalTokens == 0 {
 			totalTokens = inputTokens + outputTokens
 		}
-		anthropicResp["usage"] = map[string]interface{}{
-			"input_tokens":  int(inputTokens),
-			"output_tokens": int(outputTokens),
-			"total_tokens":  int(totalTokens),
-		}
+	}
+	anthropicResp["usage"] = map[string]interface{}{
+		"input_tokens":  int(inputTokens),
+		"output_tokens": int(outputTokens),
+		"total_tokens":  int(totalTokens),
 	}
 
 	jsonBody, err := json.Marshal(anthropicResp)
