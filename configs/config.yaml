@@ -137,3 +137,10 @@ api_keys:
     name: "dev-client-1"
   - key: "sk-gateway-dev-key-002"
     name: "dev-client-2"
+
+# Auth 白名单路径（Auth 中间件会跳过这些路径的验证）
+auth_whitelist:
+  - "/health"
+  - "/metrics"
+  - "/v1/usage/*"
+  - "/v1/admin/*"

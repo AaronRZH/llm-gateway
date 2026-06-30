@@ -88,12 +88,12 @@ func main() {
 	}
 	r := gin.New()
 
-	// 全局中间件（Auth 支持 /health、/metrics 白名单）
+	// 全局中间件（Auth 支持白名单路径）
 	r.Use(middleware.Logger())
 	r.Use(middleware.Recovery())
 	r.Use(middleware.CORS())
 	r.Use(middleware.RateLimit(cfg.RateLimit))
-	r.Use(middleware.Auth(authService, cfg.Health.Path, cfg.Metrics.Path, "/v1/usage/*", "/v1/admin/*"))
+	r.Use(middleware.Auth(authService, cfg.AuthWhitelist...))
 
 	// 注册公开路由
 	r.GET(cfg.Health.Path, health.Handler())

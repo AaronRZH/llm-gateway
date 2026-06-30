@@ -23,6 +23,7 @@ type Config struct {
 	Metrics        MetricsConfig             `mapstructure:"metrics"`
 	Health         HealthConfig              `mapstructure:"health"`
 	APIKeys        []APIKeyConfig            `mapstructure:"api_keys"`
+	AuthWhitelist  []string                  `mapstructure:"auth_whitelist"`
 }
 
 type AppConfig struct {

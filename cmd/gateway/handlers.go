@@ -200,7 +200,7 @@ func handleChatCompletion(
 				realOutput = result.Usage.CompletionTokens
 				realTotal = result.Usage.TotalTokens
 			}
-			go tokenService.RecordUsage(reqID, realModel, req.Model, targetProvider,
+			go tokenService.RecordUsageNow(reqID, realModel, req.Model, targetProvider,
 				inputTokens, estimatedOutput, realInput, realOutput, realTotal, estimatedToolCalls, apiKey)
 
 			metrics.RecordRequest("POST", "/v1/chat/completions", http.StatusOK, req.Model, time.Since(start).Seconds())
@@ -359,6 +359,12 @@ func handleAnthropicMessages(
 	tokenService *token.Service,
 ) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// /count_tokens 由独立的 handleCountTokens 处理，跳过此 handler 避免消费 body
+		if c.Request.URL.Path == "/v1/messages/count_tokens" {
+			c.Next()
+			return
+		}
+
 		reqID := uuid.New().String()
 		log := log.With().Str("request_id", reqID).Logger()
 		apiKeyVal, _ := c.Get("api_key")
@@ -566,7 +572,7 @@ func handleAnthropicMessages(
 					if json.Unmarshal(payload, &deltaChunk) == nil && deltaChunk.Type == "message_delta" {
 						anthropicOutputTokens = deltaChunk.Usage.OutputTokens
 						// 输出 tokens 提取完毕，记录用量
-						go tokenService.RecordUsage(reqID, realModel, req.Model, targetProvider,
+						go tokenService.RecordUsageNow(reqID, realModel, req.Model, targetProvider,
 							inputTokens, 0, anthropicInputTokens, anthropicOutputTokens,
 							anthropicInputTokens+anthropicOutputTokens, 0, apiKey)
 					}
@@ -611,17 +617,17 @@ func handleAnthropicMessages(
 				OutputTokens int `json:"output_tokens"`
 			} `json:"usage"`
 		}
+		realInput, realOutput := 0, 0
 		if json.Unmarshal(anthropicResp, &anthropicUsage) == nil {
-			inputTok := anthropicUsage.Usage.InputTokens
-			outputTok := anthropicUsage.Usage.OutputTokens
-			if inputTok > 0 || outputTok > 0 {
-									tokenService.RecordUsageNow(reqID, realModel, req.Model, targetProvider,
-						inputTokens, 0, inputTok, outputTok, inputTok+outputTok, 0, apiKey)
-				}
-			}
+			realInput = anthropicUsage.Usage.InputTokens
+			realOutput = anthropicUsage.Usage.OutputTokens
+		}
+		// 记录用量（无论解析是否成功，都写入存储层）
+		tokenService.RecordUsageNow(reqID, realModel, req.Model, targetProvider,
+			inputTokens, 0, realInput, realOutput, realInput+realOutput, 0, apiKey)
 
-			metrics.RecordRequest("POST", "/v1/messages", resp.StatusCode, req.Model, time.Since(start).Seconds())
-			c.Data(resp.StatusCode, "application/json", anthropicResp)
+		metrics.RecordRequest("POST", "/v1/messages", resp.StatusCode, req.Model, time.Since(start).Seconds())
+		c.Data(resp.StatusCode, "application/json", anthropicResp)
 		}
 	}
 
