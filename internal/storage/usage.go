@@ -53,6 +53,8 @@ type UsageStorage interface {
 	AggregateDaily(startTime, endTime string) ([]UsageSummary, error)
 	AggregateWeekly(startTime, endTime string) ([]UsageSummary, error)
 	AggregateMonthly(startTime, endTime string) ([]UsageSummary, error)
+	SumTokensByAPIKey(apiKey, model, startTime, endTime string) (inputTokens, outputTokens, totalTokens, requestCount int, err error)
+	SumTokensByTimeRange(startTime, endTime string) (inputTokens, outputTokens, totalTokens, requestCount int, err error)
 	AdminTotalStats(startTime, endTime string) (map[string]int64, error)
 	AdminDailyStats(startTime, endTime string) ([]UsageSummary, error)
 	Close() error
@@ -210,6 +212,32 @@ func (s *FileStorage) filter(records []UsageRecord, apiKey, model, startTime, en
 	return result, nil
 }
 
+// SumTokensByAPIKey 按 API Key 聚合 token 统计
+func (s *FileStorage) SumTokensByAPIKey(apiKey, model, startTime, endTime string) (int, int, int, int, error) {
+	records, _ := s.filter(s.records, apiKey, model, startTime, endTime)
+	var inputTokens, outputTokens, totalTokens, requestCount int
+	for _, r := range records {
+		inputTokens += r.InputTokens
+		outputTokens += r.OutputTokens
+		totalTokens += r.TotalTokens
+		requestCount++
+	}
+	return inputTokens, outputTokens, totalTokens, requestCount, nil
+}
+
+// SumTokensByTimeRange 按时间范围聚合所有 token 统计
+func (s *FileStorage) SumTokensByTimeRange(startTime, endTime string) (int, int, int, int, error) {
+	records, _ := s.filter(s.records, "", "", startTime, endTime)
+	var inputTokens, outputTokens, totalTokens, requestCount int
+	for _, r := range records {
+		inputTokens += r.InputTokens
+		outputTokens += r.OutputTokens
+		totalTokens += r.TotalTokens
+		requestCount++
+	}
+	return inputTokens, outputTokens, totalTokens, requestCount, nil
+}
+
 func (s *FileStorage) summarizeDaily(records []UsageRecord) ([]UsageSummary, error) {
 	type k struct{ Date, Model, Provider string }
 	buckets := make(map[k]*UsageSummary)
@@ -359,6 +387,55 @@ func (s *RedisStorage) QueryByRequestID(requestID string) (*UsageRecord, error) 
 		}
 	}
 	return nil, nil
+}
+
+// SumTokensByAPIKey 按 API Key 聚合 token 统计
+func (s *RedisStorage) SumTokensByAPIKey(apiKey, model, startTime, endTime string) (int, int, int, int, error) {
+	raw, err := s.redis.LRange(s.ctx, "usage:recent:"+apiKey, 0, -1).Result()
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	var inputTokens, outputTokens, totalTokens, requestCount int
+	for _, r := range raw {
+		var rec UsageRecord
+		if json.Unmarshal([]byte(r), &rec) != nil {
+			continue
+		}
+		if model != "" && rec.RealModel != model {
+			continue
+		}
+		if !inTimeRange(rec.CreatedAt, startTime, endTime) {
+			continue
+		}
+		inputTokens += rec.InputTokens
+		outputTokens += rec.OutputTokens
+		totalTokens += rec.TotalTokens
+		requestCount++
+	}
+	return inputTokens, outputTokens, totalTokens, requestCount, nil
+}
+
+// SumTokensByTimeRange 按时间范围聚合所有 token 统计
+func (s *RedisStorage) SumTokensByTimeRange(startTime, endTime string) (int, int, int, int, error) {
+	raw, err := s.redis.LRange(s.ctx, "usage:recent:all", 0, -1).Result()
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	var inputTokens, outputTokens, totalTokens, requestCount int
+	for _, r := range raw {
+		var rec UsageRecord
+		if json.Unmarshal([]byte(r), &rec) != nil {
+			continue
+		}
+		if !inTimeRange(rec.CreatedAt, startTime, endTime) {
+			continue
+		}
+		inputTokens += rec.InputTokens
+		outputTokens += rec.OutputTokens
+		totalTokens += rec.TotalTokens
+		requestCount++
+	}
+	return inputTokens, outputTokens, totalTokens, requestCount, nil
 }
 
 func (s *RedisStorage) AggregateDaily(startTime, endTime string) ([]UsageSummary, error) {

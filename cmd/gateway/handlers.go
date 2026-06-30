@@ -816,7 +816,7 @@ func rewriteAnthropicToolCalls(body []byte, providerName string) []byte {
 
 // ================= Token 用量查询 API =================
 
-// handleUsageQuery 按 API Key 查询自己的用量记录
+// handleUsageQuery 按 API Key 查询自己的 token 用量统计（聚合结果，不输出全部记录）
 func handleUsageQuery(tokenService *token.Service, authService *auth.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		apiKeyStr := c.Query("api_key")
@@ -832,13 +832,18 @@ func handleUsageQuery(tokenService *token.Service, authService *auth.Service) gi
 			}
 		}
 
-		records, err := tokenService.QueryByAPIKey(apiKeyStr, model, startTime, endTime)
+		inputTokens, outputTokens, totalTokens, requestCount, err := tokenService.SumTokensByAPIKey(apiKeyStr, model, startTime, endTime)
 		if err != nil {
-			log.Error().Err(err).Msg("query usage failed")
+			log.Error().Err(err).Msg("sum tokens failed")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "query failed"})
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"data": records, "total": len(records)})
+		c.JSON(http.StatusOK, gin.H{
+			"input_tokens":  inputTokens,
+			"output_tokens": outputTokens,
+			"total_tokens":  totalTokens,
+			"request_count": requestCount,
+		})
 	}
 }
 
@@ -886,18 +891,24 @@ func handleUsageStats(tokenService *token.Service) gin.HandlerFunc {
 	}
 }
 
-// handleAdminUsage 管理员查询所有用量记录
+// handleAdminUsage 管理员查询所有用量统计（聚合结果）
 func handleAdminUsage(tokenService *token.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		startTime := c.Query("start_time")
 		endTime := c.Query("end_time")
 
-		records, err := tokenService.QueryByTimeRange(startTime, endTime)
+		inputTokens, outputTokens, totalTokens, requestCount, err := tokenService.SumTokensByTimeRange(startTime, endTime)
 		if err != nil {
+			log.Error().Err(err).Msg("sum tokens failed")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "query failed"})
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"data": records, "total": len(records)})
+		c.JSON(http.StatusOK, gin.H{
+			"input_tokens":  inputTokens,
+			"output_tokens": outputTokens,
+			"total_tokens":  totalTokens,
+			"request_count": requestCount,
+		})
 	}
 }
 

@@ -204,6 +204,22 @@ func (s *Service) QueryByRequestID(requestID string) (*storage.UsageRecord, erro
 	return s.storage.QueryByRequestID(requestID)
 }
 
+// SumTokensByAPIKey 按 API Key 聚合 token 统计
+func (s *Service) SumTokensByAPIKey(apiKey, model, startTime, endTime string) (inputTokens, outputTokens, totalTokens, requestCount int, err error) {
+	if s.storage == nil {
+		return 0, 0, 0, 0, nil
+	}
+	return s.storage.SumTokensByAPIKey(apiKey, model, startTime, endTime)
+}
+
+// SumTokensByTimeRange 按时间范围聚合所有 token 统计
+func (s *Service) SumTokensByTimeRange(startTime, endTime string) (inputTokens, outputTokens, totalTokens, requestCount int, err error) {
+	if s.storage == nil {
+		return 0, 0, 0, 0, nil
+	}
+	return s.storage.SumTokensByTimeRange(startTime, endTime)
+}
+
 // AggregateDaily 按日聚合统计
 func (s *Service) AggregateDaily(startTime, endTime string) ([]storage.UsageSummary, error) {
 	if s.storage == nil {
