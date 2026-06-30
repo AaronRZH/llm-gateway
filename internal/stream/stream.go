@@ -127,8 +127,8 @@ func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadClose
 }
 
 // extractUsage 从 SSE chunk 提取真实 token 用量
-// OpenAI 格式: {"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150}}
-// Anthropic 格式: message_start 含 "input_tokens", message_delta 含 "usage.output_tokens"
+// OpenAI 格式: {"choices":[...],"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150}}
+// Anthropic 格式: message_start 同时含 "input_tokens" 和 "output_tokens"，message_delta 同理
 func extractUsage(payload []byte) *StreamUsage {
 	// 尝试 OpenAI 格式: {"choices":[...],"usage":{"prompt_tokens":...}}
 	var resp struct {
@@ -148,33 +148,45 @@ func extractUsage(payload []byte) *StreamUsage {
 		}
 	}
 
-	// 尝试 Anthropic 格式: message_start 中的 "input_tokens"
+	// 尝试 Anthropic 格式: message_start 同时含 "input_tokens" 和 "output_tokens"
 	var startChunk struct {
-		Type       string `json:"type"`
-		Message    struct {
-			InputTokens int `json:"input_tokens"`
+		Type    string `json:"type"`
+		Message struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
 		} `json:"message"`
 	}
 	if err := json.Unmarshal(payload, &startChunk); err == nil && startChunk.Type == "message_start" {
+		usage := &StreamUsage{}
 		if startChunk.Message.InputTokens > 0 {
-			return &StreamUsage{
-				PromptTokens: startChunk.Message.InputTokens,
-			}
+			usage.PromptTokens = startChunk.Message.InputTokens
+		}
+		if startChunk.Message.OutputTokens > 0 {
+			usage.CompletionTokens = startChunk.Message.OutputTokens
+		}
+		if usage.PromptTokens > 0 || usage.CompletionTokens > 0 {
+			return usage
 		}
 	}
 
-	// 尝试 Anthropic 格式: message_delta 中的 "usage.output_tokens"
+	// 尝试 Anthropic 格式: message_delta 中的 "usage" 同时含 "input_tokens" 和 "output_tokens"
 	var deltaChunk struct {
-		Type    string `json:"type"`
-		Usage   struct {
+		Type  string `json:"type"`
+		Usage struct {
+			InputTokens  int `json:"input_tokens"`
 			OutputTokens int `json:"output_tokens"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(payload, &deltaChunk); err == nil && deltaChunk.Type == "message_delta" {
+		usage := &StreamUsage{}
+		if deltaChunk.Usage.InputTokens > 0 {
+			usage.PromptTokens = deltaChunk.Usage.InputTokens
+		}
 		if deltaChunk.Usage.OutputTokens > 0 {
-			return &StreamUsage{
-				CompletionTokens: deltaChunk.Usage.OutputTokens,
-			}
+			usage.CompletionTokens = deltaChunk.Usage.OutputTokens
+		}
+		if usage.PromptTokens > 0 || usage.CompletionTokens > 0 {
+			return usage
 		}
 	}
 

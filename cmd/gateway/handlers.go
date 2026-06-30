@@ -1,8 +1,6 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -194,15 +192,28 @@ func handleChatCompletion(
 			toolCalls := streamHandler.ExtractToolCalls(result)
 			estimatedToolCalls := len(toolCalls)
 
-			// 优先使用从 SSE 提取的真实 token 数，没有则回退到 0
-			var realInput, realOutput, realTotal int
-			if result.Usage != nil {
-				realInput = result.Usage.PromptTokens
-				realOutput = result.Usage.CompletionTokens
-				realTotal = result.Usage.TotalTokens
-			}
-			go tokenService.RecordUsageNow(reqID, realModel, req.Model, targetProvider,
-				inputTokens, estimatedOutput, realInput, realOutput, realTotal, estimatedToolCalls, apiKey)
+				// 优先使用从 SSE 提取的真实 token 数，没有则回退到本地估算值
+				var realInput, realOutput, realTotal int
+				if result.Usage != nil {
+					realInput = result.Usage.PromptTokens
+					realOutput = result.Usage.CompletionTokens
+					realTotal = result.Usage.TotalTokens
+				}
+				// 记录用量：优先使用 upstream 返回的真实 token 数，没有则使用本地估算值
+				effInput := realInput
+				if effInput == 0 {
+					effInput = inputTokens
+				}
+				effOutput := realOutput
+				if effOutput == 0 {
+					effOutput = estimatedOutput
+				}
+				effTotal := effInput + effOutput
+				if realTotal > 0 {
+					effTotal = realTotal
+				}
+				go tokenService.RecordUsageNow(reqID, realModel, req.Model, targetProvider,
+					inputTokens, estimatedOutput, effInput, effOutput, effTotal, estimatedToolCalls, apiKey)
 
 			metrics.RecordRequest("POST", "/v1/chat/completions", http.StatusOK, req.Model, time.Since(start).Seconds())
 		} else {
@@ -382,6 +393,23 @@ func handleCountTokens(mapper *mapper.Service, router *router.Service, providerM
 		defer resp.Body.Close()
 
 		respBody, _ := io.ReadAll(resp.Body)
+
+		// 如果上游返回了 usage 字段，提取并返回 token 统计
+		if resp.StatusCode == http.StatusOK {
+			var usageData map[string]interface{}
+			var parsedResp map[string]interface{}
+			if json.Unmarshal(respBody, &parsedResp) == nil {
+				if u, ok := parsedResp["usage"].(map[string]interface{}); ok {
+					usageData = u
+				}
+			}
+			if usageData != nil {
+				c.JSON(http.StatusOK, gin.H{"usage": usageData})
+				return
+			}
+		}
+
+		// 没有 usage（上游可能返回 error），原样转发
 		c.Data(resp.StatusCode, "application/json", respBody)
 	}
 }
@@ -568,97 +596,30 @@ func handleAnthropicMessages(
 				router.RecordLatency(req.Model, targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
 			}
 
-			scanner := bufio.NewScanner(resp.Body)
-			scanner.Split(bufio.ScanLines)
+			result := streamHandler.RewriteAndForward(c.Writer, resp.Body, req.Model)
 
-				// 累计 Anthropic 流式 token 用量
-				// 同时支持 Anthropic 格式（input_tokens/output_tokens）和 OpenAI 格式（prompt_tokens/completion_tokens）
-				var anthropicInputTokens, anthropicOutputTokens int
-				// 累计状态（流式拆分：input 在 message_start，output 在 message_delta）
-				var hasInput, hasOutput bool
-
-				for scanner.Scan() {
-					line := scanner.Bytes()
-
-					// 空行是 SSE 分隔符
-					if len(line) == 0 {
-						c.Writer.Write([]byte("\n"))
-						c.Writer.Flush()
-						continue
-					}
-
-					if bytes.HasPrefix(line, []byte("data: ")) {
-						payload := line[6:]
-
-						// 尝试 OpenAI 格式: {"choices":[...],"usage":{"prompt_tokens":N,"completion_tokens":M}}
-						var openAIChunk struct {
-							Usage struct {
-								PromptTokens     int `json:"prompt_tokens"`
-								CompletionTokens int `json:"completion_tokens"`
-							} `json:"usage"`
-						}
-						if json.Unmarshal(payload, &openAIChunk) == nil {
-							if openAIChunk.Usage.PromptTokens > 0 && !hasInput {
-								anthropicInputTokens = openAIChunk.Usage.PromptTokens
-								hasInput = true
-							}
-							if openAIChunk.Usage.CompletionTokens > 0 {
-								anthropicOutputTokens = openAIChunk.Usage.CompletionTokens
-								hasOutput = true
-							}
-						}
-
-						// 尝试 Anthropic 格式: message_start 含 "input_tokens"
-						var startChunk struct {
-							Type string `json:"type"`
-							Message struct {
-								InputTokens int `json:"input_tokens"`
-							} `json:"message"`
-						}
-						if json.Unmarshal(payload, &startChunk) == nil && startChunk.Type == "message_start" {
-							if startChunk.Message.InputTokens > 0 && !hasInput {
-								anthropicInputTokens = startChunk.Message.InputTokens
-								hasInput = true
-							}
-						}
-
-						// 尝试 Anthropic 格式: message_delta 中的 "usage.output_tokens"
-						var deltaChunk struct {
-							Type  string `json:"type"`
-							Usage struct {
-								OutputTokens int `json:"output_tokens"`
-							} `json:"usage"`
-						}
-						if json.Unmarshal(payload, &deltaChunk) == nil && deltaChunk.Type == "message_delta" {
-							if deltaChunk.Usage.OutputTokens > 0 && !hasOutput {
-								anthropicOutputTokens = deltaChunk.Usage.OutputTokens
-								hasOutput = true
-							}
-							// 输出 tokens 提取完毕，记录用量
-							go tokenService.RecordUsageNow(reqID, realModel, req.Model, targetProvider,
-								inputTokens, 0, anthropicInputTokens, anthropicOutputTokens,
-								anthropicInputTokens+anthropicOutputTokens, 0, apiKey)
-						}
-
-						// 替换 data 中的真实模型名为虚拟模型名
-						if realModel != req.Model {
-							payload = bytes.ReplaceAll(payload, []byte(realModel), []byte(req.Model))
-						}
-						c.Writer.Write([]byte("data: "))
-						c.Writer.Write(payload)
-						c.Writer.Write([]byte("\n"))
-					} else {
-						c.Writer.Write(line)
-						c.Writer.Write([]byte("\n"))
-					}
-					c.Writer.Flush()
-				}
-
-			if err := scanner.Err(); err != nil {
-				log.Error().Err(err).Msg("anthropic stream scan error")
+			// 记录用量：优先使用从 SSE 提取的真实 token 数，没有则使用本地估算值
+			var realInput, realOutput, realTotal int
+			if result.Usage != nil {
+				realInput = result.Usage.PromptTokens
+				realOutput = result.Usage.CompletionTokens
+				realTotal = result.Usage.TotalTokens
 			}
-			return
+			// 优先使用 upstream 返回的真实 token 数，没有则使用本地估算值
+			effInput := realInput
+			if effInput == 0 {
+				effInput = inputTokens
+			}
+			effOutput := realOutput
+			effTotal := effInput + effOutput
+			if realTotal > 0 {
+				effTotal = realTotal
+			}
+			go tokenService.RecordUsageNow(reqID, realModel, req.Model, targetProvider,
+				inputTokens, 0, effInput, effOutput, effTotal, 0, apiKey)
 		}
+			// 流式已处理，直接返回（避免后续非流式代码重复读取 resp.Body）
+			return
 
 		// 记录延迟（非流式）
 		if targetProvider != "" {
