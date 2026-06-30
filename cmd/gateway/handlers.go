@@ -16,28 +16,28 @@ import (
 	"llm-gateway/internal/auth"
 	"llm-gateway/internal/mapper"
 	"llm-gateway/internal/metrics"
-	"llm-gateway/internal/storage"
 	"llm-gateway/internal/provider"
 	"llm-gateway/internal/router"
+	"llm-gateway/internal/storage"
 	"llm-gateway/internal/stream"
 	"llm-gateway/internal/token"
 )
 
 // ChatCompletionRequest OpenAI 兼容请求格式
 type ChatCompletionRequest struct {
-	Model       string                  `json:"model" binding:"required"`
-	Messages    []Message               `json:"messages" binding:"required"`
-	Stream      bool                    `json:"stream,omitempty"`
-	MaxTokens   int                     `json:"max_tokens,omitempty"`
-	Temperature float64                 `json:"temperature,omitempty"`
-	TopP        float64                 `json:"top_p,omitempty"`
-	Tools       []Tool                  `json:"tools,omitempty"`
+	Model       string    `json:"model" binding:"required"`
+	Messages    []Message `json:"messages" binding:"required"`
+	Stream      bool      `json:"stream,omitempty"`
+	MaxTokens   int       `json:"max_tokens,omitempty"`
+	Temperature float64   `json:"temperature,omitempty"`
+	TopP        float64   `json:"top_p,omitempty"`
+	Tools       []Tool    `json:"tools,omitempty"`
 }
 
 type Message struct {
-	Role       string     `json:"role"`
-	Content    string     `json:"content"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	Role      string     `json:"role"`
+	Content   string     `json:"content"`
+	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
 }
 
 type Tool struct {
@@ -60,13 +60,13 @@ type ToolCall struct {
 
 // ChatCompletionResponse OpenAI 兼容响应格式
 type ChatCompletionResponse struct {
-	ID         string   `json:"id"`
-	Object     string   `json:"object"`
-	Created    int64    `json:"created"`
-	Model      string   `json:"model"`
-	Choices    []Choice `json:"choices"`
-	Usage      Usage    `json:"usage"`
-	ToolCalls  []Choice `json:"tool_calls,omitempty"` // 兼容 Anthropic 响应
+	ID        string   `json:"id"`
+	Object    string   `json:"object"`
+	Created   int64    `json:"created"`
+	Model     string   `json:"model"`
+	Choices   []Choice `json:"choices"`
+	Usage     Usage    `json:"usage"`
+	ToolCalls []Choice `json:"tool_calls,omitempty"` // 兼容 Anthropic 响应
 }
 
 type Choice struct {
@@ -192,28 +192,28 @@ func handleChatCompletion(
 			toolCalls := streamHandler.ExtractToolCalls(result)
 			estimatedToolCalls := len(toolCalls)
 
-				// 优先使用从 SSE 提取的真实 token 数，没有则回退到本地估算值
-				var realInput, realOutput, realTotal int
-				if result.Usage != nil {
-					realInput = result.Usage.PromptTokens
-					realOutput = result.Usage.CompletionTokens
-					realTotal = result.Usage.TotalTokens
-				}
-				// 记录用量：优先使用 upstream 返回的真实 token 数，没有则使用本地估算值
-				effInput := realInput
-				if effInput == 0 {
-					effInput = inputTokens
-				}
-				effOutput := realOutput
-				if effOutput == 0 {
-					effOutput = estimatedOutput
-				}
-				effTotal := effInput + effOutput
-				if realTotal > 0 {
-					effTotal = realTotal
-				}
-				go tokenService.RecordUsageNow(reqID, realModel, req.Model, targetProvider,
-					inputTokens, estimatedOutput, effInput, effOutput, effTotal, estimatedToolCalls, apiKey)
+			// 优先使用从 SSE 提取的真实 token 数，没有则回退到本地估算值
+			var realInput, realOutput, realTotal int
+			if result.Usage != nil {
+				realInput = result.Usage.PromptTokens
+				realOutput = result.Usage.CompletionTokens
+				realTotal = result.Usage.TotalTokens
+			}
+			// 记录用量：优先使用 upstream 返回的真实 token 数，没有则使用本地估算值
+			effInput := realInput
+			if effInput == 0 {
+				effInput = inputTokens
+			}
+			effOutput := realOutput
+			if effOutput == 0 {
+				effOutput = estimatedOutput
+			}
+			effTotal := effInput + effOutput
+			if realTotal > 0 {
+				effTotal = realTotal
+			}
+			go tokenService.RecordUsageNow(reqID, realModel, req.Model, targetProvider,
+				inputTokens, estimatedOutput, effInput, effOutput, effTotal, estimatedToolCalls, apiKey)
 
 			metrics.RecordRequest("POST", "/v1/chat/completions", http.StatusOK, req.Model, time.Since(start).Seconds())
 		} else {
@@ -618,61 +618,10 @@ func handleAnthropicMessages(
 			go tokenService.RecordUsageNow(reqID, realModel, req.Model, targetProvider,
 				inputTokens, 0, effInput, effOutput, effTotal, 0, apiKey)
 		}
-			// 流式已处理，直接返回（避免后续非流式代码重复读取 resp.Body）
-			return
-
-		// 记录延迟（非流式）
-		if targetProvider != "" {
-			router.RecordLatency(req.Model, targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
-		}
-
-		// 5. 将后端响应转为 Anthropic 格式（使用虚拟模型名替换 real 模型名）
-		anthropicResp, err := ap.ConvertResponseWithModel(resp, req.Model)
-		if err != nil {
-			log.Error().Err(err).Msg("anthropic response conversion failed")
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-
-		// 提取用量并记录（同时支持 Anthropic 格式 input_tokens/output_tokens 和 OpenAI 格式 prompt_tokens/completion_tokens）
-		var anthropicUsage struct {
-			Usage struct {
-				InputTokens  int `json:"input_tokens"`
-				OutputTokens int `json:"output_tokens"`
-			} `json:"usage"`
-		}
-		realInput, realOutput := 0, 0
-		if json.Unmarshal(anthropicResp, &anthropicUsage) == nil {
-			realInput = anthropicUsage.Usage.InputTokens
-			realOutput = anthropicUsage.Usage.OutputTokens
-		}
-		// 回退：如果 Anthropic 格式没有值，尝试 OpenAI 格式
-		if realInput == 0 || realOutput == 0 {
-			var openAIUsage struct {
-				Usage struct {
-					PromptTokens     int `json:"prompt_tokens"`
-					CompletionTokens int `json:"completion_tokens"`
-				} `json:"usage"`
-			}
-			if json.Unmarshal(anthropicResp, &openAIUsage) == nil {
-				if realInput == 0 {
-					realInput = openAIUsage.Usage.PromptTokens
-				}
-				if realOutput == 0 {
-					realOutput = openAIUsage.Usage.CompletionTokens
-				}
-			}
-		}
-		// 记录用量（无论解析是否成功，都写入存储层）
-		tokenService.RecordUsageNow(reqID, realModel, req.Model, targetProvider,
-			inputTokens, 0, realInput, realOutput, realInput+realOutput, 0, apiKey)
-
-		metrics.RecordRequest("POST", "/v1/messages", resp.StatusCode, req.Model, time.Since(start).Seconds())
-		c.Data(resp.StatusCode, "application/json", anthropicResp)
-		}
 	}
+}
 
-	func toProviderMessages(msgs []Message) []provider.Message {
+func toProviderMessages(msgs []Message) []provider.Message {
 	out := make([]provider.Message, len(msgs))
 	for i, m := range msgs {
 		out[i] = provider.Message{Role: m.Role, Content: m.Content}
@@ -866,11 +815,11 @@ func rewriteAnthropicToolCalls(body []byte, providerName string) []byte {
 		"model":   modelName,
 		"choices": []map[string]interface{}{
 			{
-				"index":        0,
+				"index":         0,
 				"finish_reason": "tool_calls",
 				"message": map[string]interface{}{
-					"content":   "",
-					"role":      "assistant",
+					"content":    "",
+					"role":       "assistant",
 					"tool_calls": toolCalls,
 				},
 			},
