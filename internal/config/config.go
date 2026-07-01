@@ -88,9 +88,11 @@ type RateLimitConfig struct {
 }
 
 type ProviderConfig struct {
-	BaseURL string        `mapstructure:"base_url"`
-	APIKey  string        `mapstructure:"api_key"`
-	Timeout time.Duration `mapstructure:"timeout"`
+	BaseURL  string        `mapstructure:"base_url"`
+	APIKey   string        `mapstructure:"api_key"`
+	Timeout  time.Duration `mapstructure:"timeout"`
+	Endpoint string        `mapstructure:"endpoint"` // 可选：覆盖默认的 upstream 端点路径（如 /messages, /chat/completions）
+	Protocol string        `mapstructure:"protocol"` // 上游协议："openai"（默认）| "anthropic"
 }
 
 type TokenConfig struct {

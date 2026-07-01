@@ -30,7 +30,7 @@ model_mapping:
       real: "anthropic/Qwen3.6-35B-A3B-4bit"
       aliases: ["gpt-4o-mini"]
     "claude":
-      real: "anthropic/Qwen3.6-35B-A3B-4bit"
+      real: "openai/Qwen3.6-35B-A3B-4bit"
       aliases: ["claude-sonnet", "claude"]
     "deepseek":
       real: "anthropic/Qwen3.6-35B-A3B-4bit"
@@ -50,18 +50,6 @@ model_groups:
         timeout: 3000s
         retry: 2
         cost: 0.03
-      - provider: "anthropic"
-        model: "Qwen3.6-35B-A3B-4bit"
-        weight: 30
-        timeout: 3000s
-        retry: 1
-        cost: 0.015
-      - provider: "deepseek"
-        model: "Qwen3.6-35B-A3B-4bit"
-        weight: 0
-        timeout: 3000s
-        retry: 1
-        cost: 0.001
 
   "fast-chat":
     strategy: "latency_optimized"
@@ -71,10 +59,6 @@ model_groups:
         weight: 50
         timeout: 3000s
         cost: 0.0006
-      - provider: "deepseek"
-        model: "Qwen3.6-35B-A3B-4bit"
-        weight: 50
-        timeout: 3000s
 
 # 熔断器配置
 circuit_breaker:
@@ -91,19 +75,21 @@ rate_limit:
   burst: 150
 
 # Provider 配置（API Keys 建议通过环境变量注入）
+# protocol 字段：声明上游使用的协议类型（"openai" | "anthropic"）
+# 默认为 "openai"
+# 默认上游路径：anthropic → /v1/messages，其他 → /v1/chat/completions
+# endpoint 字段可覆盖默认路径
 providers:
   openai:
     base_url: "http://192.168.31.238:8000/v1"
     api_key: "${ANTHROPIC_AUTH_TOKEN}"
     timeout: 3000s
+    protocol: "openai" # 上游是 OpenAI 兼容接口
   anthropic:
-    base_url: "http://192.168.31.238:8000/v1"
+    base_url: "http://192.168.31.238:8000"
     api_key: "${ANTHROPIC_AUTH_TOKEN}"
     timeout: 3000s
-  deepseek:
-    base_url: "http://192.168.31.238:8000/v1"
-    api_key: "${ANTHROPIC_AUTH_TOKEN}"
-    timeout: 3000s
+    protocol: "anthropic" # 上游是 Anthropic 兼容接口
 
 # Token 计算
 token:

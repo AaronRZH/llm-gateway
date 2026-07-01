@@ -41,7 +41,7 @@ func (p *GenericProvider) Chat(ctx context.Context, model string, messages []Mes
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/chat/completions", bytes.NewReader(jsonBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", p.fullURL(""), bytes.NewReader(jsonBody))
 	if err != nil {
 		return nil, err
 	}
@@ -80,7 +80,7 @@ func (p *GenericProvider) StreamChat(ctx context.Context, model string, messages
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/chat/completions", bytes.NewReader(jsonBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", p.fullURL(""), bytes.NewReader(jsonBody))
 	if err != nil {
 		return nil, err
 	}
@@ -101,4 +101,14 @@ func (p *GenericProvider) StreamChat(ctx context.Context, model string, messages
 	}
 
 	return resp.Body, nil
+}
+
+// ChatWithProtocol 忽略 protocol 参数，始终使用 OpenAI 格式（默认行为）
+func (p *GenericProvider) ChatWithProtocol(ctx context.Context, model string, messages []Message, tools []Tool, clientProtocol ClientProtocol) (*http.Response, error) {
+	return p.Chat(ctx, model, messages, tools)
+}
+
+// StreamChatWithProtocol 忽略 protocol 参数，始终使用 OpenAI 格式（默认行为）
+func (p *GenericProvider) StreamChatWithProtocol(ctx context.Context, model string, messages []Message, tools []Tool, clientProtocol ClientProtocol) (io.ReadCloser, error) {
+	return p.StreamChat(ctx, model, messages, tools)
 }

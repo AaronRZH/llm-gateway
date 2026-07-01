@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -143,24 +144,49 @@ func handleChatCompletion(
 				start = time.Now()
 				var execErr error
 
-				if target.Breaker != nil {
-					result, err := target.Breaker.Execute(func() (interface{}, error) {
-						return target.Provider.StreamChat(c.Request.Context(), upstreamModel,
-							toProviderMessages(req.Messages), toProviderTools(req.Tools))
-					})
-					if err != nil {
-						if err == gobreaker.ErrOpenState || err == gobreaker.ErrTooManyRequests {
-							log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
-							continue
+
+				// 协议感知：Anthropic 上游使用 StreamChatWithProtocol 进行格式转换
+				if ap, ok := target.Provider.(*provider.AnthropicProvider); ok {
+					if target.Breaker != nil {
+						result, err := target.Breaker.Execute(func() (interface{}, error) {
+							return ap.StreamChatWithProtocol(c.Request.Context(), upstreamModel,
+								toProviderMessages(req.Messages), toProviderTools(req.Tools), provider.ProtocolOpenAI)
+						})
+						if err != nil {
+							if err == gobreaker.ErrOpenState || err == gobreaker.ErrTooManyRequests {
+								log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
+								continue
+							}
+							execErr = err
+						} else {
+							upstream = result.(io.ReadCloser)
 						}
-						execErr = err
 					} else {
-						upstream = result.(io.ReadCloser)
+						upstream, execErr = ap.StreamChatWithProtocol(c.Request.Context(), upstreamModel,
+							toProviderMessages(req.Messages), toProviderTools(req.Tools), provider.ProtocolOpenAI)
 					}
 				} else {
-					upstream, execErr = target.Provider.StreamChat(c.Request.Context(), upstreamModel,
-						toProviderMessages(req.Messages), toProviderTools(req.Tools))
+					// 非 Anthropic 上游（OpenAI/DeepSeek/Generic）：无需格式转换
+					if target.Breaker != nil {
+						result, err := target.Breaker.Execute(func() (interface{}, error) {
+							return target.Provider.StreamChat(c.Request.Context(), upstreamModel,
+								toProviderMessages(req.Messages), toProviderTools(req.Tools))
+						})
+						if err != nil {
+							if err == gobreaker.ErrOpenState || err == gobreaker.ErrTooManyRequests {
+								log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
+								continue
+							}
+							execErr = err
+						} else {
+							upstream = result.(io.ReadCloser)
+						}
+					} else {
+						upstream, execErr = target.Provider.StreamChat(c.Request.Context(), upstreamModel,
+							toProviderMessages(req.Messages), toProviderTools(req.Tools))
+					}
 				}
+
 
 				if execErr != nil {
 					log.Error().Err(execErr).Str("provider", targetProvider).Msg("stream connect failed, trying next")
@@ -234,24 +260,49 @@ func handleChatCompletion(
 				start = time.Now()
 				var execErr error
 
-				if target.Breaker != nil {
-					result, err := target.Breaker.Execute(func() (interface{}, error) {
-						return target.Provider.Chat(c.Request.Context(), upstreamModel,
-							toProviderMessages(req.Messages), toProviderTools(req.Tools))
-					})
-					if err != nil {
-						if err == gobreaker.ErrOpenState || err == gobreaker.ErrTooManyRequests {
-							log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
-							continue
+
+				// 协议感知：Anthropic 上游使用 ChatWithProtocol 进行格式转换
+				if ap, ok := target.Provider.(*provider.AnthropicProvider); ok {
+					if target.Breaker != nil {
+						result, err := target.Breaker.Execute(func() (interface{}, error) {
+							return ap.ChatWithProtocol(c.Request.Context(), upstreamModel,
+								toProviderMessages(req.Messages), toProviderTools(req.Tools), provider.ProtocolOpenAI)
+						})
+						if err != nil {
+							if err == gobreaker.ErrOpenState || err == gobreaker.ErrTooManyRequests {
+								log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
+								continue
+							}
+							execErr = err
+						} else {
+							resp = result.(*http.Response)
 						}
-						execErr = err
 					} else {
-						resp = result.(*http.Response)
+						resp, execErr = ap.ChatWithProtocol(c.Request.Context(), upstreamModel,
+							toProviderMessages(req.Messages), toProviderTools(req.Tools), provider.ProtocolOpenAI)
 					}
 				} else {
-					resp, execErr = target.Provider.Chat(c.Request.Context(), upstreamModel,
-						toProviderMessages(req.Messages), toProviderTools(req.Tools))
+					// 非 Anthropic 上游（OpenAI/DeepSeek/Generic）：无需格式转换
+					if target.Breaker != nil {
+						result, err := target.Breaker.Execute(func() (interface{}, error) {
+							return target.Provider.Chat(c.Request.Context(), upstreamModel,
+								toProviderMessages(req.Messages), toProviderTools(req.Tools))
+						})
+						if err != nil {
+							if err == gobreaker.ErrOpenState || err == gobreaker.ErrTooManyRequests {
+								log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
+								continue
+							}
+							execErr = err
+						} else {
+							resp = result.(*http.Response)
+						}
+					} else {
+						resp, execErr = target.Provider.Chat(c.Request.Context(), upstreamModel,
+							toProviderMessages(req.Messages), toProviderTools(req.Tools))
+					}
 				}
+
 
 				if execErr != nil {
 					log.Error().Err(execErr).Str("provider", targetProvider).Msg("upstream request failed, trying next")
@@ -293,6 +344,27 @@ func handleChatCompletion(
 			c.Data(resp.StatusCode, "application/json", body)
 		}
 	}
+}
+
+// detectClientProtocol 根据请求 URL 路径和 HTTP 头部判断客户端使用的协议类型。
+// OpenAI 特征：URL 路径包含 /chat/completions 或 /completions。
+// Anthropic 特征：URL 路径包含 /messages，且头部包含 anthropic-version 或 x-api-key。
+func detectClientProtocol(c *gin.Context) provider.ClientProtocol {
+	path := c.Request.URL.Path
+	if path == "/v1/messages" || path == "/messages" {
+		return provider.ProtocolAnthropic
+	}
+	if path == "/v1/chat/completions" || path == "/chat/completions" {
+		return provider.ProtocolOpenAI
+	}
+	if path == "/v1/completions" || path == "/completions" {
+		return provider.ProtocolOpenAI
+	}
+	// 通过头部做兜底判断
+	if c.GetHeader("anthropic-version") != "" || c.GetHeader("x-api-key") != "" {
+		return provider.ProtocolAnthropic
+	}
+	return provider.ProtocolOpenAI
 }
 
 func handleCompletion(
@@ -419,6 +491,7 @@ func handleAnthropicMessages(
 	router *router.Service,
 	streamHandler *stream.Handler,
 	tokenService *token.Service,
+	providerManager *provider.Manager,
 ) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// /count_tokens 由独立的 handleCountTokens 处理，跳过此 handler 避免消费 body
@@ -474,13 +547,16 @@ func handleAnthropicMessages(
 			return
 		}
 
+
+			// 4. 客户端协议检测
+			clientProtocol := detectClientProtocol(c)
+			log.Debug().Str("client_protocol", string(clientProtocol)).Msg("anthropic /messages request")
+
 		// 4. 遍历候选，带断路器保护和 fallback 重试
 		var resp *http.Response
 		var targetProvider string
 		var upstreamModel string
 		var start time.Time
-		var ap *provider.AnthropicProvider
-
 		for target := sel.Next(); target != nil; target = sel.Next() {
 			upstreamModel = target.Model
 			targetProvider = target.ProviderName
@@ -488,13 +564,8 @@ func handleAnthropicMessages(
 				targetProvider = providerName
 			}
 
-			// 非 Anthropic provider 不支持 /messages 端点，跳过
-			var ok bool
-			ap, ok = target.Provider.(*provider.AnthropicProvider)
-			if !ok {
-				log.Debug().Str("provider", targetProvider).Msg("provider does not support /messages, skipping")
-				continue
-			}
+			// 根据上游协议类型决定处理方式
+			upstreamProtocol := target.Provider.GetProtocol()
 
 			// 构建额外参数
 			extraParams := map[string]interface{}{
@@ -532,36 +603,184 @@ func handleAnthropicMessages(
 			start = time.Now()
 			var execErr error
 
-			if target.Breaker != nil {
-				result, err := target.Breaker.Execute(func() (interface{}, error) {
-					return ap.SendDirect(
-						reqCtx,
-						realModel,
-						req.Messages,
-						req.System,
-						extraParams,
-						req.Stream,
-					)
-				})
-				if err != nil {
-					if err == gobreaker.ErrOpenState || err == gobreaker.ErrTooManyRequests {
-						log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
-						continue
+			// 协议感知路由：根据客户端协议和上游协议决定格式转换
+			if clientProtocol == upstreamProtocol {
+				// Case 1/4: 客户端和上游协议一致，直接转发
+				if upstreamProtocol == provider.ProtocolAnthropic {
+					// Anthropic → Anthropic：使用 SendDirect
+					ap, _ := target.Provider.(*provider.AnthropicProvider)
+					if target.Breaker != nil {
+						result, err := target.Breaker.Execute(func() (interface{}, error) {
+							return ap.SendDirect(
+								reqCtx,
+								realModel,
+								req.Messages,
+								req.System,
+								extraParams,
+								req.Stream,
+							)
+						})
+						if err != nil {
+							if err == gobreaker.ErrOpenState || err == gobreaker.ErrTooManyRequests {
+								log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
+								continue
+							}
+							execErr = err
+						} else {
+							resp = result.(*http.Response)
+						}
+					} else {
+						resp, execErr = ap.SendDirect(
+							reqCtx,
+							realModel,
+							req.Messages,
+							req.System,
+							extraParams,
+							req.Stream,
+						)
 					}
-					execErr = err
 				} else {
-					resp = result.(*http.Response)
+					// OpenAI → OpenAI：直接使用 Chat（无需格式转换）
+					messages := toProviderMessagesFromMap(req.Messages)
+					tools := toolsFromAnthropicRequest(req.Tools)
+					if target.Breaker != nil {
+						result, err := target.Breaker.Execute(func() (interface{}, error) {
+							return target.Provider.Chat(reqCtx, upstreamModel, messages, tools)
+						})
+						if err != nil {
+							if err == gobreaker.ErrOpenState || err == gobreaker.ErrTooManyRequests {
+								log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
+								continue
+							}
+							execErr = err
+						} else {
+							resp = result.(*http.Response)
+						}
+					} else {
+						resp, execErr = target.Provider.Chat(reqCtx, upstreamModel, messages, tools)
+					}
+				}
+			} else if clientProtocol == provider.ProtocolOpenAI && upstreamProtocol == provider.ProtocolAnthropic {
+				// Case 2: OpenAI 客户端 → Anthropic 上游：ChatWithProtocol 转换格式
+				messages := []provider.Message{}
+				for _, msg := range req.Messages {
+					role := ""
+					if r, ok := msg["role"].(string); ok {
+						role = r
+					}
+					content := ""
+					if c, ok := msg["content"].(string); ok {
+						content = c
+					} else if c, ok := msg["content"]; ok {
+						if cStr, ok := c.(string); ok {
+							content = cStr
+						} else {
+							content = fmt.Sprintf("%v", c)
+						}
+					}
+					messages = append(messages, provider.Message{Role: role, Content: content})
+				}
+				tools := toolsFromAnthropicRequest(req.Tools)
+				if target.Breaker != nil {
+					result, err := target.Breaker.Execute(func() (interface{}, error) {
+						return target.Provider.ChatWithProtocol(
+							reqCtx, realModel, messages, tools, clientProtocol)
+					})
+					if err != nil {
+						if err == gobreaker.ErrOpenState || err == gobreaker.ErrTooManyRequests {
+							log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
+							continue
+						}
+						execErr = err
+					} else {
+						resp = result.(*http.Response)
+					}
+				} else {
+					resp, execErr = target.Provider.ChatWithProtocol(
+						reqCtx, realModel, messages, tools, clientProtocol)
 				}
 			} else {
-				resp, execErr = ap.SendDirect(
-					reqCtx,
-					realModel,
-					req.Messages,
-					req.System,
-					extraParams,
-					req.Stream,
-				)
+				// Case 3: Anthropic 客户端 → OpenAI 上游：需要 A→O 转换
+				p, ok := providerManager.Get("anthropic")
+				if !ok {
+					log.Error().Msg("anthropic provider not available for format conversion")
+					continue
+				}
+				ap := p.(*provider.AnthropicProvider)
+
+				// A→O message conversion
+				openAIMsgs, openAITools := ap.ConvertAnthropicMessagesToOpenAI(
+					req.Messages, req.System, req.Tools)
+
+				if req.Stream {
+					// 流式：发送到 OpenAI 上游，用 SSE converter 包装响应
+					if target.Breaker != nil {
+						result, err := target.Breaker.Execute(func() (interface{}, error) {
+							return target.Provider.StreamChat(reqCtx, upstreamModel, openAIMsgs, openAITools)
+						})
+						if err != nil {
+							if err == gobreaker.ErrOpenState || err == gobreaker.ErrTooManyRequests {
+								log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
+								continue
+							}
+							execErr = err
+						} else {
+							upstream := result.(io.ReadCloser)
+							resp = &http.Response{
+								StatusCode: http.StatusOK,
+								Body:       stream.NewAnthropicSSEConverter(upstream, req.Model),
+							}
+						}
+					} else {
+						upstream, err := target.Provider.StreamChat(reqCtx, upstreamModel, openAIMsgs, openAITools)
+						if err != nil {
+							execErr = err
+						} else {
+							resp = &http.Response{
+								StatusCode: http.StatusOK,
+								Body:       stream.NewAnthropicSSEConverter(upstream, req.Model),
+							}
+						}
+					}
+				} else {
+					// 非流式：发送到 OpenAI 上游，然后转换响应格式
+					if target.Breaker != nil {
+						result, err := target.Breaker.Execute(func() (interface{}, error) {
+							return target.Provider.Chat(reqCtx, upstreamModel, openAIMsgs, openAITools)
+						})
+						if err != nil {
+							if err == gobreaker.ErrOpenState || err == gobreaker.ErrTooManyRequests {
+								log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
+								continue
+							}
+							execErr = err
+						} else {
+							resp = result.(*http.Response)
+						}
+					} else {
+						resp, execErr = target.Provider.Chat(reqCtx, upstreamModel, openAIMsgs, openAITools)
+					}
+
+					if execErr == nil && resp != nil && resp.StatusCode < 400 {
+						// 转换 O→A 响应格式
+						body, _ := io.ReadAll(resp.Body)
+						resp.Body.Close()
+						anthropicBody, convErr := ap.ConvertOpenAIToAnthropicResponse(body, req.Model, inputTokens)
+						if convErr == nil {
+							resp = &http.Response{
+								StatusCode: http.StatusOK,
+								Body:       io.NopCloser(bytes.NewReader(anthropicBody)),
+							}
+						} else {
+							resp = &http.Response{
+								StatusCode: resp.StatusCode,
+								Body:       io.NopCloser(bytes.NewReader(body)),
+							}
+						}
+					}
+				}
 			}
+
 
 			if execErr != nil {
 				log.Error().Err(execErr).Str("provider", targetProvider).Msg("anthropic upstream request failed, trying next")
@@ -637,6 +856,35 @@ func toTokenMessages(msgs []Message) []token.Message {
 	return out
 }
 
+// toProviderMessagesFromMap 将 Anthropic 格式的消息列表（[]map[string]interface{}）转为 []provider.Message
+// content blocks 会被展平为字符串
+func toProviderMessagesFromMap(msgs []map[string]interface{}) []provider.Message {
+	var out []provider.Message
+	for _, msg := range msgs {
+		role, _ := msg["role"].(string)
+		if role == "" {
+			continue
+		}
+		content := ""
+		switch v := msg["content"].(type) {
+		case string:
+			content = v
+		case []interface{}:
+			for _, block := range v {
+				if b, ok := block.(map[string]interface{}); ok {
+					if b["type"] == "text" {
+						if t, ok := b["text"].(string); ok {
+							content += t
+						}
+					}
+				}
+			}
+		}
+		out = append(out, provider.Message{Role: role, Content: content})
+	}
+	return out
+}
+
 // parseUsage 从 OpenAI 兼容响应 JSON 中提取 usage 字段
 // 同时支持 OpenAI 格式（prompt_tokens/completion_tokens）和 Anthropic 格式（input_tokens/output_tokens）
 func parseUsage(body []byte) (promptTokens, completionTokens, totalTokens int) {
@@ -687,6 +935,54 @@ func toProviderTools(tools []Tool) []provider.Tool {
 				Description: t.Function.Description,
 				Parameters:  t.Function.Parameters,
 			},
+		}
+	}
+	return out
+}
+
+// toolsFromAnthropicRequest 将 Anthropic 请求中的 tools（[]map[string]interface{}）转为 Provider 格式的 Tool。
+// 支持 OpenAI 格式（有 "function" 字段）和 Anthropic 格式（name 直接在顶层）的 tools。
+func toolsFromAnthropicRequest(reqTools []map[string]interface{}) []provider.Tool {
+	if len(reqTools) == 0 {
+		return nil
+	}
+	out := make([]provider.Tool, 0, len(reqTools))
+	for _, t := range reqTools {
+		// 尝试 OpenAI 格式：{"type":"function","function":{"name":"...","description":"...","parameters":{}}}
+		if fnRaw, ok := t["function"]; ok {
+			if fn, ok := fnRaw.(map[string]interface{}); ok {
+				name, _ := fn["name"].(string)
+				desc, _ := fn["description"].(string)
+				var params any
+				if p, ok := fn["parameters"]; ok {
+					params = p
+				}
+				out = append(out, provider.Tool{
+					Type: func() string { if tt, ok := t["type"].(string); ok { return tt }; return "function" }(),
+					Function: provider.ToolFunc{
+						Name:        name,
+						Description: desc,
+						Parameters:  params,
+					},
+				})
+				continue
+			}
+		}
+		// 尝试 Anthropic 格式：{"name":"...","description":"...","input_schema":{}}
+		if name, ok := t["name"].(string); ok {
+			desc, _ := t["description"].(string)
+			var params any
+			if p, ok := t["input_schema"]; ok {
+				params = p
+			}
+			out = append(out, provider.Tool{
+				Type: func() string { if tt, ok := t["type"].(string); ok { return tt }; return "function" }(),
+				Function: provider.ToolFunc{
+					Name:        name,
+					Description: desc,
+					Parameters:  params,
+				},
+			})
 		}
 	}
 	return out

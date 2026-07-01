@@ -35,21 +35,22 @@ func Auth(authService *auth.Service, publicPaths ...string) gin.HandlerFunc {
 			}
 		}
 
+		// 支持 Authorization: Bearer <key>（OpenAI 格式）和 x-api-key: <key>（Anthropic 格式）
 		authHeader := c.GetHeader("Authorization")
-		if authHeader == "" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing authorization header"})
-			return
+		apiKey := ""
+		if authHeader != "" {
+			parts := strings.SplitN(authHeader, " ", 2)
+			if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid authorization format"})
+				return
+			}
+			apiKey = parts[1]
+		} else {
+			apiKey = c.GetHeader("x-api-key")
 		}
 
-		parts := strings.SplitN(authHeader, " ", 2)
-		if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid authorization format"})
-			return
-		}
-
-		apiKey := parts[1]
 		if apiKey == "" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "empty api key"})
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing authorization header"})
 			return
 		}
 

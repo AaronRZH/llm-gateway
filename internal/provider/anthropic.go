@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"strings"
 	"fmt"
 	"io"
 	"net/http"
@@ -44,7 +45,7 @@ func (p *AnthropicProvider) Chat(ctx context.Context, model string, messages []M
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/messages", bytes.NewReader(jsonBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", p.fullURL(""), bytes.NewReader(jsonBody))
 	if err != nil {
 		return nil, err
 	}
@@ -88,7 +89,7 @@ func (p *AnthropicProvider) StreamChat(ctx context.Context, model string, messag
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/messages", bytes.NewReader(jsonBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", p.fullURL(""), bytes.NewReader(jsonBody))
 	if err != nil {
 		return nil, err
 	}
@@ -110,6 +111,138 @@ func (p *AnthropicProvider) StreamChat(ctx context.Context, model string, messag
 	}
 
 	return resp.Body, nil
+}
+
+// StreamChatWithProtocol 根据客户端协议决定是否进行格式转换（流式）。
+func (p *AnthropicProvider) StreamChatWithProtocol(ctx context.Context, model string, messages []Message, tools []Tool, clientProtocol ClientProtocol) (io.ReadCloser, error) {
+	var anthropicMessages []map[string]interface{}
+
+	if clientProtocol == ProtocolOpenAI {
+		// OpenAI 客户端 → 转换为 Anthropic 格式（默认行为）
+		anthropicMessages = p.convertMessages(messages)
+	} else {
+		// Anthropic 客户端 → 消息已是 Anthropic 格式，直接使用
+		for _, msg := range messages {
+			anthropicMessages = append(anthropicMessages, map[string]interface{}{
+				"role":    msg.Role,
+				"content": p.contentToBlocks(msg.Content),
+			})
+		}
+	}
+
+	return p.doStreamWithMessages(ctx, model, anthropicMessages, tools)
+}
+
+// ChatWithProtocol 根据客户端协议决定是否进行格式转换。
+func (p *AnthropicProvider) ChatWithProtocol(ctx context.Context, model string, messages []Message, tools []Tool, clientProtocol ClientProtocol) (*http.Response, error) {
+	var anthropicMessages []map[string]interface{}
+
+	if clientProtocol == ProtocolOpenAI {
+		anthropicMessages = p.convertMessages(messages)
+	} else {
+		for _, msg := range messages {
+			anthropicMessages = append(anthropicMessages, map[string]interface{}{
+				"role":    msg.Role,
+				"content": p.contentToBlocks(msg.Content),
+			})
+		}
+	}
+
+	return p.doChatWithMessages(ctx, model, anthropicMessages, tools)
+}
+
+// doStreamWithMessages 用已转换的 Anthropic 消息发送流式请求到上游。
+func (p *AnthropicProvider) doStreamWithMessages(
+	ctx context.Context,
+	model string,
+	messages []map[string]interface{},
+	tools []Tool,
+) (io.ReadCloser, error) {
+	reqBody := map[string]interface{}{
+		"model":      model,
+		"messages":   messages,
+		"max_tokens": 4096,
+		"stream":     true,
+	}
+
+	// 如果有工具定义，转换为 Anthropic tools 格式
+	if len(tools) > 0 {
+		reqBody["tools"] = p.convertTools(tools)
+	}
+
+	jsonBody, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", p.fullURL(""), bytes.NewReader(jsonBody))
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", p.apiKey)
+	req.Header.Set("anthropic-version", "2023-06-01")
+	req.Header.Set("Accept", "text/event-stream")
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return nil, fmt.Errorf("anthropic stream error %d: %s", resp.StatusCode, string(body))
+	}
+
+	return resp.Body, nil
+}
+
+// doChatWithMessages 用已转换的 Anthropic 消息发送请求到上游。
+func (p *AnthropicProvider) doChatWithMessages(
+	ctx context.Context,
+	model string,
+	messages []map[string]interface{},
+	tools []Tool,
+) (*http.Response, error) {
+	reqBody := map[string]interface{}{
+		"model":    model,
+		"messages": messages,
+		"max_tokens": 4096,
+	}
+
+	// 如果有工具定义，转换为 Anthropic tools 格式
+	if len(tools) > 0 {
+		reqBody["tools"] = p.convertTools(tools)
+	}
+
+	jsonBody, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", p.fullURL(""), bytes.NewReader(jsonBody))
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", p.apiKey)
+	req.Header.Set("anthropic-version", "2023-06-01")
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return nil, fmt.Errorf("anthropic error %d: %s", resp.StatusCode, string(body))
+	}
+
+	return resp, nil
 }
 
 // convertTools 将 OpenAI 格式的 tools 转换为 Anthropic 格式
@@ -330,7 +463,7 @@ func (p *AnthropicProvider) ChatWithRequest(ctx context.Context, req *AnthropicR
 		return nil, err
 	}
 
-	req2, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/messages", bytes.NewReader(jsonBody))
+	req2, err := http.NewRequestWithContext(ctx, "POST", p.fullURL(""), bytes.NewReader(jsonBody))
 	if err != nil {
 		return nil, err
 	}
@@ -575,7 +708,7 @@ func (p *AnthropicProvider) SendDirect(
 		return nil, err
 	}
 
-	url := p.baseURL + "/messages"
+	url := p.fullURL("")
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonBody))
 	if err != nil {
 		return nil, err
@@ -598,9 +731,147 @@ func (p *AnthropicProvider) SendDirect(
 	return resp, nil
 }
 
+// flattenContent 将 Anthropic content blocks 展平为字符串
+func (p *AnthropicProvider) flattenContent(content interface{}) string {
+	switch v := content.(type) {
+	case string:
+		return v
+	case []interface{}:
+		var parts []string
+		for _, block := range v {
+			if b, ok := block.(map[string]interface{}); ok {
+				if b["type"] == "text" {
+					if t, ok := b["text"].(string); ok {
+						parts = append(parts, t)
+					}
+				}
+			}
+		}
+		return strings.Join(parts, "")
+	default:
+		return ""
+	}
+}
+
+// ConvertAnthropicMessagesToOpenAI 将 Anthropic 格式消息和工具转换为 OpenAI 格式
+func (p *AnthropicProvider) ConvertAnthropicMessagesToOpenAI(
+	messages []map[string]interface{},
+	system interface{},
+	tools []map[string]interface{},
+) ([]Message, []Tool) {
+	var result []Message
+
+	// 1. system → 第一条 system message
+	if system != nil {
+		content := ""
+		switch v := system.(type) {
+		case string:
+			content = v
+		case []interface{}:
+			for _, block := range v {
+				if b, ok := block.(map[string]interface{}); ok {
+					if b["type"] == "text" {
+						if t, ok := b["text"].(string); ok {
+							content += t
+						}
+					}
+				}
+			}
+		}
+		if content != "" {
+			result = append(result, Message{Role: "system", Content: content})
+		}
+	}
+
+	// 2. messages: content blocks → string
+	for _, msg := range messages {
+		role, _ := msg["role"].(string)
+		if role != "user" && role != "assistant" && role != "system" {
+			continue
+		}
+		content := p.flattenContent(msg["content"])
+		result = append(result, Message{Role: role, Content: content})
+	}
+
+	// 3. tools: Anthropic → OpenAI 格式
+	var openAITools []Tool
+	for _, t := range tools {
+		name, _ := t["name"].(string)
+		desc, _ := t["description"].(string)
+		inputSchema, _ := t["input_schema"]
+		openAITools = append(openAITools, Tool{
+			Type: "function",
+			Function: ToolFunc{
+				Name:        name,
+				Description: desc,
+				Parameters:  inputSchema,
+			},
+		})
+	}
+
+	return result, openAITools
+}
+
+// ConvertOpenAIToAnthropicResponse 将 OpenAI 非流式响应体转换为 Anthropic 格式
+func (p *AnthropicProvider) ConvertOpenAIToAnthropicResponse(body []byte, virtualModel string, inputTokens int) ([]byte, error) {
+	var openAIResp struct {
+		ID      string `json:"id"`
+		Object  string `json:"object"`
+		Model   string `json:"model"`
+		Choices []struct {
+			Index        int    `json:"index"`
+			FinishReason string `json:"finish_reason"`
+			Message      struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+			TotalTokens      int `json:"total_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &openAIResp); err != nil {
+		return nil, err
+	}
+
+	content := ""
+	finishReason := "end_turn"
+	if len(openAIResp.Choices) > 0 {
+		content = openAIResp.Choices[0].Message.Content
+		if openAIResp.Choices[0].FinishReason == "stop" {
+			finishReason = "end_turn"
+		} else if openAIResp.Choices[0].FinishReason != "" {
+			finishReason = openAIResp.Choices[0].FinishReason
+		}
+	}
+
+	// 构建 content blocks
+	anthropicContent := []map[string]interface{}{
+		{"type": "text", "text": content},
+	}
+
+	anthropicResp := map[string]interface{}{
+		"id":    "msg_" + strings.TrimPrefix(openAIResp.ID, "chatcmpl-"),
+		"type":  "message",
+		"role":  "assistant",
+		"content": anthropicContent,
+		"model":         virtualModel,
+		"stop_reason":   finishReason,
+		"stop_sequence": nil,
+		"usage": map[string]interface{}{
+			"input_tokens":  openAIResp.Usage.PromptTokens,
+			"output_tokens": openAIResp.Usage.CompletionTokens,
+		},
+	}
+
+	return json.Marshal(anthropicResp)
+}
+
 // CountTokens 调用上游的 /v1/messages/count_tokens 端点
 func (p *AnthropicProvider) CountTokens(ctx context.Context, body []byte) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/messages/count_tokens", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "POST", p.fullURL("") + "/count_tokens", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
