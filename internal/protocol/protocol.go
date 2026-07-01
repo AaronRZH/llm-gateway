@@ -89,6 +89,7 @@ func Resolve(req Request) (*Result, error) {
 					return nil, err
 				}
 				return &Result{
+					StatusCode: http.StatusOK,
 					StreamBody: body,
 				}, nil
 			}
@@ -116,6 +117,7 @@ func Resolve(req Request) (*Result, error) {
 				return nil, err
 			}
 			return &Result{
+				StatusCode: http.StatusOK,
 				StreamBody: body,
 			}, nil
 		}
@@ -149,6 +151,7 @@ func Resolve(req Request) (*Result, error) {
 				return nil, err
 			}
 			return &Result{
+				StatusCode: http.StatusOK,
 				StreamBody: stream.NewOpenAIStreamConverter(body, req.VirtualModel),
 			}, nil
 		}
@@ -188,6 +191,7 @@ func Resolve(req Request) (*Result, error) {
 			return nil, err
 		}
 		return &Result{
+			StatusCode: http.StatusOK,
 			StreamBody: stream.NewAnthropicSSEConverter(body, req.VirtualModel),
 		}, nil
 	}

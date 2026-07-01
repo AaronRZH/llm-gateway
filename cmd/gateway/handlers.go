@@ -76,6 +76,7 @@ func handleChatCompletion(
 			var upstreamModel string
 			var start time.Time
 
+			var lastErr error
 			for target := sel.Next(); target != nil; target = sel.Next() {
 				upstreamModel = target.Model
 				targetProvider = target.ProviderName
@@ -92,11 +93,15 @@ func handleChatCompletion(
 					ChatReq:        &req,
 					IsStream:       true,
 					Ctx:            c.Request.Context(),
+					VirtualModel:   req.Model,
 				})
 				if err != nil {
 					if err == gobreaker.ErrOpenState || err == gobreaker.ErrTooManyRequests {
 						log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
 						continue
+					}
+					if lastErr == nil {
+						lastErr = err
 					}
 					log.Error().Err(err).Str("provider", targetProvider).Msg("stream connect failed, trying next")
 					continue
@@ -106,8 +111,13 @@ func handleChatCompletion(
 			}
 
 			if upstream == nil {
-				log.Error().Msg("all upstream models failed for stream")
-				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "all upstream models failed"})
+				if lastErr != nil {
+					log.Error().Err(lastErr).Msg("all upstream models failed for stream")
+					c.JSON(http.StatusServiceUnavailable, gin.H{"error": lastErr.Error()})
+				} else {
+					log.Error().Msg("all upstream models failed for stream")
+					c.JSON(http.StatusServiceUnavailable, gin.H{"error": "all upstream models failed"})
+				}
 				return
 			}
 
@@ -158,6 +168,7 @@ func handleChatCompletion(
 			var targetProvider string
 			var upstreamModel string
 			var start time.Time
+			var lastErr error
 
 			for target := sel.Next(); target != nil; target = sel.Next() {
 				upstreamModel = target.Model
@@ -175,18 +186,25 @@ func handleChatCompletion(
 					ChatReq:        &req,
 					IsStream:       false,
 					Ctx:            c.Request.Context(),
+					VirtualModel:   req.Model,
 				})
 				if err != nil {
 					if err == gobreaker.ErrOpenState || err == gobreaker.ErrTooManyRequests {
 						log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
 						continue
 					}
+					if lastErr == nil {
+						lastErr = err
+					}
 					log.Error().Err(err).Str("provider", targetProvider).Msg("upstream request failed, trying next")
 					continue
 				}
-				defer res.Response.Body.Close()
+				// Body 已在 protocol.Resolve 中读取并转换，直接使用
+				if res.Response != nil {
+					defer res.Response.Body.Close()
+				}
 
-				body, _ := io.ReadAll(res.Response.Body)
+				body := res.Body
 
 				// 记录延迟（用于 latency_optimized 策略）
 				if targetProvider != "" {
@@ -213,8 +231,13 @@ func handleChatCompletion(
 				return
 			}
 
-			log.Error().Msg("all upstream models failed for non-stream")
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "all upstream models failed"})
+			if lastErr != nil {
+				log.Error().Err(lastErr).Msg("all upstream models failed for non-stream")
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": lastErr.Error()})
+			} else {
+				log.Error().Msg("all upstream models failed for non-stream")
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "all upstream models failed"})
+			}
 			return
 		}
 	}
@@ -405,10 +428,11 @@ func handleAnthropicMessages(
 		log.Debug().Str("client_protocol", string(clientProtocol)).Msg("anthropic /messages request")
 
 		// 4. 遍历候选，带断路器保护和 fallback 重试
-		var resp *http.Response
+		var protocolResult *protocol.Result
 		var targetProvider string
 		var upstreamModel string
 		var start time.Time
+		var lastErr error
 		for target := sel.Next(); target != nil; target = sel.Next() {
 			upstreamModel = target.Model
 			targetProvider = target.ProviderName
@@ -459,36 +483,53 @@ func handleAnthropicMessages(
 				ExtraParams:    extraParams,
 				IsStream:       req.Stream,
 				Ctx:            reqCtx,
+				VirtualModel:   req.Model,
 			})
 			if err != nil {
 				if err == gobreaker.ErrOpenState || err == gobreaker.ErrTooManyRequests {
 					log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
 					continue
 				}
+				if lastErr == nil {
+					lastErr = err
+				}
 				log.Error().Err(err).Str("provider", targetProvider).Msg("anthropic upstream request failed, trying next")
 				continue
 			}
-			resp = res.Response
+			protocolResult = res
 			break
 		}
 
-		if resp == nil {
-			log.Error().Msg("all upstream models failed for anthropic /messages")
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "all upstream models failed"})
+		if protocolResult == nil {
+			if lastErr != nil {
+				log.Error().Err(lastErr).Msg("all upstream models failed for anthropic /messages")
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": lastErr.Error()})
+			} else {
+				log.Error().Msg("all upstream models failed for anthropic /messages")
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "all upstream models failed"})
+			}
 			return
 		}
-		defer resp.Body.Close()
 
 		// 上游返回错误状态码时，直接转发错误 body
-		if resp.StatusCode >= 400 {
-			body, _ := io.ReadAll(resp.Body)
-			log.Error().Int("status", resp.StatusCode).RawJSON("body", body).Msg("anthropic upstream returned error")
-			c.Data(resp.StatusCode, "application/json", body)
+		// （仅当 Response 可用时 — Case 4 流式/非流式及 Cases 1-3 非流式）
+		if protocolResult.Response != nil && protocolResult.StatusCode >= 400 {
+			body, _ := io.ReadAll(protocolResult.Response.Body)
+			protocolResult.Response.Body.Close()
+			log.Error().Int("status", protocolResult.StatusCode).RawJSON("body", body).Msg("anthropic upstream returned error")
+			c.Data(protocolResult.StatusCode, "application/json", body)
 			return
 		}
 
 		if req.Stream {
-			// 流式响应：转发 SSE，并替换 model 字段为虚拟模型名
+			// 流式响应：使用 StreamBody（可能已包装 SSE converter）
+			if protocolResult.StreamBody == nil {
+				log.Error().Msg("stream body is nil after successful resolve")
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "upstream returned empty stream"})
+				return
+			}
+			defer protocolResult.StreamBody.Close()
+
 			c.Header("Content-Type", "text/event-stream")
 			c.Header("Cache-Control", "no-cache")
 			c.Header("Connection", "keep-alive")
@@ -498,7 +539,7 @@ func handleAnthropicMessages(
 				routerSvc.RecordLatency(req.Model, targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
 			}
 
-			result := streamHandler.RewriteAndForward(c.Writer, resp.Body, req.Model)
+			result := streamHandler.RewriteAndForward(c.Writer, protocolResult.StreamBody, req.Model)
 
 			// 记录用量：优先使用从 SSE 提取的真实 token 数，没有则使用本地估算值
 			var realInput, realOutput, realTotal int
@@ -519,6 +560,29 @@ func handleAnthropicMessages(
 			}
 			go tokenService.RecordUsageNow(reqID, realModel, req.Model, targetProvider,
 				inputTokens, 0, effInput, effOutput, effTotal, 0, apiKey)
+
+			metrics.RecordRequest("POST", "/v1/messages", protocolResult.StatusCode, req.Model, time.Since(start).Seconds())
+		} else {
+			// 非流式响应：使用 Body（已在 Resolve 中读取并转换）
+			if protocolResult.Response != nil {
+				defer protocolResult.Response.Body.Close()
+			}
+
+			// 记录延迟
+			if targetProvider != "" {
+				routerSvc.RecordLatency(req.Model, targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
+			}
+
+			// 记录用量
+			realInput, realOutput, realTotal := parseUsage(protocolResult.Body)
+			toolCalls := parseToolCalls(protocolResult.Body, targetProvider)
+			_ = realTotal
+			go tokenService.RecordUsageNow(reqID, realModel, req.Model, targetProvider,
+				inputTokens, 0, realInput, realOutput, realTotal, len(toolCalls), apiKey)
+
+			metrics.RecordRequest("POST", "/v1/messages", protocolResult.StatusCode, req.Model, time.Since(start).Seconds())
+
+			c.Data(protocolResult.StatusCode, "application/json", protocolResult.Body)
 		}
 	}
 }

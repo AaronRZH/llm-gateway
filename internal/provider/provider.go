@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 
@@ -232,16 +231,6 @@ func (p *Provider) buildAnthropicRequest(ctx context.Context, url string, model 
 	return req, nil
 }
 
-// checkError 检查上游返回的错误状态码
-func (p *Provider) checkError(resp *http.Response) error {
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		return fmt.Errorf("%s error %d: %s", p.name, resp.StatusCode, string(body))
-	}
-	return nil
-}
-
 // Chat 非流式请求 — 使用 OpenAI 格式发送
 func (p *Provider) Chat(ctx context.Context, model string, messages []Message, tools []Tool) (*http.Response, error) {
 	req, err := p.buildRequest(ctx, "POST", p.fullURL(""), model, messages, tools, false)
@@ -249,18 +238,8 @@ func (p *Provider) Chat(ctx context.Context, model string, messages []Message, t
 		return nil, err
 	}
 
-	resp, err := p.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := p.checkError(resp); err != nil {
-		return nil, err
-	}
-
-	return resp, nil
+	return p.httpClient.Do(req)
 }
-
 // StreamChat 流式请求 — 使用 OpenAI 格式发送
 func (p *Provider) StreamChat(ctx context.Context, model string, messages []Message, tools []Tool) (io.ReadCloser, error) {
 	req, err := p.buildRequest(ctx, "POST", p.fullURL(""), model, messages, tools, true)
@@ -270,10 +249,6 @@ func (p *Provider) StreamChat(ctx context.Context, model string, messages []Mess
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
-		return nil, err
-	}
-
-	if err := p.checkError(resp); err != nil {
 		return nil, err
 	}
 
@@ -314,10 +289,6 @@ func (p *Provider) doSendAnthropic(ctx context.Context, model string, messages [
 		return nil, err
 	}
 
-	if err := p.checkError(resp); err != nil {
-		return nil, err
-	}
-
 	return resp, nil
 }
 
@@ -330,10 +301,6 @@ func (p *Provider) doSendAnthropicStream(ctx context.Context, model string, mess
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
-		return nil, err
-	}
-
-	if err := p.checkError(resp); err != nil {
 		return nil, err
 	}
 

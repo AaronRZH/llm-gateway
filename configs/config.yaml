@@ -87,7 +87,7 @@ providers:
     timeout: 3000s
     protocol: "openai" # 上游是 OpenAI 兼容接口
   anthropic:
-    base_url: "http://192.168.31.238:8000"
+    base_url: "http://192.168.31.238:8000/v1"
     api_key: "${ANTHROPIC_AUTH_TOKEN}"
     timeout: 3000s
     protocol: "anthropic" # 上游是 Anthropic 兼容接口
