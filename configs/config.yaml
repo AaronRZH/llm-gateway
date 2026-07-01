@@ -75,9 +75,10 @@ rate_limit:
   burst: 150
 
 # Provider 配置（API Keys 建议通过环境变量注入）
+# provider name 仅作路由标识，不影响行为
 # protocol 字段：声明上游使用的协议类型（"openai" | "anthropic"）
 # 默认为 "openai"
-# 默认上游路径：anthropic → /v1/messages，其他 → /v1/chat/completions
+# 默认上游路径：anthropic → /messages，其他 → /chat/completions
 # endpoint 字段可覆盖默认路径
 providers:
   openai:

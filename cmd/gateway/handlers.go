@@ -145,11 +145,12 @@ func handleChatCompletion(
 				var execErr error
 
 
-				// 协议感知：Anthropic 上游使用 StreamChatWithProtocol 进行格式转换
-				if ap, ok := target.Provider.(*provider.AnthropicProvider); ok {
+				// 协议感知：根据上游协议决定调用方式
+				if target.Provider.GetProtocol() == provider.ProtocolAnthropic {
+					// Anthropic 上游：使用 StreamChatWithProtocol 进行格式转换
 					if target.Breaker != nil {
 						result, err := target.Breaker.Execute(func() (interface{}, error) {
-							return ap.StreamChatWithProtocol(c.Request.Context(), upstreamModel,
+							return target.Provider.StreamChatWithProtocol(c.Request.Context(), upstreamModel,
 								toProviderMessages(req.Messages), toProviderTools(req.Tools), provider.ProtocolOpenAI)
 						})
 						if err != nil {
@@ -162,11 +163,11 @@ func handleChatCompletion(
 							upstream = result.(io.ReadCloser)
 						}
 					} else {
-						upstream, execErr = ap.StreamChatWithProtocol(c.Request.Context(), upstreamModel,
+						upstream, execErr = target.Provider.StreamChatWithProtocol(c.Request.Context(), upstreamModel,
 							toProviderMessages(req.Messages), toProviderTools(req.Tools), provider.ProtocolOpenAI)
 					}
 				} else {
-					// 非 Anthropic 上游（OpenAI/DeepSeek/Generic）：无需格式转换
+					// 非 Anthropic 上游：无需格式转换
 					if target.Breaker != nil {
 						result, err := target.Breaker.Execute(func() (interface{}, error) {
 							return target.Provider.StreamChat(c.Request.Context(), upstreamModel,
@@ -261,11 +262,12 @@ func handleChatCompletion(
 				var execErr error
 
 
-				// 协议感知：Anthropic 上游使用 ChatWithProtocol 进行格式转换
-				if ap, ok := target.Provider.(*provider.AnthropicProvider); ok {
+				// 协议感知：根据上游协议决定调用方式
+				if target.Provider.GetProtocol() == provider.ProtocolAnthropic {
+					// Anthropic 上游：使用 ChatWithProtocol 进行格式转换
 					if target.Breaker != nil {
 						result, err := target.Breaker.Execute(func() (interface{}, error) {
-							return ap.ChatWithProtocol(c.Request.Context(), upstreamModel,
+							return target.Provider.ChatWithProtocol(c.Request.Context(), upstreamModel,
 								toProviderMessages(req.Messages), toProviderTools(req.Tools), provider.ProtocolOpenAI)
 						})
 						if err != nil {
@@ -278,11 +280,11 @@ func handleChatCompletion(
 							resp = result.(*http.Response)
 						}
 					} else {
-						resp, execErr = ap.ChatWithProtocol(c.Request.Context(), upstreamModel,
+						resp, execErr = target.Provider.ChatWithProtocol(c.Request.Context(), upstreamModel,
 							toProviderMessages(req.Messages), toProviderTools(req.Tools), provider.ProtocolOpenAI)
 					}
 				} else {
-					// 非 Anthropic 上游（OpenAI/DeepSeek/Generic）：无需格式转换
+					// 非 Anthropic 上游：无需格式转换
 					if target.Breaker != nil {
 						result, err := target.Breaker.Execute(func() (interface{}, error) {
 							return target.Provider.Chat(c.Request.Context(), upstreamModel,
@@ -450,13 +452,7 @@ func handleCountTokens(mapper *mapper.Service, router *router.Service, providerM
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "anthropic provider not available"})
 			return
 		}
-		ap, ok := p.(*provider.AnthropicProvider)
-		if !ok {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "provider is not an AnthropicProvider"})
-			return
-		}
-
-		resp, err := ap.CountTokens(c.Request.Context(), body)
+		resp, err := p.CountTokens(c.Request.Context(), body)
 		if err != nil {
 			log.Error().Err(err).Msg("count_tokens upstream request failed")
 			c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
@@ -491,7 +487,6 @@ func handleAnthropicMessages(
 	router *router.Service,
 	streamHandler *stream.Handler,
 	tokenService *token.Service,
-	providerManager *provider.Manager,
 ) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// /count_tokens 由独立的 handleCountTokens 处理，跳过此 handler 避免消费 body
@@ -608,10 +603,10 @@ func handleAnthropicMessages(
 				// Case 1/4: 客户端和上游协议一致，直接转发
 				if upstreamProtocol == provider.ProtocolAnthropic {
 					// Anthropic → Anthropic：使用 SendDirect
-					ap, _ := target.Provider.(*provider.AnthropicProvider)
+					// GetProtocol check: upstream is Anthropic, SendDirect handles the rest
 					if target.Breaker != nil {
 						result, err := target.Breaker.Execute(func() (interface{}, error) {
-							return ap.SendDirect(
+							return target.Provider.SendDirect(
 								reqCtx,
 								realModel,
 								req.Messages,
@@ -630,7 +625,7 @@ func handleAnthropicMessages(
 							resp = result.(*http.Response)
 						}
 					} else {
-						resp, execErr = ap.SendDirect(
+						resp, execErr = target.Provider.SendDirect(
 							reqCtx,
 							realModel,
 							req.Messages,
@@ -701,15 +696,8 @@ func handleAnthropicMessages(
 				}
 			} else {
 				// Case 3: Anthropic 客户端 → OpenAI 上游：需要 A→O 转换
-				p, ok := providerManager.Get("anthropic")
-				if !ok {
-					log.Error().Msg("anthropic provider not available for format conversion")
-					continue
-				}
-				ap := p.(*provider.AnthropicProvider)
-
-				// A→O message conversion
-				openAIMsgs, openAITools := ap.ConvertAnthropicMessagesToOpenAI(
+				// 通过 target.Provider（通常就是 "anthropic" provider）做格式转换
+				openAIMsgs, openAITools := target.Provider.ConvertAnthropicMessagesToOpenAI(
 					req.Messages, req.System, req.Tools)
 
 				if req.Stream {
@@ -765,7 +753,7 @@ func handleAnthropicMessages(
 						// 转换 O→A 响应格式
 						body, _ := io.ReadAll(resp.Body)
 						resp.Body.Close()
-						anthropicBody, convErr := ap.ConvertOpenAIToAnthropicResponse(body, req.Model, inputTokens)
+						anthropicBody, convErr := target.Provider.ConvertOpenAIToAnthropicResponse(body, req.Model, inputTokens)
 						if convErr == nil {
 							resp = &http.Response{
 								StatusCode: http.StatusOK,
