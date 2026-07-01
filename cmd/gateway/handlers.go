@@ -84,7 +84,7 @@ type Usage struct {
 
 func handleChatCompletion(
 	mapper *mapper.Service,
-	router *router.Service,
+	routerSvc *router.Service,
 	streamHandler *stream.Handler,
 	tokenService *token.Service,
 ) gin.HandlerFunc {
@@ -120,7 +120,7 @@ func handleChatCompletion(
 		log.Debug().Int("input_tokens", inputTokens).Msg("token estimated")
 
 		// 3. 路由选择 — 获取候选列表（支持 fallback 重试）
-		sel, err := router.SelectCandidates(c.Request.Context(), req.Model, inputTokens)
+		sel, err := routerSvc.SelectCandidates(c.Request.Context(), req.Model, inputTokens)
 		if err != nil {
 			log.Error().Err(err).Msg("router selection failed")
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no available model"})
@@ -133,6 +133,8 @@ func handleChatCompletion(
 			var targetProvider string
 			var upstreamModel string
 			var start time.Time
+				var isAnthropic bool
+
 
 			for target := sel.Next(); target != nil; target = sel.Next() {
 				upstreamModel = target.Model
@@ -193,6 +195,7 @@ func handleChatCompletion(
 					log.Error().Err(execErr).Str("provider", targetProvider).Msg("stream connect failed, trying next")
 					continue
 				}
+				isAnthropic = target.Provider.GetProtocol() == provider.ProtocolAnthropic
 				break
 			}
 
@@ -200,6 +203,11 @@ func handleChatCompletion(
 				log.Error().Msg("all upstream models failed for stream")
 				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "all upstream models failed"})
 				return
+			}
+
+			// Case 2 (OpenAI 客户端 → Anthropic 上游): 需要 Anthropic SSE → OpenAI SSE 转换
+			if isAnthropic {
+				upstream = stream.NewOpenAIStreamConverter(upstream, req.Model)
 			}
 			defer upstream.Close()
 
@@ -211,7 +219,7 @@ func handleChatCompletion(
 
 			// 记录延迟（用于 latency_optimized 策略）
 			if targetProvider != "" {
-				router.RecordLatency(req.Model, targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
+				routerSvc.RecordLatency(req.Model, targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
 			}
 
 			// 5. 流式：根据累计内容估算输出 token，异步记录用量
@@ -324,7 +332,7 @@ func handleChatCompletion(
 
 			// 记录延迟（用于 latency_optimized 策略）
 			if targetProvider != "" {
-				router.RecordLatency(req.Model, targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
+				routerSvc.RecordLatency(req.Model, targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
 			}
 
 			// 5. 解析上游返回的真实 usage，异步记录用量
@@ -371,7 +379,7 @@ func detectClientProtocol(c *gin.Context) provider.ClientProtocol {
 
 func handleCompletion(
 	mapper *mapper.Service,
-	router *router.Service,
+	routerSvc *router.Service,
 	streamHandler *stream.Handler,
 	tokenService *token.Service,
 ) gin.HandlerFunc {
@@ -405,7 +413,7 @@ func handleListModels(mapper *mapper.Service) gin.HandlerFunc {
 }
 
 // handleCountTokens 代理 /v1/messages/count_tokens 请求到上游 Anthropic 端点
-func handleCountTokens(mapper *mapper.Service, router *router.Service, providerManager *provider.Manager) gin.HandlerFunc {
+func handleCountTokens(mapper *mapper.Service, routerSvc *router.Service, providerManager *provider.Manager) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		body, err := io.ReadAll(c.Request.Body)
 		if err != nil {
@@ -426,7 +434,7 @@ func handleCountTokens(mapper *mapper.Service, router *router.Service, providerM
 			}
 
 			// 通过路由获取真实模型（支持 fallback chain）
-			sel, err := router.SelectCandidates(c.Request.Context(), parseReq.Model, 0)
+			sel, err := routerSvc.SelectCandidates(c.Request.Context(), parseReq.Model, 0)
 			if err != nil {
 				log.Warn().Str("model", parseReq.Model).Msg("count_tokens router selection failed")
 				c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("model '%s' has no available target", parseReq.Model)})
@@ -484,7 +492,7 @@ func handleCountTokens(mapper *mapper.Service, router *router.Service, providerM
 
 func handleAnthropicMessages(
 	mapper *mapper.Service,
-	router *router.Service,
+	routerSvc *router.Service,
 	streamHandler *stream.Handler,
 	tokenService *token.Service,
 ) gin.HandlerFunc {
@@ -535,7 +543,7 @@ func handleAnthropicMessages(
 		log.Debug().Int("input_tokens", inputTokens).Msg("anthropic token estimated")
 
 		// 3. 路由选择 — 获取候选列表（支持 fallback 重试）
-		sel, err := router.SelectCandidates(c.Request.Context(), req.Model, inputTokens)
+		sel, err := routerSvc.SelectCandidates(c.Request.Context(), req.Model, inputTokens)
 		if err != nil {
 			log.Error().Err(err).Msg("anthropic router selection failed")
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no available model"})
@@ -676,23 +684,34 @@ func handleAnthropicMessages(
 					messages = append(messages, provider.Message{Role: role, Content: content})
 				}
 				tools := toolsFromAnthropicRequest(req.Tools)
+
+				var callErr error
+				var chatResult interface{}
 				if target.Breaker != nil {
-					result, err := target.Breaker.Execute(func() (interface{}, error) {
+					chatResult, callErr = target.Breaker.Execute(func() (interface{}, error) {
 						return target.Provider.ChatWithProtocol(
 							reqCtx, realModel, messages, tools, clientProtocol)
 					})
-					if err != nil {
-						if err == gobreaker.ErrOpenState || err == gobreaker.ErrTooManyRequests {
-							log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
-							continue
-						}
-						execErr = err
-					} else {
-						resp = result.(*http.Response)
-					}
 				} else {
-					resp, execErr = target.Provider.ChatWithProtocol(
+					resp, callErr = target.Provider.ChatWithProtocol(
 						reqCtx, realModel, messages, tools, clientProtocol)
+				}
+				if callErr != nil {
+					if callErr == gobreaker.ErrOpenState || callErr == gobreaker.ErrTooManyRequests {
+						log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
+						continue
+					}
+					execErr = callErr
+				} else if target.Breaker != nil {
+					resp = chatResult.(*http.Response)
+				}
+
+				// Case 2 特殊处理：Anthropic 上游返回的是 Anthropic 格式 SSE 流
+				// 流式：包装 OpenAIStreamConverter 转换为 OpenAI SSE 后转发
+				if req.Stream {
+					upstream := resp.Body
+					upstream = stream.NewOpenAIStreamConverter(upstream, req.Model)
+					resp.Body = upstream
 				}
 			} else {
 				// Case 3: Anthropic 客户端 → OpenAI 上游：需要 A→O 转换
@@ -800,7 +819,7 @@ func handleAnthropicMessages(
 
 			// 记录延迟（在流开始后记录，而不是结束后）
 			if targetProvider != "" {
-				router.RecordLatency(req.Model, targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
+				routerSvc.RecordLatency(req.Model, targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
 			}
 
 			result := streamHandler.RewriteAndForward(c.Writer, resp.Body, req.Model)

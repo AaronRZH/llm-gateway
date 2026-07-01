@@ -8,6 +8,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -326,11 +327,279 @@ func (c *AnthropicSSEConverter) finishTool(inTool bool, toolID, toolName, toolIn
 	}
 }
 
-// writeSSE 将 event 以 SSE 格式写入 writer
+// ==================== OpenAIStreamConverter (Anthropic SSE → OpenAI SSE) ====================
+
+// OpenAIStreamState openAI 转换器内部状态
+type OpenAIStreamState int
+
+const (
+	oaiStateIdle      OpenAIStreamState = iota // 等待开始
+	oaiStateStarted                            // message_start 已处理
+	oaiStateStreaming                            // 正在处理 text content delta
+	oaiStateTool                                 // 正在处理 tool_use delta
+	oaiStateDone                                 // 已结束
+)
+
+// OpenAIStreamConverter 将 Anthropic SSE 流实时转换为 OpenAI SSE 流
+// 实现 io.ReadCloser，可直接作为 handler 的上游使用
+type OpenAIStreamConverter struct {
+	pr *io.PipeReader
+	pw *io.PipeWriter
+
+	// upstream 上游 SSE reader（来自 Anthropic 上游的 SSE 流）
+	upstream io.ReadCloser
+
+	// 状态
+	state        OpenAIStreamState
+	model        string // 虚拟模型名
+	promptTokens int
+
+	// tool_use 累积
+	inTool   bool
+	toolID   string
+	toolName string
+	toolInput strings.Builder
+
+	// id 和 created 用于全链路一致性
+	streamID string
+	created  int64
+
+	// wg 等待 convert goroutine 完成
+	wg sync.WaitGroup
+}
+
+// NewOpenAIStreamConverter 创建 Anthropic→OpenAI SSE 转换器
+func NewOpenAIStreamConverter(upstream io.ReadCloser, virtualModel string) *OpenAIStreamConverter {
+	pr, pw := io.Pipe()
+	id := uuid.New().String()[:12]
+	c := &OpenAIStreamConverter{
+		pr:       pr,
+		pw:       pw,
+		upstream: upstream,
+		state:    oaiStateIdle,
+		model:    virtualModel,
+		streamID: id,
+		created:  time.Now().Unix(),
+	}
+
+	c.wg.Add(1)
+	go c.convert()
+	return c
+}
+
+// Read 实现 io.ReadCloser
+func (c *OpenAIStreamConverter) Read(p []byte) (n int, err error) {
+	return c.pr.Read(p)
+}
+
+// Close 实现 io.ReadCloser
+func (c *OpenAIStreamConverter) Close() error {
+	c.wg.Wait()
+	return c.pr.Close()
+}
+
+// convert 在 goroutine 中运行，读取上游 Anthropic SSE 并转换为 OpenAI SSE
+func (c *OpenAIStreamConverter) convert() {
+	defer c.pw.Close()
+	defer c.upstream.Close()
+	defer c.wg.Done()
+
+	scanner := bufio.NewScanner(c.upstream)
+	scanner.Split(bufio.ScanLines)
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+
+		// SSE 分隔符，忽略
+		if len(line) == 0 {
+			continue
+		}
+
+		// 非 data: 行，忽略
+		if !bytes.HasPrefix(line, []byte("data: ")) {
+			continue
+		}
+
+		payload := line[6:] // 去掉 "data: "
+
+		// 解析 Anthropic SSE event
+		var event map[string]interface{}
+		if err := json.Unmarshal(payload, &event); err != nil {
+			continue
+		}
+
+		eventType, _ := event["type"].(string)
+
+		switch eventType {
+		case "message_start":
+			c.state = oaiStateStarted
+
+		case "content_block_start":
+			index, _ := event["index"].(float64)
+			switch int(index) {
+			case 0:
+				c.state = oaiStateStreaming
+				c.writeDelta(`{"role":"assistant","content":""}`)
+			case 1:
+				c.state = oaiStateTool
+				c.inTool = true
+				cb, _ := event["content_block"].(map[string]interface{})
+				if id, ok := cb["id"].(string); ok {
+					c.toolID = id
+				} else {
+					c.toolID = "call_" + uuid.New().String()[:8]
+				}
+				if name, ok := cb["name"].(string); ok {
+					c.toolName = name
+				}
+				c.toolInput.Reset()
+				c.writeToolStart()
+			}
+
+		case "content_block_delta":
+			idx, _ := event["index"].(float64)
+			d, _ := event["delta"].(map[string]interface{})
+
+			switch int(idx) {
+			case 0:
+				c.state = oaiStateStreaming
+				c.inTool = false
+				if text, ok := d["text"].(string); ok {
+					c.writeTextDelta(text)
+				}
+			case 1:
+				c.state = oaiStateTool
+				c.inTool = true
+				if pj, ok := d["partial_json"].(string); ok {
+					c.toolInput.WriteString(pj)
+					c.writeToolArgsDelta(pj)
+				}
+			}
+
+		case "content_block_stop":
+			idx, _ := event["index"].(float64)
+			switch int(idx) {
+			case 0:
+				c.state = oaiStateStarted
+			case 1:
+				c.inTool = false
+			}
+
+		case "message_delta":
+			if c.state == oaiStateDone {
+				break
+			}
+			c.state = oaiStateDone
+
+			d, _ := event["delta"].(map[string]interface{})
+			stopReason, _ := d["stop_reason"].(string)
+			usage, _ := event["usage"].(map[string]interface{})
+
+			finishReason := "stop"
+			if stopReason == "tool_use" {
+				finishReason = "tool_calls"
+			}
+
+			var outputTokens int
+			if usage != nil {
+				if v, ok := usage["input_tokens"].(float64); ok {
+					c.promptTokens = int(v)
+				}
+				if v, ok := usage["output_tokens"].(float64); ok {
+					outputTokens = int(v)
+				}
+			}
+
+			if c.inTool && c.toolName != "" {
+				argsBytes, _ := json.Marshal(c.toolInput.String())
+				c.writeToolFinal(string(argsBytes), finishReason)
+			} else {
+				c.writeTextFinal(finishReason)
+			}
+			c.writeUsage(outputTokens)
+
+		case "message_stop":
+			if c.state != oaiStateDone {
+				c.writeDone()
+			}
+			c.state = oaiStateDone
+		}
+	}
+
+	// 扫描结束，确保完成
+	if c.state != oaiStateDone {
+		c.writeDone()
+	}
+}
+
+// helpers — 每种输出封装为独立方法
+
+// writeDelta 写第一条带 role 的 chunk
+func (c *OpenAIStreamConverter) writeDelta(contentJSON string) {
+	c.writeChunkPlain(`{"delta":` + contentJSON + `}`)
+}
+
+// writeToolStart 写 tool_use 第一个 chunk
+func (c *OpenAIStreamConverter) writeToolStart() {
+	c.writeChunkPlain(`{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"` + c.toolID + `","type":"function","function":{"name":"` + c.toolName + `","arguments":""}}]}`)
+}
+
+// writeTextDelta 写 text 增量 delta
+func (c *OpenAIStreamConverter) writeTextDelta(text string) {
+	c.writeChunk(`{"content":"` + escapeJSON(text) + `"}`)
+}
+
+// writeChunk 写一个包含 delta 的 OpenAI SSE chunk
+func (c *OpenAIStreamConverter) writeChunk(deltaJSON string) {
+	c.writeChunkPlain(`{"delta":` + deltaJSON + `}`)
+}
+
+// writeToolFinal 写 tool_use 最终 chunk（带完整 arguments 和 finish_reason）
+func (c *OpenAIStreamConverter) writeToolFinal(argsJSON string, finishReason string) {
+	c.writeChunkPlain(`{"content":null,"tool_calls":[{"index":0,"id":"` + c.toolID + `","type":"function","function":{"arguments":"` + escapeJSON(argsJSON) + `"}}],"finish_reason":"` + finishReason + `"}`)
+}
+
+// writeToolArgsDelta 写 tool_use 的 arguments 增量 delta
+func (c *OpenAIStreamConverter) writeToolArgsDelta(partialJSON string) {
+	c.writeChunk(`{"tool_calls":[{"index":0,"function":{"arguments":"` + escapeJSON(partialJSON) + `"}}]}`)
+}
+
+// writeTextFinal 写 text 最终 chunk（带 finish_reason）
+func (c *OpenAIStreamConverter) writeTextFinal(finishReason string) {
+	c.writeChunkPlain(`{"finish_reason":"` + finishReason + `"}`)
+}
+
+// writeUsage 写带 usage 的 final chunk
+func (c *OpenAIStreamConverter) writeUsage(outputTokens int) {
+	c.writeChunkPlain(`{"usage":{"prompt_tokens":` + fmt.Sprintf("%d", c.promptTokens) + `,"completion_tokens":` + fmt.Sprintf("%d", outputTokens) + `,"total_tokens":` + fmt.Sprintf("%d", c.promptTokens+outputTokens) + `}}`)
+}
+
+// writeDone 写 [DONE] 标记
+func (c *OpenAIStreamConverter) writeDone() {
+	fmt.Fprintf(c.pw, "data: [DONE]\n\n")
+}
+
+// writeSSE 将 event 以 SSE 格式写入 writer（AnthropicSSEConverter 用）
 func writeSSE(w *io.PipeWriter, event map[string]interface{}) {
 	data, err := json.Marshal(event)
 	if err != nil {
 		return
 	}
 	fmt.Fprintf(w, "data: %s\n\n", string(data))
+}
+
+// writeChunkPlain 将 JSON 主体以 OpenAI SSE 格式写入
+func (c *OpenAIStreamConverter) writeChunkPlain(jsonBody string) {
+	chunk := `{"id":"msg_` + c.streamID + `","object":"chat.completion.chunk","created":` + fmt.Sprintf("%d", c.created) + `,"model":"` + c.model + `","choices":[{"index":0,` + jsonBody + `}]}`
+	fmt.Fprintf(c.pw, "data: %s\n\n", chunk)
+}
+
+// escapeJSON 转义 JSON 值中的特殊字符（用于内嵌在 JSON 字符串中）
+func escapeJSON(s string) string {
+	s = strings.ReplaceAll(s, "\\", "\\\\")
+	s = strings.ReplaceAll(s, "\"", "\\\"")
+	s = strings.ReplaceAll(s, "\n", "\\n")
+	s = strings.ReplaceAll(s, "\r", "\\r")
+	s = strings.ReplaceAll(s, "\t", "\\t")
+	return s
 }
