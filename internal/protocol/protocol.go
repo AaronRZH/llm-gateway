@@ -166,12 +166,12 @@ func Resolve(req Request) (*Result, error) {
 			return nil, err
 		}
 		respBody, _ := io.ReadAll(resp.Body)
-		converted, convErr := req.UpstreamTarget.Provider.ConvertOpenAIToAnthropicResponse(respBody, req.VirtualModel, 0)
+		converted, convErr := req.UpstreamTarget.Provider.ConvertAnthropicToOpenAIResponse(respBody, req.VirtualModel)
 		if convErr == nil {
 			return &Result{
 				Response:   resp,
 				Body:       converted,
-				StatusCode: http.StatusOK,
+				StatusCode: resp.StatusCode,
 			}, nil
 		}
 		return &Result{
@@ -210,7 +210,7 @@ func Resolve(req Request) (*Result, error) {
 		return &Result{
 			Response:   resp,
 			Body:       converted,
-			StatusCode: http.StatusOK,
+			StatusCode: resp.StatusCode,
 		}, nil
 	}
 	return &Result{

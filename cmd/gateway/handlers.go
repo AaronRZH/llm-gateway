@@ -514,7 +514,10 @@ func handleAnthropicMessages(
 		// 上游返回错误状态码时，直接转发错误 body
 		// （仅当 Response 可用时 — Case 4 流式/非流式及 Cases 1-3 非流式）
 		if protocolResult.Response != nil && protocolResult.StatusCode >= 400 {
-			body, _ := io.ReadAll(protocolResult.Response.Body)
+			body := protocolResult.Body
+			if len(body) == 0 {
+				body, _ = io.ReadAll(protocolResult.Response.Body)
+			}
 			protocolResult.Response.Body.Close()
 			log.Error().Int("status", protocolResult.StatusCode).RawJSON("body", body).Msg("anthropic upstream returned error")
 			c.Data(protocolResult.StatusCode, "application/json", body)

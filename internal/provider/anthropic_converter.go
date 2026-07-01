@@ -6,6 +6,9 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
+
+	"github.com/google/uuid"
 )
 
 // AnthropicRequest 网关接收的完整 Anthropic 请求体
@@ -534,4 +537,110 @@ func (c *AnthropicConverter) ConvertOpenAIToAnthropicResponse(body []byte, virtu
 	}
 
 	return json.Marshal(anthropicResp)
+}
+
+// ConvertAnthropicToOpenAIResponse 将 Anthropic 非流式响应体转换为 OpenAI 格式。
+// 用于 Case 2 (OpenAI 客户端 → Anthropic 上游) 的非流式路径：
+// ChatWithProtocol 发送 Anthropic 请求 → 上游返回 Anthropic 格式响应 → 此方法转换为 OpenAI 格式。
+func (c *AnthropicConverter) ConvertAnthropicToOpenAIResponse(body []byte, virtualModel string) ([]byte, error) {
+	var anthropicResp struct {
+		ID         string                   `json:"id"`
+		Model      string                   `json:"model"`
+		Content    []map[string]interface{} `json:"content"`
+		StopReason string                   `json:"stop_reason"`
+		Usage      struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &anthropicResp); err != nil {
+		return nil, err
+	}
+
+	// 提取 text content 和 tool_use blocks
+	var textParts []string
+	var toolCalls []map[string]interface{}
+
+	for _, block := range anthropicResp.Content {
+		blockType, _ := block["type"].(string)
+		switch blockType {
+		case "text":
+			if t, ok := block["text"].(string); ok {
+				textParts = append(textParts, t)
+			}
+		case "tool_use":
+			id, _ := block["id"].(string)
+			name, _ := block["name"].(string)
+			input, _ := block["input"]
+			argsJSON, err := json.Marshal(input)
+			if err != nil {
+				argsJSON = []byte("{}")
+			}
+			toolCalls = append(toolCalls, map[string]interface{}{
+				"id":   id,
+				"type": "function",
+				"function": map[string]interface{}{
+					"name":      name,
+					"arguments": string(argsJSON),
+				},
+			})
+		}
+	}
+
+	content := strings.Join(textParts, "")
+
+	// 映射 stop_reason → finish_reason
+	finishReason := "stop"
+	switch anthropicResp.StopReason {
+	case "end_turn":
+		finishReason = "stop"
+	case "max_tokens":
+		finishReason = "length"
+	case "tool_use":
+		finishReason = "tool_calls"
+	case "stop_sequence":
+		finishReason = "stop"
+	default:
+		if anthropicResp.StopReason != "" {
+			finishReason = anthropicResp.StopReason
+		}
+	}
+
+	// 构建 OpenAI 格式的 message
+	message := map[string]interface{}{
+		"role": "assistant",
+	}
+	if len(toolCalls) > 0 {
+		message["content"] = ""
+		message["tool_calls"] = toolCalls
+	} else {
+		message["content"] = content
+	}
+
+	// 构建 OpenAI 格式的 id
+	id := "chatcmpl-" + strings.TrimPrefix(anthropicResp.ID, "msg_")
+	if anthropicResp.ID == "" {
+		id = "chatcmpl-" + uuid.New().String()[:12]
+	}
+
+	openAIResp := map[string]interface{}{
+		"id":      id,
+		"object":  "chat.completion",
+		"created": time.Now().Unix(),
+		"model":   virtualModel,
+		"choices": []map[string]interface{}{
+			{
+				"index":         0,
+				"message":       message,
+				"finish_reason": finishReason,
+			},
+		},
+		"usage": map[string]interface{}{
+			"prompt_tokens":     anthropicResp.Usage.InputTokens,
+			"completion_tokens": anthropicResp.Usage.OutputTokens,
+			"total_tokens":      anthropicResp.Usage.InputTokens + anthropicResp.Usage.OutputTokens,
+		},
+	}
+
+	return json.Marshal(openAIResp)
 }

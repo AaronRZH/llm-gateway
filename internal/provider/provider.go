@@ -383,6 +383,11 @@ func (p *Provider) ConvertOpenAIToAnthropicResponse(body []byte, virtualModel st
 	return p.getConverter().ConvertOpenAIToAnthropicResponse(body, virtualModel, inputTokens)
 }
 
+// ConvertAnthropicToOpenAIResponse 将 Anthropic 非流式响应体转换为 OpenAI 格式
+func (p *Provider) ConvertAnthropicToOpenAIResponse(body []byte, virtualModel string) ([]byte, error) {
+	return p.getConverter().ConvertAnthropicToOpenAIResponse(body, virtualModel)
+}
+
 // ConvertResponse 将后端响应转为 Anthropic 格式
 func (p *Provider) ConvertResponse(resp *http.Response) ([]byte, error) {
 	return p.getConverter().ConvertResponse(resp)
