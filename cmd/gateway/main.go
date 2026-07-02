@@ -112,13 +112,15 @@ func main() {
 	}
 
 	// Token 用量统计查询路由
-	api.GET("/usage", handleUsageQuery(tokenService, authService))
-	api.GET("/usage/:request_id", handleUsageByID(tokenService))
-	api.GET("/usage/stats", handleUsageStats(tokenService))
-	api.GET("/admin/usage", handleAdminUsage(tokenService))
-	api.GET("/admin/usage/daily", handleAdminDailyUsage(tokenService))
-	api.GET("/admin/usage/stats", handleAdminStats(tokenService))
-	api.GET("/admin/calibration", handleAdminCalibration(tokenService))
+	r.GET("/usage", handleUsageQuery(tokenService, authService))
+	r.GET("/usage/:request_id", handleUsageByID(tokenService))
+	r.GET("/usage/stats", handleUsageStats(tokenService))
+
+	// 管理员路由
+	r.GET("/admin/usage", handleAdminUsage(tokenService))
+	r.GET("/admin/usage/daily", handleAdminDailyUsage(tokenService))
+	r.GET("/admin/usage/stats", handleAdminStats(tokenService))
+	r.GET("/admin/calibration", handleAdminCalibration(tokenService))
 
 	// 启动 HTTP 服务
 	srv := &http.Server{

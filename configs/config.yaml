@@ -27,6 +27,36 @@ models:
   - "deepseek"
   - "deepseek-v4-pro"
 
+# Provider 配置（API Keys 建议通过环境变量注入）
+# provider name 仅作路由标识，不影响行为
+# protocol 字段：声明上游使用的协议类型（"openai" | "anthropic"），默认为 "openai"
+providers:
+  openai:
+    base_url: "http://192.168.31.238:8000/v1"
+    api_key: "${ANTHROPIC_AUTH_TOKEN}"
+    timeout: 3000s
+    protocol: "openai" # 上游是 OpenAI 兼容接口
+  seneenova:
+    base_url: "https://token.sensenova.cn/v1"
+    api_key: "${SENSENOVA_AUTH_TOKEN}"
+    timeout: 3000s
+    protocol: "openai" # 上游是 OpenAI 兼容接口
+  anthropic:
+    base_url: "http://192.168.31.238:8000/v1"
+    api_key: "${ANTHROPIC_AUTH_TOKEN}"
+    timeout: 3000s
+    protocol: "anthropic" # 上游是 Anthropic 兼容接口
+  deepseek_openai:
+    base_url: "https://api.deepseek.com"
+    api_key: "${DEEPSEEK_API_KEY}"
+    timeout: 3000s
+    protocol: "openai" # 上游是 OpenAI 兼容接口
+  deepseek_anthropic:
+    base_url: "https://api.deepseek.com/anthropic"
+    api_key: "${DEEPSEEK_API_KEY}"
+    timeout: 3000s
+    protocol: "anthropic" # 上游是 Anthropic 兼容接口
+
 # provider 和 model 必须是真实存在的
 real_models:
   strategy: "latency_optimized" # priority | round_robin | latency_optimized | cost_optimized
@@ -66,39 +96,6 @@ rate_limit:
   requests_per_second: 100
   burst: 150
 
-# Provider 配置（API Keys 建议通过环境变量注入）
-# provider name 仅作路由标识，不影响行为
-# protocol 字段：声明上游使用的协议类型（"openai" | "anthropic"）
-# 默认为 "openai"
-# 默认上游路径：anthropic → /messages，其他 → /chat/completions
-# endpoint 字段可覆盖默认路径
-providers:
-  openai:
-    base_url: "http://192.168.31.238:8000/v1"
-    api_key: "${ANTHROPIC_AUTH_TOKEN}"
-    timeout: 3000s
-    protocol: "openai" # 上游是 OpenAI 兼容接口
-  seneenova:
-    base_url: "https://token.sensenova.cn/v1"
-    api_key: "${SENSENOVA_AUTH_TOKEN}"
-    timeout: 3000s
-    protocol: "openai" # 上游是 OpenAI 兼容接口
-  anthropic:
-    base_url: "http://192.168.31.238:8000/v1"
-    api_key: "${ANTHROPIC_AUTH_TOKEN}"
-    timeout: 3000s
-    protocol: "anthropic" # 上游是 Anthropic 兼容接口
-  deepseek_openai:
-    base_url: "https://api.deepseek.com"
-    api_key: "${DEEPSEEK_API_KEY}"
-    timeout: 3000s
-    protocol: "openai" # 上游是 OpenAI 兼容接口
-  deepseek_anthropic:
-    base_url: "https://api.deepseek.com/anthropic"
-    api_key: "${DEEPSEEK_API_KEY}"
-    timeout: 3000s
-    protocol: "anthropic" # 上游是 Anthropic 兼容接口
-
 token:
   # 本地估算模型映射
   tokenizer_mapping:
@@ -129,5 +126,5 @@ api_keys:
 auth_whitelist:
   - "/health"
   - "/metrics"
-  - "/v1/usage/*"
-  - "/v1/admin/*"
+  - "/usage/*"
+  - "/admin/*"

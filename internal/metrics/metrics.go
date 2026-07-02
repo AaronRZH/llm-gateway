@@ -189,7 +189,7 @@ func exportToJSON(families []*dto.MetricFamily) MetricsMap {
 				})
 				mf.Metrics = append(mf.Metrics, MetricItem{
 					Labels: map[string]string{"__name__": family.GetName() + "_count"},
-					Value:  json.Number(fmt.Sprintf("%g", h.GetSampleCount())),
+					Value:  json.Number(fmt.Sprintf("%d", h.GetSampleCount())),
 				})
 			case dto.MetricType_SUMMARY:
 				for _, q := range metric.Summary.Quantile {
@@ -274,7 +274,7 @@ func GatheredMap() map[string]map[string]interface{} {
 				for _, b := range h.Bucket {
 					buckets = append(buckets, map[string]interface{}{
 						"le":    fmt.Sprintf("%g", b.GetUpperBound()),
-						"count": b.GetCumulativeCount(),
+						"count": json.Number(fmt.Sprintf("%d", b.GetCumulativeCount())),
 					})
 				}
 				sort.Slice(buckets, func(i, j int) bool {
