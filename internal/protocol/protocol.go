@@ -5,6 +5,8 @@ import (
 	"io"
 	"net/http"
 
+	"github.com/rs/zerolog/log"
+
 	"llm-gateway/internal/provider"
 	"llm-gateway/internal/router"
 	"llm-gateway/internal/stream"
@@ -37,6 +39,15 @@ type Result struct {
 func Resolve(req Request) (*Result, error) {
 	clientProto := req.ClientProtocol
 	upstreamProto := req.UpstreamTarget.Provider.GetProtocol()
+
+	log.Debug().
+		Str("provider", req.UpstreamTarget.ProviderName).
+		Str("upstream_model", req.UpstreamTarget.Model).
+		Str("upstream_url", req.UpstreamTarget.Provider.FullURL()).
+		Str("client_protocol", string(clientProto)).
+		Str("upstream_protocol", string(upstreamProto)).
+		Bool("stream", req.IsStream).
+		Msg("sending request to upstream")
 
 	if clientProto == upstreamProto {
 		// Case 1/4: 协议一致，直接转发
@@ -199,12 +210,28 @@ func Resolve(req Request) (*Result, error) {
 	// 非流式 Case 3
 	openAIMsgs, openAITools := req.UpstreamTarget.Provider.ConvertAnthropicMessagesToOpenAI(
 		req.AnthropicReq.Messages, req.AnthropicReq.System, req.AnthropicReq.Tools)
+
+	log.Debug().
+		Str("provider", req.UpstreamTarget.ProviderName).
+		Str("model", req.UpstreamTarget.Model).
+		Interface("messages", openAIMsgs).
+		Interface("tools", openAITools).
+		Msg("sending openai request to upstream")
+
 	resp, err := req.UpstreamTarget.Provider.Chat(
 		req.Ctx, req.UpstreamTarget.Model, openAIMsgs, openAITools)
 	if err != nil {
 		return nil, err
 	}
 	respBody, _ := io.ReadAll(resp.Body)
+
+	log.Debug().
+		Int("upstream_status", resp.StatusCode).
+		RawJSON("upstream_body", respBody).
+		Str("provider", req.UpstreamTarget.ProviderName).
+		Str("model", req.UpstreamTarget.Model).
+		Msg("openai upstream response (raw)")
+
 	converted, convErr := req.UpstreamTarget.Provider.ConvertOpenAIToAnthropicResponse(respBody, req.VirtualModel, 0)
 	if convErr == nil {
 		return &Result{

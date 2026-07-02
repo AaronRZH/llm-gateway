@@ -401,7 +401,9 @@ func (c *AnthropicConverter) ConvertResponseWithModel(resp *http.Response, virtu
 	return jsonBody, nil
 }
 
-// ConvertAnthropicMessagesToOpenAI 将 Anthropic 格式消息和工具转换为 OpenAI 格式
+// ConvertAnthropicMessagesToOpenAI 将 Anthropic 格式消息和工具转换为 OpenAI 格式。
+// 处理 content blocks（text、tool_use、tool_result），
+// tool_use → assistant + tool_calls，tool_result → role:"tool"。
 func (c *AnthropicConverter) ConvertAnthropicMessagesToOpenAI(
 	messages []map[string]interface{},
 	system interface{},
@@ -410,35 +412,78 @@ func (c *AnthropicConverter) ConvertAnthropicMessagesToOpenAI(
 	var result []Message
 
 	// 1. system → 第一条 system message
+	var systemContent string
 	if system != nil {
-		content := ""
 		switch v := system.(type) {
 		case string:
-			content = v
+			systemContent = v
 		case []interface{}:
 			for _, block := range v {
 				if b, ok := block.(map[string]interface{}); ok {
 					if b["type"] == "text" {
 						if t, ok := b["text"].(string); ok {
-							content += t
+							systemContent += t
 						}
 					}
 				}
 			}
 		}
-		if content != "" {
-			result = append(result, Message{Role: "system", Content: content})
+	}
+
+	// 2. messages: content blocks → OpenAI 格式
+	for _, msg := range messages {
+		role, _ := msg["role"].(string)
+
+		// role="system" 合并到 systemContent
+		if role == "system" {
+			systemContent += "\n\n" + c.FlattenContent(msg["content"])
+			continue
+		}
+
+		if role != "user" && role != "assistant" {
+			continue
+		}
+
+		// 解析 content blocks
+		textContent, toolCalls, toolResults := c.parseContentBlocks(msg["content"])
+
+		switch {
+		case role == "assistant" && len(toolCalls) > 0:
+			// assistant 消息带有 tool_use → OpenAI tool_calls 格式
+			result = append(result, Message{
+				Role:      "assistant",
+				Content:   textContent,
+				ToolCalls: toolCalls,
+			})
+
+		case role == "user" && len(toolResults) > 0:
+			// user 消息带有 tool_result → 每个转为一条 role:"tool" 消息
+			for _, tr := range toolResults {
+				toolCallID, _ := tr["tool_call_id"].(string)
+				content, _ := tr["content"].(string)
+				result = append(result, Message{
+					Role:       "tool",
+					Content:    content,
+					ToolCallID: toolCallID,
+				})
+			}
+			// 如果同时还有文本内容，追加一条 user 消息
+			if textContent != "" {
+				result = append(result, Message{Role: "user", Content: textContent})
+			}
+
+		default:
+			// 纯文本消息
+			if textContent == "" && role == "assistant" {
+				continue // 跳过空的 assistant 消息
+			}
+			result = append(result, Message{Role: role, Content: textContent})
 		}
 	}
 
-	// 2. messages: content blocks → string
-	for _, msg := range messages {
-		role, _ := msg["role"].(string)
-		if role != "user" && role != "assistant" && role != "system" {
-			continue
-		}
-		content := c.FlattenContent(msg["content"])
-		result = append(result, Message{Role: role, Content: content})
+	// 合并后的 systemContent 放到最前面
+	if systemContent != "" {
+		result = append([]Message{{Role: "system", Content: systemContent}}, result...)
 	}
 
 	// 3. tools: Anthropic → OpenAI 格式
@@ -482,7 +527,75 @@ func (c *AnthropicConverter) FlattenContent(content interface{}) string {
 	}
 }
 
-// ConvertOpenAIToAnthropicResponse 将 OpenAI 非流式响应体转换为 Anthropic 格式
+// parseContentBlocks 解析 Anthropic content blocks，提取文本、tool_use 和 tool_result。
+// 返回：textContent、toolCalls（OpenAI 格式）、toolResults（OpenAI 格式）。
+func (c *AnthropicConverter) parseContentBlocks(content interface{}) (string, []map[string]interface{}, []map[string]interface{}) {
+	blocks, ok := content.([]interface{})
+	if !ok {
+		// 不是 content blocks 数组，按字符串处理
+		return c.FlattenContent(content), nil, nil
+	}
+
+	var textParts []string
+	var toolCalls []map[string]interface{}
+	var toolResults []map[string]interface{}
+
+	for _, block := range blocks {
+		b, ok := block.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		blockType, _ := b["type"].(string)
+		switch blockType {
+		case "text":
+			if t, ok := b["text"].(string); ok {
+				textParts = append(textParts, t)
+			}
+		case "tool_use":
+			// Anthropic tool_use → OpenAI tool_call
+			id, _ := b["id"].(string)
+			name, _ := b["name"].(string)
+			input, _ := b["input"]
+			argsJSON, _ := json.Marshal(input)
+			toolCalls = append(toolCalls, map[string]interface{}{
+				"id":   id,
+				"type": "function",
+				"function": map[string]interface{}{
+					"name":      name,
+					"arguments": string(argsJSON),
+				},
+			})
+		case "tool_result":
+			// Anthropic tool_result → OpenAI role:"tool" 消息
+			toolUseID, _ := b["tool_use_id"].(string)
+			resultContent := ""
+			switch v := b["content"].(type) {
+			case string:
+				resultContent = v
+			case []interface{}:
+				// tool_result content 也可能是 content blocks
+				for _, cb := range v {
+					if cbm, ok := cb.(map[string]interface{}); ok {
+						if cbm["type"] == "text" {
+							if t, ok := cbm["text"].(string); ok {
+								resultContent += t
+							}
+						}
+					}
+				}
+			}
+			toolResults = append(toolResults, map[string]interface{}{
+				"tool_call_id": toolUseID,
+				"content":      resultContent,
+			})
+		}
+	}
+
+	return strings.Join(textParts, ""), toolCalls, toolResults
+}
+
+// ConvertOpenAIToAnthropicResponse 将 OpenAI 非流式响应体转换为 Anthropic 格式。
+// 支持 text 和 tool_calls 两种响应内容。
 func (c *AnthropicConverter) ConvertOpenAIToAnthropicResponse(body []byte, virtualModel string, inputTokens int) ([]byte, error) {
 	var openAIResp struct {
 		ID      string `json:"id"`
@@ -492,8 +605,16 @@ func (c *AnthropicConverter) ConvertOpenAIToAnthropicResponse(body []byte, virtu
 			Index        int    `json:"index"`
 			FinishReason string `json:"finish_reason"`
 			Message      struct {
-				Role    string `json:"role"`
-				Content string `json:"content"`
+				Role      string `json:"role"`
+				Content   string `json:"content"`
+				ToolCalls []struct {
+					ID       string `json:"id"`
+					Type     string `json:"type"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls,omitempty"`
 			} `json:"message"`
 		} `json:"choices"`
 		Usage struct {
@@ -506,32 +627,74 @@ func (c *AnthropicConverter) ConvertOpenAIToAnthropicResponse(body []byte, virtu
 		return nil, err
 	}
 
-	content := ""
+	// 构建 Anthropic content blocks
+	var anthropicContent []map[string]interface{}
 	finishReason := "end_turn"
+
 	if len(openAIResp.Choices) > 0 {
-		content = openAIResp.Choices[0].Message.Content
-		if openAIResp.Choices[0].FinishReason == "stop" {
+		choice := openAIResp.Choices[0]
+
+		// 映射 finish_reason → stop_reason
+		switch choice.FinishReason {
+		case "stop":
 			finishReason = "end_turn"
-		} else if openAIResp.Choices[0].FinishReason != "" {
-			finishReason = openAIResp.Choices[0].FinishReason
+		case "tool_calls":
+			finishReason = "tool_use"
+		case "length":
+			finishReason = "max_tokens"
+		default:
+			if choice.FinishReason != "" {
+				finishReason = choice.FinishReason
+			}
+		}
+
+		// 文本内容
+		if choice.Message.Content != "" {
+			anthropicContent = append(anthropicContent, map[string]interface{}{
+				"type": "text",
+				"text": choice.Message.Content,
+			})
+		}
+
+		// tool_calls → Anthropic tool_use content blocks
+		for _, tc := range choice.Message.ToolCalls {
+			var input map[string]interface{}
+			if err := json.Unmarshal([]byte(tc.Function.Arguments), &input); err != nil {
+				// arguments 解析失败时保留原始字符串
+				input = map[string]interface{}{"raw": tc.Function.Arguments}
+			}
+			anthropicContent = append(anthropicContent, map[string]interface{}{
+				"type":  "tool_use",
+				"id":    tc.ID,
+				"name":  tc.Function.Name,
+				"input": input,
+			})
 		}
 	}
 
-	// 构建 content blocks
-	anthropicContent := []map[string]interface{}{
-		{"type": "text", "text": content},
+	// 确保 content 不为空
+	if len(anthropicContent) == 0 {
+		anthropicContent = []map[string]interface{}{
+			{"type": "text", "text": ""},
+		}
+	}
+
+	// usage: 优先使用 OpenAI 响应中的真实数据
+	realInputTokens := openAIResp.Usage.PromptTokens
+	if realInputTokens == 0 {
+		realInputTokens = inputTokens
 	}
 
 	anthropicResp := map[string]interface{}{
-		"id":          "msg_" + strings.TrimPrefix(openAIResp.ID, "chatcmpl-"),
-		"type":        "message",
-		"role":        "assistant",
-		"content":     anthropicContent,
-		"model":       virtualModel,
-		"stop_reason": finishReason,
+		"id":            "msg_" + strings.TrimPrefix(openAIResp.ID, "chatcmpl-"),
+		"type":          "message",
+		"role":          "assistant",
+		"content":       anthropicContent,
+		"model":         virtualModel,
+		"stop_reason":   finishReason,
 		"stop_sequence": nil,
 		"usage": map[string]interface{}{
-			"input_tokens":  inputTokens,
+			"input_tokens":  realInputTokens,
 			"output_tokens": openAIResp.Usage.CompletionTokens,
 		},
 	}

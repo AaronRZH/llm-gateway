@@ -31,10 +31,12 @@ const (
 	ProtocolAnthropic ClientProtocol = "anthropic"
 )
 
-// Message 消息结构
+// Message 消息结构（OpenAI 格式，支持 tool_calls）
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string                   `json:"role"`
+	Content    string                   `json:"content,omitempty"`
+	ToolCalls  []map[string]interface{} `json:"tool_calls,omitempty"`
+	ToolCallID string                   `json:"tool_call_id,omitempty"`
 }
 
 // Provider 上游 Provider 接口 — 统一发送所有 HTTP 请求
@@ -133,6 +135,11 @@ func (p *Provider) GetName() string {
 // GetProtocol 返回上游使用的协议类型
 func (p *Provider) GetProtocol() ClientProtocol {
 	return p.protocol
+}
+
+// FullURL 返回完整的 upstream URL（不含 suffix）
+func (p *Provider) FullURL() string {
+	return p.fullURL("")
 }
 
 // getConverter 获取格式转换器（延迟初始化）

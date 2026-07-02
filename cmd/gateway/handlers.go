@@ -355,9 +355,48 @@ func handleCountTokens(mapper *mapper.Service, routerSvc *router.Service, provid
 				reqMap["model"] = target.Model
 				body, _ = json.Marshal(reqMap)
 			}
+
+			// 非 Anthropic 上游不支持 /count_tokens，本地粗略估算
+			if target.Provider.GetProtocol() != provider.ProtocolAnthropic {
+				estimatedInput := len(body) / 4 // 简单字符估算
+				c.JSON(http.StatusOK, gin.H{"usage": map[string]interface{}{
+					"input_tokens": estimatedInput,
+				}})
+				return
+			}
+
+			// 使用路由解析到的 provider 发送 count_tokens 请求
+			resp, err := target.Provider.CountTokens(c.Request.Context(), body)
+			if err != nil {
+				log.Error().Err(err).Str("provider", target.ProviderName).Msg("count_tokens upstream request failed")
+				c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+				return
+			}
+			defer resp.Body.Close()
+
+			respBody, _ := io.ReadAll(resp.Body)
+
+			// 如果上游返回了 usage 字段，提取并返回 token 统计
+			if resp.StatusCode == http.StatusOK {
+				var usageData map[string]interface{}
+				var parsedResp map[string]interface{}
+				if json.Unmarshal(respBody, &parsedResp) == nil {
+					if u, ok := parsedResp["usage"].(map[string]interface{}); ok {
+						usageData = u
+					}
+				}
+				if usageData != nil {
+					c.JSON(http.StatusOK, gin.H{"usage": usageData})
+					return
+				}
+			}
+
+			// 没有 usage（上游可能返回 error），原样转发
+			c.Data(resp.StatusCode, "application/json", respBody)
+			return
 		}
 
-		// 调用上游的 /messages/count_tokens 端点
+		// 没有 model 字段或 model 为空时，尝试直接调用 anthropic provider 兜底
 		p, ok := providerManager.Get("anthropic")
 		if !ok {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "anthropic provider not available"})
@@ -373,7 +412,6 @@ func handleCountTokens(mapper *mapper.Service, routerSvc *router.Service, provid
 
 		respBody, _ := io.ReadAll(resp.Body)
 
-		// 如果上游返回了 usage 字段，提取并返回 token 统计
 		if resp.StatusCode == http.StatusOK {
 			var usageData map[string]interface{}
 			var parsedResp map[string]interface{}
@@ -388,7 +426,6 @@ func handleCountTokens(mapper *mapper.Service, routerSvc *router.Service, provid
 			}
 		}
 
-		// 没有 usage（上游可能返回 error），原样转发
 		c.Data(resp.StatusCode, "application/json", respBody)
 	}
 }
@@ -563,7 +600,7 @@ func handleAnthropicMessages(
 				body, _ = io.ReadAll(protocolResult.Response.Body)
 			}
 			protocolResult.Response.Body.Close()
-			log.Error().Int("status", protocolResult.StatusCode).RawJSON("body", body).Msg("anthropic upstream returned error")
+			log.Error().Int("status", protocolResult.StatusCode).RawJSON("body", body).Str("provider", targetProvider).Msg("upstream returned error")
 			c.Data(protocolResult.StatusCode, "application/json", body)
 			return
 		}
@@ -748,7 +785,12 @@ func toolsFromAnthropicRequest(reqTools []map[string]interface{}) []provider.Too
 					params = p
 				}
 				out = append(out, provider.Tool{
-					Type: func() string { if tt, ok := t["type"].(string); ok { return tt }; return "function" }(),
+					Type: func() string {
+						if tt, ok := t["type"].(string); ok {
+							return tt
+						}
+						return "function"
+					}(),
 					Function: provider.ToolFunc{
 						Name:        name,
 						Description: desc,
@@ -766,7 +808,12 @@ func toolsFromAnthropicRequest(reqTools []map[string]interface{}) []provider.Too
 				params = p
 			}
 			out = append(out, provider.Tool{
-				Type: func() string { if tt, ok := t["type"].(string); ok { return tt }; return "function" }(),
+				Type: func() string {
+					if tt, ok := t["type"].(string); ok {
+						return tt
+					}
+					return "function"
+				}(),
 				Function: provider.ToolFunc{
 					Name:        name,
 					Description: desc,
