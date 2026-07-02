@@ -493,6 +493,7 @@ func handleAnthropicMessages(
 			var cancel context.CancelFunc
 			if target.Timeout > 0 {
 				reqCtx, cancel = context.WithTimeout(reqCtx, target.Timeout)
+				defer cancel()
 			}
 
 			start = time.Now()
@@ -527,9 +528,6 @@ func handleAnthropicMessages(
 					Ctx:            reqCtx,
 					VirtualModel:   req.Model,
 				})
-			}
-			if cancel != nil {
-				cancel()
 			}
 			if resolveErr != nil {
 				if resolveErr == gobreaker.ErrOpenState || resolveErr == gobreaker.ErrTooManyRequests {
