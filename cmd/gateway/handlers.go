@@ -42,27 +42,23 @@ func handleChatCompletion(
 			return
 		}
 
-		// 1. 模型名映射: virtual -> real
-		mapped, err := mapper.Resolve(req.Model)
-		realModel := req.Model
-		providerName := ""
-		if err != nil {
-			log.Warn().Str("model", req.Model).Msg("model not found in mapping")
-		} else {
-			realModel = mapped.RealModel
-			providerName = mapped.Provider
+		// 1. 模型名 allowlist 校验
+		if err := mapper.Validate(req.Model); err != nil {
+			log.Warn().Str("model", req.Model).Msg("model not in allowlist")
+			c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("model '%s' not found", req.Model)})
+			return
 		}
-		log.Debug().Str("virtual", req.Model).Str("real", realModel).Str("provider", providerName).Msg("model mapped")
+		log.Debug().Str("model", req.Model).Msg("model validated")
 
 		// 2. 估算输入 token（加上 tools 定义的粗略开销）
-		inputTokens := tokenService.EstimateInput(toTokenMessages(req.Messages), realModel)
+		inputTokens := tokenService.EstimateInput(toTokenMessages(req.Messages), req.Model)
 		if len(req.Tools) > 0 {
 			inputTokens += len(req.Tools) * 80 // 每个 tool 定义约 80 tokens 开销
 		}
 		log.Debug().Int("input_tokens", inputTokens).Msg("token estimated")
 
 		// 3. 路由选择 — 获取候选列表（支持 fallback 重试）
-		sel, err := routerSvc.SelectCandidates(c.Request.Context(), req.Model, inputTokens)
+		sel, err := routerSvc.SelectCandidates(c.Request.Context(), inputTokens)
 		if err != nil {
 			log.Error().Err(err).Msg("router selection failed")
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no available model"})
@@ -80,30 +76,47 @@ func handleChatCompletion(
 			for target := sel.Next(); target != nil; target = sel.Next() {
 				upstreamModel = target.Model
 				targetProvider = target.ProviderName
-				if targetProvider == "" {
-					targetProvider = providerName
-				}
 
 				start = time.Now()
 
 				// 协议处理：统一调用 protocol.Resolve 处理 4 种协议组合
-				res, err := protocol.Resolve(protocol.Request{
-					ClientProtocol: provider.ProtocolOpenAI, // handleChatCompletion 总是 OpenAI 客户端
-					UpstreamTarget: target,
-					ChatReq:        &req,
-					IsStream:       true,
-					Ctx:            c.Request.Context(),
-					VirtualModel:   req.Model,
-				})
-				if err != nil {
-					if err == gobreaker.ErrOpenState || err == gobreaker.ErrTooManyRequests {
+				// 通过 Breaker.Execute() 包裹，使熔断器可统计成功/失败并自动转换状态
+				var res *protocol.Result
+				var resolveErr error
+				if target.Breaker != nil {
+					result, breakerErr := target.Breaker.Execute(func() (interface{}, error) {
+						return protocol.Resolve(protocol.Request{
+							ClientProtocol: provider.ProtocolOpenAI,
+							UpstreamTarget: target,
+							ChatReq:        &req,
+							IsStream:       true,
+							Ctx:            c.Request.Context(),
+							VirtualModel:   req.Model,
+						})
+					})
+					if result != nil {
+						res = result.(*protocol.Result)
+					}
+					resolveErr = breakerErr
+				} else {
+					res, resolveErr = protocol.Resolve(protocol.Request{
+						ClientProtocol: provider.ProtocolOpenAI,
+						UpstreamTarget: target,
+						ChatReq:        &req,
+						IsStream:       true,
+						Ctx:            c.Request.Context(),
+						VirtualModel:   req.Model,
+					})
+				}
+				if resolveErr != nil {
+					if resolveErr == gobreaker.ErrOpenState || resolveErr == gobreaker.ErrTooManyRequests {
 						log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
 						continue
 					}
 					if lastErr == nil {
-						lastErr = err
+						lastErr = resolveErr
 					}
-					log.Error().Err(err).Str("provider", targetProvider).Msg("stream connect failed, trying next")
+					log.Error().Err(resolveErr).Str("provider", targetProvider).Msg("stream connect failed, trying next")
 					continue
 				}
 				upstream = res.StreamBody
@@ -131,11 +144,11 @@ func handleChatCompletion(
 
 			// 记录延迟（用于 latency_optimized 策略）
 			if targetProvider != "" {
-				routerSvc.RecordLatency(req.Model, targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
+				routerSvc.RecordLatency(targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
 			}
 
 			// 5. 流式：根据累计内容估算输出 token，异步记录用量
-			estimatedOutput := tokenService.EstimateOutput(result.AccumulatedContent, realModel)
+			estimatedOutput := tokenService.EstimateOutput(result.AccumulatedContent, req.Model)
 			toolCalls := streamHandler.ExtractToolCalls(result)
 			estimatedToolCalls := len(toolCalls)
 
@@ -159,7 +172,7 @@ func handleChatCompletion(
 			if realTotal > 0 {
 				effTotal = realTotal
 			}
-			go tokenService.RecordUsageNow(reqID, realModel, req.Model, targetProvider,
+			go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
 				inputTokens, estimatedOutput, effInput, effOutput, effTotal, estimatedToolCalls, apiKey)
 
 			metrics.RecordRequest("POST", "/v1/chat/completions", http.StatusOK, req.Model, time.Since(start).Seconds())
@@ -173,30 +186,47 @@ func handleChatCompletion(
 			for target := sel.Next(); target != nil; target = sel.Next() {
 				upstreamModel = target.Model
 				targetProvider = target.ProviderName
-				if targetProvider == "" {
-					targetProvider = providerName
-				}
 
 				start = time.Now()
 
 				// 协议处理：统一调用 protocol.Resolve 处理 4 种协议组合
-				res, err := protocol.Resolve(protocol.Request{
-					ClientProtocol: provider.ProtocolOpenAI, // handleChatCompletion 总是 OpenAI 客户端
-					UpstreamTarget: target,
-					ChatReq:        &req,
-					IsStream:       false,
-					Ctx:            c.Request.Context(),
-					VirtualModel:   req.Model,
-				})
-				if err != nil {
-					if err == gobreaker.ErrOpenState || err == gobreaker.ErrTooManyRequests {
+				// 通过 Breaker.Execute() 包裹，使熔断器可统计成功/失败并自动转换状态
+				var res *protocol.Result
+				var resolveErr error
+				if target.Breaker != nil {
+					result, breakerErr := target.Breaker.Execute(func() (interface{}, error) {
+						return protocol.Resolve(protocol.Request{
+							ClientProtocol: provider.ProtocolOpenAI,
+							UpstreamTarget: target,
+							ChatReq:        &req,
+							IsStream:       false,
+							Ctx:            c.Request.Context(),
+							VirtualModel:   req.Model,
+						})
+					})
+					if result != nil {
+						res = result.(*protocol.Result)
+					}
+					resolveErr = breakerErr
+				} else {
+					res, resolveErr = protocol.Resolve(protocol.Request{
+						ClientProtocol: provider.ProtocolOpenAI,
+						UpstreamTarget: target,
+						ChatReq:        &req,
+						IsStream:       false,
+						Ctx:            c.Request.Context(),
+						VirtualModel:   req.Model,
+					})
+				}
+				if resolveErr != nil {
+					if resolveErr == gobreaker.ErrOpenState || resolveErr == gobreaker.ErrTooManyRequests {
 						log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
 						continue
 					}
 					if lastErr == nil {
-						lastErr = err
+						lastErr = resolveErr
 					}
-					log.Error().Err(err).Str("provider", targetProvider).Msg("upstream request failed, trying next")
+					log.Error().Err(resolveErr).Str("provider", targetProvider).Msg("upstream request failed, trying next")
 					continue
 				}
 				// Body 已在 protocol.Resolve 中读取并转换，直接使用
@@ -208,7 +238,7 @@ func handleChatCompletion(
 
 				// 记录延迟（用于 latency_optimized 策略）
 				if targetProvider != "" {
-					routerSvc.RecordLatency(req.Model, targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
+					routerSvc.RecordLatency(targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
 				}
 
 				// 5. 解析上游返回的真实 usage，异步记录用量
@@ -216,7 +246,7 @@ func handleChatCompletion(
 				// 解析 tool_calls
 				toolCalls := parseToolCalls(body, targetProvider)
 				_ = realTotal // 保留用于未来的扩展
-				tokenService.RecordUsageNow(reqID, realModel, req.Model, targetProvider,
+				go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
 					inputTokens, 0, realInput, realOutput, realTotal, len(toolCalls), apiKey)
 
 				metrics.RecordRequest("POST", "/v1/chat/completions", res.StatusCode, req.Model, time.Since(start).Seconds())
@@ -300,14 +330,14 @@ func handleCountTokens(mapper *mapper.Service, routerSvc *router.Service, provid
 		}
 		if err := json.Unmarshal(body, &parseReq); err == nil && parseReq.Model != "" {
 			// 模型未配置则直接 404
-			if _, err := mapper.Resolve(parseReq.Model); err != nil {
+			if err := mapper.Validate(parseReq.Model); err != nil {
 				log.Warn().Str("model", parseReq.Model).Msg("count_tokens model not found in mapping")
 				c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("model '%s' not found in mapping", parseReq.Model)})
 				return
 			}
 
 			// 通过路由获取真实模型（支持 fallback chain）
-			sel, err := routerSvc.SelectCandidates(c.Request.Context(), parseReq.Model, 0)
+			sel, err := routerSvc.SelectCandidates(c.Request.Context(), 0)
 			if err != nil {
 				log.Warn().Str("model", parseReq.Model).Msg("count_tokens router selection failed")
 				c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("model '%s' has no available target", parseReq.Model)})
@@ -388,17 +418,13 @@ func handleAnthropicMessages(
 			return
 		}
 
-		// 1. 模型名映射: virtual -> real
-		mapped, err := mapper.Resolve(req.Model)
-		realModel := req.Model
-		providerName := ""
-		if err != nil {
-			log.Warn().Str("model", req.Model).Msg("model not found in mapping")
-		} else {
-			realModel = mapped.RealModel
-			providerName = mapped.Provider
+		// 1. 模型名 allowlist 校验
+		if err := mapper.Validate(req.Model); err != nil {
+			log.Warn().Str("model", req.Model).Msg("model not in allowlist")
+			c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("model '%s' not found", req.Model)})
+			return
 		}
-		log.Debug().Str("virtual", req.Model).Str("real", realModel).Str("provider", providerName).Msg("anthropic model mapped")
+		log.Debug().Str("model", req.Model).Msg("anthropic model validated")
 
 		// 2. 估算输入 token
 		var inputTokens int
@@ -416,7 +442,7 @@ func handleAnthropicMessages(
 		log.Debug().Int("input_tokens", inputTokens).Msg("anthropic token estimated")
 
 		// 3. 路由选择 — 获取候选列表（支持 fallback 重试）
-		sel, err := routerSvc.SelectCandidates(c.Request.Context(), req.Model, inputTokens)
+		sel, err := routerSvc.SelectCandidates(c.Request.Context(), inputTokens)
 		if err != nil {
 			log.Error().Err(err).Msg("anthropic router selection failed")
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no available model"})
@@ -436,9 +462,6 @@ func handleAnthropicMessages(
 		for target := sel.Next(); target != nil; target = sel.Next() {
 			upstreamModel = target.Model
 			targetProvider = target.ProviderName
-			if targetProvider == "" {
-				targetProvider = providerName
-			}
 
 			// 构建额外参数（Case 4 专用）
 			extraParams := map[string]interface{}{
@@ -467,33 +490,56 @@ func handleAnthropicMessages(
 
 			// 使用 target 的超时时间设置 context deadline
 			reqCtx := c.Request.Context()
+			var cancel context.CancelFunc
 			if target.Timeout > 0 {
-				var cancel context.CancelFunc
 				reqCtx, cancel = context.WithTimeout(reqCtx, target.Timeout)
-				defer cancel()
 			}
 
 			start = time.Now()
 
 			// 协议处理：统一调用 protocol.Resolve 处理 4 种协议组合
-			res, err := protocol.Resolve(protocol.Request{
-				ClientProtocol: clientProtocol,
-				UpstreamTarget: target,
-				AnthropicReq:   &req,
-				ExtraParams:    extraParams,
-				IsStream:       req.Stream,
-				Ctx:            reqCtx,
-				VirtualModel:   req.Model,
-			})
-			if err != nil {
-				if err == gobreaker.ErrOpenState || err == gobreaker.ErrTooManyRequests {
+			// 通过 Breaker.Execute() 包裹，使熔断器可统计成功/失败并自动转换状态
+			var res *protocol.Result
+			var resolveErr error
+			if target.Breaker != nil {
+				result, breakerErr := target.Breaker.Execute(func() (interface{}, error) {
+					return protocol.Resolve(protocol.Request{
+						ClientProtocol: clientProtocol,
+						UpstreamTarget: target,
+						AnthropicReq:   &req,
+						ExtraParams:    extraParams,
+						IsStream:       req.Stream,
+						Ctx:            reqCtx,
+						VirtualModel:   req.Model,
+					})
+				})
+				if result != nil {
+					res = result.(*protocol.Result)
+				}
+				resolveErr = breakerErr
+			} else {
+				res, resolveErr = protocol.Resolve(protocol.Request{
+					ClientProtocol: clientProtocol,
+					UpstreamTarget: target,
+					AnthropicReq:   &req,
+					ExtraParams:    extraParams,
+					IsStream:       req.Stream,
+					Ctx:            reqCtx,
+					VirtualModel:   req.Model,
+				})
+			}
+			if cancel != nil {
+				cancel()
+			}
+			if resolveErr != nil {
+				if resolveErr == gobreaker.ErrOpenState || resolveErr == gobreaker.ErrTooManyRequests {
 					log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
 					continue
 				}
 				if lastErr == nil {
-					lastErr = err
+					lastErr = resolveErr
 				}
-				log.Error().Err(err).Str("provider", targetProvider).Msg("anthropic upstream request failed, trying next")
+				log.Error().Err(resolveErr).Str("provider", targetProvider).Msg("anthropic upstream request failed, trying next")
 				continue
 			}
 			protocolResult = res
@@ -539,7 +585,7 @@ func handleAnthropicMessages(
 
 			// 记录延迟（在流开始后记录，而不是结束后）
 			if targetProvider != "" {
-				routerSvc.RecordLatency(req.Model, targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
+				routerSvc.RecordLatency(targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
 			}
 
 			result := streamHandler.RewriteAndForward(c.Writer, protocolResult.StreamBody, req.Model)
@@ -561,7 +607,7 @@ func handleAnthropicMessages(
 			if realTotal > 0 {
 				effTotal = realTotal
 			}
-			go tokenService.RecordUsageNow(reqID, realModel, req.Model, targetProvider,
+			go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
 				inputTokens, 0, effInput, effOutput, effTotal, 0, apiKey)
 
 			metrics.RecordRequest("POST", "/v1/messages", protocolResult.StatusCode, req.Model, time.Since(start).Seconds())
@@ -573,14 +619,14 @@ func handleAnthropicMessages(
 
 			// 记录延迟
 			if targetProvider != "" {
-				routerSvc.RecordLatency(req.Model, targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
+				routerSvc.RecordLatency(targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
 			}
 
 			// 记录用量
 			realInput, realOutput, realTotal := parseUsage(protocolResult.Body)
 			toolCalls := parseToolCalls(protocolResult.Body, targetProvider)
 			_ = realTotal
-			go tokenService.RecordUsageNow(reqID, realModel, req.Model, targetProvider,
+			go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
 				inputTokens, 0, realInput, realOutput, realTotal, len(toolCalls), apiKey)
 
 			metrics.RecordRequest("POST", "/v1/messages", protocolResult.StatusCode, req.Model, time.Since(start).Seconds())

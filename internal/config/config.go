@@ -14,8 +14,8 @@ type Config struct {
 	App            AppConfig                 `mapstructure:"app"`
 	Log            LogConfig                 `mapstructure:"log"`
 	Redis          RedisConfig               `mapstructure:"redis"`
-	ModelMapping   ModelMappingConfig        `mapstructure:"model_mapping"`
-	ModelGroups    map[string]ModelGroup     `mapstructure:"model_groups"`
+	Models      []string          `mapstructure:"models"`
+	RealModels  RealModelsConfig  `mapstructure:"real_models"`
 	CircuitBreaker CircuitBreakerConfig      `mapstructure:"circuit_breaker"`
 	RateLimit      RateLimitConfig           `mapstructure:"rate_limit"`
 	Providers      map[string]ProviderConfig `mapstructure:"providers"`
@@ -49,19 +49,9 @@ type RedisConfig struct {
 	WriteTimeout time.Duration `mapstructure:"write_timeout"`
 }
 
-type ModelMappingConfig struct {
-	VirtualToReal map[string]VirtualModel `mapstructure:"virtual_to_real"`
-	RealToVirtual map[string]string       `mapstructure:"real_to_virtual"`
-}
-
-type VirtualModel struct {
-	Real    string   `mapstructure:"real"`
-	Aliases []string `mapstructure:"aliases"`
-}
-
-type ModelGroup struct {
-	Strategy      string         `mapstructure:"strategy"`
-	FallbackChain []FallbackItem `mapstructure:"fallback_chain"`
+type RealModelsConfig struct {
+	Strategy string         `mapstructure:"strategy"`
+	Models   []FallbackItem `mapstructure:"models"`
 }
 
 type FallbackItem struct {
@@ -96,14 +86,7 @@ type ProviderConfig struct {
 }
 
 type TokenConfig struct {
-	TokenizerMapping map[string]string  `mapstructure:"tokenizer_mapping"`
-	OfficialSync     OfficialSyncConfig `mapstructure:"official_sync"`
-}
-
-type OfficialSyncConfig struct {
-	Enabled   bool          `mapstructure:"enabled"`
-	Interval  time.Duration `mapstructure:"interval"`
-	BatchSize int           `mapstructure:"batch_size"`
+	TokenizerMapping map[string]string `mapstructure:"tokenizer_mapping"`
 }
 
 type MetricsConfig struct {
@@ -123,30 +106,33 @@ type APIKeyConfig struct {
 
 // Load 加载配置
 func Load(path string) (*Config, error) {
-	v := viper.New()
+	v := viper.NewWithOptions(viper.KeyDelimiter("::"))
 	v.SetConfigFile(path)
 	v.SetConfigType("yaml")
 
+	// 使用 :: 作为 key 分隔符，避免模型名中包含 "." 导致的解析问题
+	// （如 mimo-v2.5 会被默认的 "." 分隔符拆成 mimo-v2 -> 5）
+
 	// 环境变量支持
 	v.SetEnvPrefix("LLM")
-	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	v.SetEnvKeyReplacer(strings.NewReplacer("::", "_"))
 	v.AutomaticEnv()
 
 	// 默认值
-	v.SetDefault("app.port", 8080)
-	v.SetDefault("log.level", "info")
-	v.SetDefault("redis.addr", "localhost:6379")
-	v.SetDefault("health.enabled", true)
-	v.SetDefault("health.path", "/health")
-	v.SetDefault("metrics.enabled", true)
-	v.SetDefault("metrics.path", "/metrics")
+	v.SetDefault("app::port", 8080)
+	v.SetDefault("log::level", "info")
+	v.SetDefault("redis::addr", "localhost:6379")
+	v.SetDefault("health::enabled", true)
+	v.SetDefault("health::path", "/health")
+	v.SetDefault("metrics::enabled", true)
+	v.SetDefault("metrics::path", "/metrics")
 
 	if err := v.ReadInConfig(); err != nil {
 		return nil, fmt.Errorf("read config failed: %w", err)
 	}
 
 	// 加载环境特定配置（如 config.prod.yaml）
-	env := v.GetString("app.env")
+	env := v.GetString("app::env")
 	if env != "" && env != "dev" {
 		envConfig := fmt.Sprintf("configs/config.%s.yaml", env)
 		if _, err := os.Stat(envConfig); err == nil {

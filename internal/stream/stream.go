@@ -3,24 +3,22 @@ package stream
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 
 	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
-
-	"llm-gateway/internal/mapper"
 )
 
 // Handler SSE 流处理
 type Handler struct {
-	mapper *mapper.Service
 }
 
 // New 创建流处理器
-func New(mapper *mapper.Service) *Handler {
-	return &Handler{mapper: mapper}
+func New() *Handler {
+	return &Handler{}
 }
 
 // StreamResult 流式处理结果
@@ -119,7 +117,7 @@ func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadClose
 		flusher.Flush()
 	}
 
-	if err := scanner.Err(); err != nil {
+	if err := scanner.Err(); err != nil && err != io.EOF && err != context.Canceled {
 		log.Error().Err(err).Msg("stream scan error")
 	}
 

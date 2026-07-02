@@ -57,11 +57,11 @@ func main() {
 		Msg("starting llm-gateway")
 
 	// 初始化各模块
-	mapperService := mapper.New(cfg.ModelMapping)
+	mapperService := mapper.New(cfg.Models)
 	tokenService := token.New(cfg.Token)
 	providerManager := provider.NewManager(cfg.Providers)
-	routerService := router.New(cfg.ModelGroups, providerManager, mapperService, tokenService, cfg.CircuitBreaker)
-	streamHandler := stream.New(mapperService)
+	routerService := router.New(cfg.RealModels, providerManager, tokenService, cfg.CircuitBreaker)
+	streamHandler := stream.New()
 
 	// 初始化 Redis 客户端
 	redisClient := redisutil.New(redisutil.Config{
@@ -98,7 +98,7 @@ func main() {
 	// 注册公开路由
 	r.GET(cfg.Health.Path, health.Handler())
 	if cfg.Metrics.Enabled {
-		r.GET(cfg.Metrics.Path, metrics.Handler())
+		r.GET(cfg.Metrics.Path, metrics.JSONHandler())
 	}
 
 	// API 路由

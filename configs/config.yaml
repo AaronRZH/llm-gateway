@@ -19,46 +19,38 @@ redis:
   read_timeout: 3s
   write_timeout: 3s
 
-# 模型名映射
-model_mapping:
-  # 对外暴露名 -> 内部真实模型
-  virtual_to_real:
-    "gpt-4":
-      real: "anthropic/Qwen3.6-35B-A3B-4bit"
-      aliases: ["gpt-4o"]
-    "gpt-4-mini":
-      real: "anthropic/Qwen3.6-35B-A3B-4bit"
-      aliases: ["gpt-4o-mini"]
-    "claude":
-      real: "openai/Qwen3.6-35B-A3B-4bit"
-      aliases: ["claude-sonnet", "claude"]
-    "deepseek":
-      real: "anthropic/Qwen3.6-35B-A3B-4bit"
-      aliases: ["deepseek-v3"]
+# 模型名 allowlist（对外暴露）
+models:
+  - "gpt-4"
+  - "gpt-4-mini"
+  - "claude"
+  - "deepseek"
+  - "deepseek-v4-pro"
 
-  # 反向映射（响应重写用，你的代理模型名含.导致Viper解析异常，先注释）
-  # "anthropic/Qwen3.6-35B-A3B-4bit": "Qwen3.6-35B-A3B-4bit"
-
-# 模型组 & 自动切换策略
-model_groups:
-  "smart-chat":
-    strategy: "round_robin" # priority | round_robin | latency_optimized | cost_optimized
-    fallback_chain:
-      - provider: "openai"
-        model: "Qwen3.6-35B-A3B-4bit"
-        weight: 70
-        timeout: 3000s
-        retry: 2
-        cost: 0.03
-
-  "fast-chat":
-    strategy: "latency_optimized"
-    fallback_chain:
-      - provider: "openai"
-        model: "Qwen3.6-35B-A3B-4bit"
-        weight: 50
-        timeout: 3000s
-        cost: 0.0006
+# provider 和 model 必须是真实存在的
+real_models:
+  strategy: "latency_optimized" # priority | round_robin | latency_optimized | cost_optimized
+  models:
+    - provider: "anthropic"
+      model: "Qwen3.6-35B-A3B-4bit"
+      weight: 70
+      timeout: 3000s
+      cost: 0
+    - provider: "openai"
+      model: "Qwen3.6-35B-A3B-4bit"
+      weight: 50
+      timeout: 3000s
+      cost: 0
+    - provider: "deepseek_anthropic"
+      model: "deepseek-v4-flash"
+      weight: 10
+      timeout: 3000s
+      cost: 0.03
+    - provider: "seneenova"
+      model: "sensenova-6.7-flash-lite"
+      weight: 70
+      timeout: 3000s
+      cost: 0
 
 # 熔断器配置
 circuit_breaker:
@@ -86,13 +78,27 @@ providers:
     api_key: "${ANTHROPIC_AUTH_TOKEN}"
     timeout: 3000s
     protocol: "openai" # 上游是 OpenAI 兼容接口
+  seneenova:
+    base_url: "https://token.sensenova.cn/v1"
+    api_key: "${SENSENOVA_AUTH_TOKEN}"
+    timeout: 3000s
+    protocol: "openai" # 上游是 OpenAI 兼容接口
   anthropic:
     base_url: "http://192.168.31.238:8000/v1"
     api_key: "${ANTHROPIC_AUTH_TOKEN}"
     timeout: 3000s
     protocol: "anthropic" # 上游是 Anthropic 兼容接口
+  deepseek_openai:
+    base_url: "https://api.deepseek.com"
+    api_key: "${DEEPSEEK_API_KEY}"
+    timeout: 3000s
+    protocol: "openai" # 上游是 OpenAI 兼容接口
+  deepseek_anthropic:
+    base_url: "https://api.deepseek.com/anthropic"
+    api_key: "${DEEPSEEK_API_KEY}"
+    timeout: 3000s
+    protocol: "anthropic" # 上游是 Anthropic 兼容接口
 
-# Token 计算
 token:
   # 本地估算模型映射
   tokenizer_mapping:
@@ -100,12 +106,6 @@ token:
     "gpt-4o-mini-2024-07-18": "cl100k_base"
     "claude-3-5-sonnet-20241022": "claude"
     "deepseek-chat": "deepseek"
-
-  # 官网同步配置
-  official_sync:
-    enabled: true
-    interval: 5m
-    batch_size: 100
 
 # 监控
 metrics:
