@@ -32,7 +32,7 @@ models:
 # protocol 字段：声明上游使用的协议类型（"openai" | "anthropic"），默认为 "openai"
 providers:
   openai:
-    base_url: "http://192.168.31.238:8000/v1"
+    base_url: "https://api.openai.com/v1"
     api_key: "${ANTHROPIC_AUTH_TOKEN}"
     timeout: 3000s
     protocol: "openai" # 上游是 OpenAI 兼容接口
@@ -42,7 +42,7 @@ providers:
     timeout: 3000s
     protocol: "openai" # 上游是 OpenAI 兼容接口
   anthropic:
-    base_url: "http://192.168.31.238:8000/v1"
+    base_url: "https://api.anthropic.com/v1"
     api_key: "${ANTHROPIC_AUTH_TOKEN}"
     timeout: 3000s
     protocol: "anthropic" # 上游是 Anthropic 兼容接口
@@ -56,29 +56,44 @@ providers:
     api_key: "${DEEPSEEK_API_KEY}"
     timeout: 3000s
     protocol: "anthropic" # 上游是 Anthropic 兼容接口
+  xiaomi_tp:
+    base_url: "https://token-plan-cn.xiaomimimo.com/v1"
+    api_key: "${XIAOMI_TP_AUTH_TOKEN}"
+    timeout: 3000s
+    protocol: "openai" # 上游是 OpenAI 兼容接口
 
 # provider 和 model 必须是真实存在的
 real_models:
-  strategy: "latency_optimized" # priority | round_robin | latency_optimized | cost_optimized
+  strategy: "priority" # priority | round_robin | latency_optimized | cost_optimized
   models:
-    - provider: "anthropic"
-      model: "Qwen3.6-35B-A3B-4bit"
-      weight: 70
-      timeout: 3000s
-      cost: 0
-    - provider: "openai"
-      model: "Qwen3.6-35B-A3B-4bit"
-      weight: 50
-      timeout: 3000s
-      cost: 0
-    - provider: "deepseek_anthropic"
-      model: "deepseek-v4-flash"
-      weight: 10
-      timeout: 3000s
-      cost: 0.03
-    - provider: "seneenova"
-      model: "sensenova-6.7-flash-lite"
-      weight: 70
+    # - provider: "anthropic"
+    #   model: "claude-fable-5"
+    #   weight: 70
+    #   timeout: 3000s
+    #   cost: 0
+    # - provider: "openai"
+    #   model: "gpt-5"
+    #   weight: 50
+    #   timeout: 3000s
+    #   cost: 0
+    # - provider: "deepseek_anthropic"
+    #   model: "deepseek-v4-flash"
+    #   weight: 10
+    #   timeout: 3000s
+    #   cost: 0.03
+    # - provider: "seneenova"
+    #   model: "sensenova-6.7-flash-lite"
+    #   weight: 80
+    #   timeout: 3000s
+    #   cost: 0
+    # - provider: "seneenova"
+    #   model: "deepseek-v4-flash"
+    #   weight: 90
+    #   timeout: 3000s
+    #   cost: 0
+    - provider: "xiaomi_tp"
+      model: "mimo-v2.5-pro"
+      weight: 100
       timeout: 3000s
       cost: 0
 
