@@ -1,4 +1,4 @@
-.PHONY: build run test clean docker docker-run docker-down docker-up-redis darwin-amd64 darwin-arm64 linux-amd64 package
+.PHONY: build run test clean docker docker-run docker-up-redis darwin-amd64 darwin-arm64 linux-amd64 windows-amd64 package
 
 APP_NAME := llm-gateway
 BUILD_DIR := ./build
@@ -31,14 +31,28 @@ linux-amd64:
 		-o $(BUILD_DIR)/linux-amd64/$(APP_NAME) ./cmd/gateway
 	@cp -r configs $(BUILD_DIR)/linux-amd64/
 
+# Windows x86_64
+windows-amd64:
+	@mkdir -p $(BUILD_DIR)/windows-amd64
+	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" \
+		-o $(BUILD_DIR)/windows-amd64/$(APP_NAME).exe ./cmd/gateway
+	@cp -r configs $(BUILD_DIR)/windows-amd64/
+
 # 打包所有平台 + 包含 .env 到每个压缩包
-package: darwin-amd64 darwin-arm64 linux-amd64
+package: darwin-amd64 darwin-arm64 linux-amd64 windows-amd64
 	@mkdir -p $(BUILD_DIR)
 	@for plat in darwin-amd64 darwin-arm64 linux-amd64; do \
 		STAGE=$$(mktemp -d); \
 		cp -r $(BUILD_DIR)/$$plat/* $$STAGE/; \
 		if [ -f .env ]; then cp .env $$STAGE/; fi; \
 		tar czf $(BUILD_DIR)/$(APP_NAME)-$$plat.tar.gz -C $$STAGE .; \
+		rm -rf $$STAGE; \
+	done
+	@for plat in windows-amd64; do \
+		STAGE=$$(mktemp -d); \
+		cp -r $(BUILD_DIR)/$$plat/* $$STAGE/; \
+		if [ -f .env ]; then cp .env $$STAGE/; fi; \
+		zip -r $(BUILD_DIR)/$(APP_NAME)-$$plat.zip $$STAGE/. -x ".DS_Store" "*/.DS_Store"; \
 		rm -rf $$STAGE; \
 	done
 
