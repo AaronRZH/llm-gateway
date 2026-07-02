@@ -38,20 +38,20 @@ windows-amd64:
 		-o $(BUILD_DIR)/windows-amd64/$(APP_NAME).exe ./cmd/gateway
 	@cp -r configs $(BUILD_DIR)/windows-amd64/
 
-# 打包所有平台 + 包含 .env 到每个压缩包
+# 打包所有平台 + 包含 .evn.example 到每个压缩包
 package: darwin-amd64 darwin-arm64 linux-amd64 windows-amd64
 	@mkdir -p $(BUILD_DIR)
 	@for plat in darwin-amd64 darwin-arm64 linux-amd64; do \
 		STAGE=$$(mktemp -d); \
 		cp -r $(BUILD_DIR)/$$plat/* $$STAGE/; \
-		if [ -f .env ]; then cp .env $$STAGE/; fi; \
+		if [ -f .evn.example ]; then cp .evn.example $$STAGE/; fi; \
 		tar czf $(BUILD_DIR)/$(APP_NAME)-$$plat.tar.gz -C $$STAGE .; \
 		rm -rf $$STAGE; \
 	done
 	@for plat in windows-amd64; do \
 		STAGE=$$(mktemp -d); \
 		cp -r $(BUILD_DIR)/$$plat/* $$STAGE/; \
-		if [ -f .env ]; then cp .env $$STAGE/; fi; \
+		if [ -f .evn.example ]; then cp .evn.example $$STAGE/; fi; \
 		zip -r $(BUILD_DIR)/$(APP_NAME)-$$plat.zip $$STAGE/. -x ".DS_Store" "*/.DS_Store"; \
 		rm -rf $$STAGE; \
 	done
