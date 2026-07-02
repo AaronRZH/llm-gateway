@@ -4,16 +4,28 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 
 	"llm-gateway/internal/config"
 )
 
+// UpstreamHTTPError 表示上游返回非 2xx HTTP 状态码的错误。
+type UpstreamHTTPError struct {
+	StatusCode int
+	Provider   string
+	Body       []byte
+}
+
+func (e *UpstreamHTTPError) Error() string {
+	return fmt.Sprintf("upstream %s returned HTTP %d", e.Provider, e.StatusCode)
+}
+
 // Tool 工具定义（OpenAI 格式）
 type Tool struct {
-	Type     string    `json:"type"`
-	Function ToolFunc  `json:"function"`
+	Type     string   `json:"type"`
+	Function ToolFunc `json:"function"`
 }
 
 // ToolFunc 工具函数定义
@@ -44,7 +56,7 @@ type Provider struct {
 	name       string
 	baseURL    string
 	apiKey     string
-	endpoint   string // 可选：覆盖默认的 upstream 端点路径
+	endpoint   string         // 可选：覆盖默认的 upstream 端点路径
 	protocol   ClientProtocol // 上游协议类型（openai / anthropic）
 	httpClient *http.Client
 
@@ -150,6 +162,20 @@ func (p *Provider) getConverter() *AnthropicConverter {
 	return p.converter
 }
 
+// checkHTTPResponse 检查 HTTP 响应状态码，对 4xx/5xx 返回 UpstreamHTTPError。
+func (p *Provider) checkHTTPResponse(resp *http.Response) (*http.Response, error) {
+	if resp.StatusCode < 400 {
+		return resp, nil
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	return nil, &UpstreamHTTPError{
+		StatusCode: resp.StatusCode,
+		Provider:   p.name,
+		Body:       body,
+	}
+}
+
 // ==================== HTTP 发送方法 ====================
 
 // buildRequest 构建 HTTP 请求（OpenAI 格式 body）
@@ -245,8 +271,13 @@ func (p *Provider) Chat(ctx context.Context, model string, messages []Message, t
 		return nil, err
 	}
 
-	return p.httpClient.Do(req)
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	return p.checkHTTPResponse(resp)
 }
+
 // StreamChat 流式请求 — 使用 OpenAI 格式发送
 func (p *Provider) StreamChat(ctx context.Context, model string, messages []Message, tools []Tool) (io.ReadCloser, error) {
 	req, err := p.buildRequest(ctx, "POST", p.fullURL(""), model, messages, tools, true)
@@ -258,7 +289,10 @@ func (p *Provider) StreamChat(ctx context.Context, model string, messages []Mess
 	if err != nil {
 		return nil, err
 	}
-
+	_, err = p.checkHTTPResponse(resp)
+	if err != nil {
+		return nil, err
+	}
 	return resp.Body, nil
 }
 
@@ -295,7 +329,10 @@ func (p *Provider) doSendAnthropic(ctx context.Context, model string, messages [
 	if err != nil {
 		return nil, err
 	}
-
+	_, err = p.checkHTTPResponse(resp)
+	if err != nil {
+		return nil, err
+	}
 	return resp, nil
 }
 
@@ -310,7 +347,10 @@ func (p *Provider) doSendAnthropicStream(ctx context.Context, model string, mess
 	if err != nil {
 		return nil, err
 	}
-
+	_, err = p.checkHTTPResponse(resp)
+	if err != nil {
+		return nil, err
+	}
 	return resp.Body, nil
 }
 
@@ -329,9 +369,7 @@ func (p *Provider) CountTokens(ctx context.Context, body []byte) (*http.Response
 	if err != nil {
 		return nil, err
 	}
-
-	// 错误状态码也原样返回，由 handler 转发给客户端
-	return resp, nil
+	return p.checkHTTPResponse(resp)
 }
 
 // SendDirect 用已存在的 Anthropic 格式消息直接发送请求到上游，不做格式转换。

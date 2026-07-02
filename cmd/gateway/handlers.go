@@ -119,6 +119,13 @@ func handleChatCompletion(
 					log.Error().Err(resolveErr).Str("provider", targetProvider).Msg("stream connect failed, trying next")
 					continue
 				}
+				// 429 退避：不触发熔断，退避后继续 fallback 尝试下一个候选
+				if res.StatusCode == 429 {
+					backoff := parseRetryAfter(res.Body, 5*time.Second)
+					log.Warn().Dur("backoff", backoff).Str("provider", targetProvider).Msg("rate limited (429), backing off")
+					time.Sleep(backoff)
+					continue
+				}
 				upstream = res.StreamBody
 				break
 			}
@@ -227,6 +234,13 @@ func handleChatCompletion(
 						lastErr = resolveErr
 					}
 					log.Error().Err(resolveErr).Str("provider", targetProvider).Msg("upstream request failed, trying next")
+					continue
+				}
+				// 429 退避：不触发熔断，退避后继续 fallback 尝试下一个候选
+				if res.StatusCode == 429 {
+					backoff := parseRetryAfter(res.Body, 5*time.Second)
+					log.Warn().Dur("backoff", backoff).Str("provider", targetProvider).Msg("rate limited (429), backing off")
+					time.Sleep(backoff)
 					continue
 				}
 				// Body 已在 protocol.Resolve 中读取并转换，直接使用
@@ -575,6 +589,13 @@ func handleAnthropicMessages(
 					lastErr = resolveErr
 				}
 				log.Error().Err(resolveErr).Str("provider", targetProvider).Msg("anthropic upstream request failed, trying next")
+				continue
+			}
+			// 429 退避：不触发熔断，退避后继续 fallback 尝试下一个候选
+			if res.StatusCode == 429 {
+				backoff := parseRetryAfter(res.Body, 5*time.Second)
+				log.Warn().Dur("backoff", backoff).Str("provider", targetProvider).Msg("rate limited (429), backing off")
+				time.Sleep(backoff)
 				continue
 			}
 			protocolResult = res
@@ -1087,6 +1108,34 @@ func handleAdminStats(tokenService *token.Service) gin.HandlerFunc {
 		}
 		c.JSON(http.StatusOK, gin.H{"data": stats})
 	}
+}
+
+// parseRetryAfter 从 429 响应的 body 中解析 Retry-After，返回退避时间。
+func parseRetryAfter(body []byte, fallback time.Duration) time.Duration {
+	if len(body) == 0 {
+		return fallback
+	}
+	var parsed map[string]interface{}
+	if json.Unmarshal(body, &parsed) != nil {
+		return fallback
+	}
+	// 尝试嵌套的 error.retry_after 字段（OpenAI 格式）
+	if errMsg, ok := parsed["error"].(map[string]interface{}); ok {
+		if retryAfter, ok := errMsg["retry_after"].(float64); ok {
+			d := time.Duration(retryAfter) * time.Second
+			if d > 0 && d <= 300*time.Second {
+				return d
+			}
+		}
+	}
+	// 尝试顶层 retry_after 字段
+	if retryAfter, ok := parsed["retry_after"].(float64); ok {
+		d := time.Duration(retryAfter) * time.Second
+		if d > 0 && d <= 300*time.Second {
+			return d
+		}
+	}
+	return fallback
 }
 
 // handleAdminCalibration 管理端校准信息

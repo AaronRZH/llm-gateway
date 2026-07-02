@@ -16,21 +16,21 @@ import (
 type Request struct {
 	ClientProtocol provider.ClientProtocol // 客户端使用的协议
 	UpstreamTarget *router.Target          // 路由目标（包含 Provider 和 GetProtocol()）
-	ChatReq        *ChatCompletionRequest   // OpenAI 格式请求（非 nil 表示 OpenAI 客户端）
-	AnthropicReq   *AnthropicRequest        // Anthropic 格式请求（非 nil 表示 Anthropic 客户端）
-	ExtraParams    map[string]interface{}   // Case 4 专用（SendDirect 额外参数）
-	IsStream       bool                     // 是否流式
-	Ctx            context.Context        // 请求上下文
-	StreamHandler  *stream.Handler          // SSE 转发器（可为 nil）
-	VirtualModel   string                   // 虚拟模型名（用于 SSE 转换）
+	ChatReq        *ChatCompletionRequest  // OpenAI 格式请求（非 nil 表示 OpenAI 客户端）
+	AnthropicReq   *AnthropicRequest       // Anthropic 格式请求（非 nil 表示 Anthropic 客户端）
+	ExtraParams    map[string]interface{}  // Case 4 专用（SendDirect 额外参数）
+	IsStream       bool                    // 是否流式
+	Ctx            context.Context         // 请求上下文
+	StreamHandler  *stream.Handler         // SSE 转发器（可为 nil）
+	VirtualModel   string                  // 虚拟模型名（用于 SSE 转换）
 }
 
 // Result Resolve 函数的返回结果
 type Result struct {
-	Response  *http.Response     // 完整响应（用于非流式StatusCode和Body）
-	Body      []byte             // 非流式完整响应体（供后续body处理）
-	StatusCode int               // HTTP状态码
-	StreamBody io.ReadCloser      // 流式响应体（已包装 SSE converter 如需）
+	Response   *http.Response // 完整响应（用于非流式StatusCode和Body）
+	Body       []byte         // 非流式完整响应体（供后续body处理）
+	StatusCode int            // HTTP状态码
+	StreamBody io.ReadCloser  // 流式响应体（已包装 SSE converter 如需）
 }
 
 // Resolve 根据客户端协议和上游协议的组合执行对应的 HTTP 请求和转换逻辑。
@@ -39,6 +39,27 @@ type Result struct {
 func Resolve(req Request) (*Result, error) {
 	clientProto := req.ClientProtocol
 	upstreamProto := req.UpstreamTarget.Provider.GetProtocol()
+
+	// handleProviderErr: treat 429 as non-breaker (backoff), 4xx/5xx as breaker errors
+	// UpstreamHTTPError 429 → return Result (nil error), breaker does not count
+	// UpstreamHTTPError 5xx/4xx → return nil + error, breaker counts
+	// Non-UpstreamHTTPError → return nil + error, breaker counts
+	handleProviderErr := func(err error) (*Result, error) {
+		if err == nil {
+			return nil, nil
+		}
+		ue, ok := err.(*provider.UpstreamHTTPError)
+		if !ok {
+			return nil, err
+		}
+		if ue.StatusCode == 429 {
+			return &Result{
+				Body:       ue.Body,
+				StatusCode: 429,
+			}, nil
+		}
+		return nil, err
+	}
 
 	log.Debug().
 		Str("provider", req.UpstreamTarget.ProviderName).
@@ -62,8 +83,8 @@ func Resolve(req Request) (*Result, error) {
 					req.ExtraParams,
 					true,
 				)
-				if err != nil {
-					return nil, err
+				if r, e := handleProviderErr(err); r != nil || e != nil {
+					return r, e
 				}
 				return &Result{
 					Response:   resp,
@@ -79,8 +100,8 @@ func Resolve(req Request) (*Result, error) {
 				req.ExtraParams,
 				false,
 			)
-			if err != nil {
-				return nil, err
+			if r, e := handleProviderErr(err); r != nil || e != nil {
+				return r, e
 			}
 			body, _ := io.ReadAll(resp.Body)
 			return &Result{
@@ -96,8 +117,8 @@ func Resolve(req Request) (*Result, error) {
 			tools := toolsFromAnthropicRequest(req.AnthropicReq.Tools)
 			if req.IsStream {
 				body, err := req.UpstreamTarget.Provider.StreamChat(req.Ctx, req.UpstreamTarget.Model, messages, tools)
-				if err != nil {
-					return nil, err
+				if r, e := handleProviderErr(err); r != nil || e != nil {
+					return r, e
 				}
 				return &Result{
 					StatusCode: http.StatusOK,
@@ -107,8 +128,8 @@ func Resolve(req Request) (*Result, error) {
 			messages = toProviderMessagesFromMap(req.AnthropicReq.Messages)
 			tools = toolsFromAnthropicRequest(req.AnthropicReq.Tools)
 			resp, err := req.UpstreamTarget.Provider.Chat(req.Ctx, req.UpstreamTarget.Model, messages, tools)
-			if err != nil {
-				return nil, err
+			if r, e := handleProviderErr(err); r != nil || e != nil {
+				return r, e
 			}
 			body, _ := io.ReadAll(resp.Body)
 			return &Result{
@@ -124,8 +145,8 @@ func Resolve(req Request) (*Result, error) {
 				toProviderMessages(req.ChatReq.Messages),
 				toProviderTools(req.ChatReq.Tools),
 			)
-			if err != nil {
-				return nil, err
+			if r, e := handleProviderErr(err); r != nil || e != nil {
+				return r, e
 			}
 			return &Result{
 				StatusCode: http.StatusOK,
@@ -137,8 +158,8 @@ func Resolve(req Request) (*Result, error) {
 			toProviderMessages(req.ChatReq.Messages),
 			toProviderTools(req.ChatReq.Tools),
 		)
-		if err != nil {
-			return nil, err
+		if r, e := handleProviderErr(err); r != nil || e != nil {
+			return r, e
 		}
 		body, _ := io.ReadAll(resp.Body)
 		return &Result{
@@ -158,8 +179,8 @@ func Resolve(req Request) (*Result, error) {
 				toProviderTools(req.ChatReq.Tools),
 				provider.ProtocolOpenAI,
 			)
-			if err != nil {
-				return nil, err
+			if r, e := handleProviderErr(err); r != nil || e != nil {
+				return r, e
 			}
 			return &Result{
 				StatusCode: http.StatusOK,
@@ -173,8 +194,8 @@ func Resolve(req Request) (*Result, error) {
 			toProviderTools(req.ChatReq.Tools),
 			provider.ProtocolOpenAI,
 		)
-		if err != nil {
-			return nil, err
+		if r, e := handleProviderErr(err); r != nil || e != nil {
+			return r, e
 		}
 		respBody, _ := io.ReadAll(resp.Body)
 		converted, convErr := req.UpstreamTarget.Provider.ConvertAnthropicToOpenAIResponse(respBody, req.VirtualModel)
@@ -198,8 +219,8 @@ func Resolve(req Request) (*Result, error) {
 			req.AnthropicReq.Messages, req.AnthropicReq.System, req.AnthropicReq.Tools)
 		body, err := req.UpstreamTarget.Provider.StreamChat(
 			req.Ctx, req.UpstreamTarget.Model, openAIMsgs, openAITools)
-		if err != nil {
-			return nil, err
+		if r, e := handleProviderErr(err); r != nil || e != nil {
+			return r, e
 		}
 		return &Result{
 			StatusCode: http.StatusOK,
@@ -220,8 +241,8 @@ func Resolve(req Request) (*Result, error) {
 
 	resp, err := req.UpstreamTarget.Provider.Chat(
 		req.Ctx, req.UpstreamTarget.Model, openAIMsgs, openAITools)
-	if err != nil {
-		return nil, err
+	if r, e := handleProviderErr(err); r != nil || e != nil {
+		return r, e
 	}
 	respBody, _ := io.ReadAll(resp.Body)
 
@@ -321,7 +342,12 @@ func toolsFromAnthropicRequest(reqTools []map[string]interface{}) []provider.Too
 					params = p
 				}
 				out = append(out, provider.Tool{
-					Type: func() string { if tt, ok := t["type"].(string); ok { return tt }; return "function" }(),
+					Type: func() string {
+						if tt, ok := t["type"].(string); ok {
+							return tt
+						}
+						return "function"
+					}(),
 					Function: provider.ToolFunc{
 						Name:        name,
 						Description: desc,
@@ -338,7 +364,12 @@ func toolsFromAnthropicRequest(reqTools []map[string]interface{}) []provider.Too
 				params = p
 			}
 			out = append(out, provider.Tool{
-				Type: func() string { if tt, ok := t["type"].(string); ok { return tt }; return "function" }(),
+				Type: func() string {
+					if tt, ok := t["type"].(string); ok {
+						return tt
+					}
+					return "function"
+				}(),
 				Function: provider.ToolFunc{
 					Name:        name,
 					Description: desc,
