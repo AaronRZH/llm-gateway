@@ -1,78 +1,505 @@
 # LLM Gateway
 
-大模型网关，支持模型自动切换、Token 计数、模型名映射。
+大模型 API 网关，支持多 Provider 路由、协议自动转换（OpenAI ↔ Anthropic）、Token 用量统计与持久化、熔断降级、限流与监控。
+
+## 核心特性
+
+- **多 Provider 路由** — 支持 OpenAI / Anthropic / DeepSeek / 商汤日日新 / 小米 Turbo 等多个上游，按 priority / round_robin / latency_optimized / cost_optimized 策略自动选路
+- **协议转换** — 客户端使用 OpenAI 格式，自动转换为 Anthropic 格式发往上游，反之亦然（非流式 + SSE 流式）
+- **模型 Tier 分级** — 虚拟模型名支持 `premium / standard / economy` 分级，路由时自动按级匹配和降级 fallback
+- **Token 估算 & 用量持久化** — 基于 `tiktoken-go` 本地估算，同时获取上游真实用量，写入 PostgreSQL（支持文件降级）
+- **熔断保护** — 基于 `gobreaker` 的熔断器，Provider 异常时自动降级到其他候选
+- **API Key 管理** — 支持配置文件种子 Key + Redis 动态 Key，三层缓存验证
+- **Prometheus 监控** — 请求数 / 耗时 / Token 用量 / 上游延迟 / 熔断器状态
+- **SSE 流式转发** — 实时转发并重写 model 字段，兼容客户端 SDK
+
+## 架构概览
+
+```
+┌──────────────┐     ┌──────────────┐     ┌─────────────────┐
+│              │     │              │     │  OpenAI (Chat)   │◄── OpenAI 格式
+│  OpenAI SDK  │────▶│              │────▶├─────────────────┤
+│  (Chat Com-  │     │  LLM Gateway │     │  Anthropic API   │◄── Anthropic 格式
+│   pletions)  │     │              │     ├─────────────────┤
+│              │     │   port 8080  │     │  DeepSeek (OpenAI)│
+├──────────────┤     │              │     ├─────────────────┤
+│              │     │              │     │  商汤 (OpenAI)    │
+│ Anthropic    │────▶│              │────▶├─────────────────┤
+│ SDK          │     │              │     │  小米 Turbo (OAI)│
+│ (/messages)  │     │              │     └─────────────────┘
+└──────────────┘     └──────┬───────┘
+                            │
+                    ┌───────┴───────┐
+                    │               │
+                    ▼               ▼
+             ┌──────────┐   ┌──────────┐
+             │ PostgreSQL │   │  文件存储  │
+             │ (主存储)   │   │ (降级方案) │
+             └──────────┘   └──────────┘
+                            │
+                            ▼
+                     ┌──────────┐
+                     │  Redis   │
+                     │(API Key / │
+                     │ 缓存)     │
+                     └──────────┘
+```
+
+### 请求生命周期
+
+```
+客户端请求 → Auth 中间件(验证 API Key) → RateLimit 中间件
+  → Handler(解析协议: OpenAI/Anthropic)
+    → Mapper(模型名 allowlist 检查)
+    → Token Service(估算输入 tokens)
+    → Router(选择上游 Provider + 模型)
+      → Protocol Resolver(格式转换 + 发送请求)
+        → [非流式] 解析上游响应 → Token Service(记录用量) → 返回客户端
+        → [流 式]  SSE 转发 + 累计 content → Token Service(记录用量)
+```
 
 ## 技术栈
 
-- **Web 框架**: Gin
-- **配置管理**: Viper
-- **缓存**: Redis (go-redis)
-- **Token 计算**: tiktoken-go
-- **日志**: zerolog
-- **监控**: Prometheus
-- **熔断**: gobreaker
+| 组件 | 库 |
+|---|---|
+| Web 框架 | [Gin](https://github.com/gin-gonic/gin) |
+| 配置管理 | [Viper](https://github.com/spf13/viper) |
+| PostgreSQL | [pgx/v5](https://github.com/jackc/pgx) |
+| Redis | [go-redis](https://github.com/redis/go-redis) |
+| Token 估算 | [tiktoken-go](https://github.com/pkoukk/tiktoken-go) |
+| 熔断器 | [gobreaker](https://github.com/sony/gobreaker) |
+| 监控 | [Prometheus](https://prometheus.io/) |
+| 日志 | [zerolog](https://github.com/rs/zerolog) |
 
 ## 快速开始
 
+### 前置条件
+
+- Go 1.25+
+- Docker & Docker Compose（可选，用于 PostgreSQL / Redis）
+- 各 Provider 的 API Key
+
+### 1. 配置环境变量
+
+复制 `.env.example` 为 `.env` 并填入你的 API Key：
+
 ```bash
-# 1. 安装依赖
-go mod download
-
-# 2. 启动 Redis（本地开发）
-make docker-up-redis
-
-# 3. 运行
-make run
-
-# 4. 测试
-curl http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-test" \
-  -d '{"model":"gpt-4","messages":[{"role":"user","content":"hello"}]}'
+cp .env.example .env
+# 编辑 .env
 ```
 
-## Docker 部署
-
-所有 Docker 相关文件统一放在 `deployments/docker/`：
+`.env` 文件格式：
 
 ```bash
-# 构建镜像
-make docker
+OPENAI_API_KEY=sk-xxx
+ANTHROPIC_API_KEY=sk-ant-xxx
+ANTHROPIC_AUTH_TOKEN=sk-ant-xxx
+DEEPSEEK_API_KEY=sk-xxx
+SENSENOVA_AUTH_TOKEN=sk-xxx
+XIAOMI_TP_AUTH_TOKEN=tp-xxx
+REDIS_PASSWORD=password
+POSTGRES_PASSWORD=password
+```
 
-# 启动完整栈（gateway + redis + prometheus）
-export OPENAI_API_KEY=your-key
-make docker-run
+### 2. 启动依赖服务
 
-# 停止
-make docker-down
+```bash
+# 启动 PostgreSQL + Redis
+make docker-up-db
+```
+
+### 3. 运行网关
+
+```bash
+# 开发模式（热重载，需安装 air）
+make dev
+
+# 或直接运行
+make run
+```
+
+### 4. 验证
+
+```bash
+# 健康检查
+curl http://localhost:8080/health
+
+# OpenAI 兼容接口
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-gateway-dev-key-001" \
+  -d '{
+    "model": "gpt-4",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+
+# Anthropic 兼容接口
+curl http://localhost:8080/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: sk-gateway-dev-key-001" \
+  -d '{
+    "model": "claude",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "max_tokens": 1024
+  }'
+```
+
+## 配置指南
+
+所有配置集中在 `configs/config.yaml`，通过环境变量覆盖。
+
+### 基础配置
+
+```yaml
+app:
+  env: "dev"          # dev | prod
+  port: 8080
+
+log:
+  level: "debug"      # debug | info | warn | error
+  format: "console"   # json | console
+```
+
+### Provider 配置
+
+支持任意 Provider（每个 Provider 可配置为 OpenAI 或 Anthropic 协议）：
+
+```yaml
+providers:
+  openai:
+    base_url: "https://api.openai.com/v1"
+    api_key: "${OPENAI_API_KEY}"
+    timeout: 300s
+    protocol: "openai"      # 上游使用的协议
+  anthropic:
+    base_url: "https://api.anthropic.com/v1"
+    api_key: "${ANTHROPIC_AUTH_TOKEN}"
+    timeout: 300s
+    protocol: "anthropic"
+  deepseek_openai:
+    base_url: "https://api.deepseek.com"
+    api_key: "${DEEPSEEK_API_KEY}"
+    timeout: 300s
+    protocol: "openai"
+```
+
+### 模型路由配置
+
+虚拟模型（对外暴露） → 真实模型（上游）的映射：
+
+```yaml
+# 对外暴露的虚拟模型，带 tier 分级
+models:
+  - name: "gpt-4"       # 客户端请求用的模型名
+    tier: "premium"
+  - name: "claude"
+    tier: "premium"
+  - name: "deepseek"
+    tier: "economy"
+
+# 真实的 fallback 链（路由目标）
+real_models:
+  strategy: "priority"  # priority | round_robin | latency_optimized | cost_optimized
+  models:
+    - provider: "anthropic"
+      model: "claude-sonnet-4-20250514"
+      weight: 70
+      timeout: 300s
+      cost: 3.0
+      tier: "premium"
+    - provider: "openai"
+      model: "gpt-5"
+      weight: 50
+      timeout: 300s
+      cost: 2.5
+      tier: "premium"
+    - provider: "seneenova"
+      model: "deepseek-v4-flash"
+      weight: 80
+      timeout: 300s
+      cost: 0.03
+      tier: "economy"
+```
+
+#### 路由策略
+
+| 策略 | 说明 |
+|---|---|
+| `priority` | 按配置顺序依次尝试（默认） |
+| `round_robin` | 加权轮询，按 weight 分发 |
+| `latency_optimized` | 选择历史延迟最低的 Provider |
+| `cost_optimized` | 选择成本最低的 Provider |
+
+#### Tier 分级机制
+
+当虚拟模型配置了 `tier` 时（如 `gpt-4: premium`），路由时只选择带相同 tier 或未指定 tier 的 fallback 候选，实现分级保障：
+
+```
+gpt-4 (premium)  →  {anthropic/claude-sonnet-4-20250514 (premium),
+                      openai/gpt-5 (premium)}  ← 跳过 economy 级
+deepseek (economy) →  {seneenova/deepseek-v4-flash (economy),
+                       xiaomi/mimo-v2.5-pro (standard)}  ← 也可以包含无 tier 通用候选
+```
+
+### 熔断器
+
+```yaml
+circuit_breaker:
+  max_requests: 3        # 半开状态允许试探请求数
+  interval: 10s          # 统计周期
+  timeout: 5s            # 请求超时
+  failure_threshold: 5   # 连续失败次数触发熔断
+  cooldown: 30s          # 熔断后冷却时间
+```
+
+### 限流
+
+```yaml
+rate_limit:
+  enabled: true
+  requests_per_second: 100
+  burst: 150
+```
+
+### Token 估算
+
+```yaml
+token:
+  tokenizer_mapping:
+    "gpt-4o-2024-11-20": "cl100k_base"
+    "claude-3-5-sonnet-20241022": "claude"
+    "deepseek-chat": "deepseek"
+```
+
+### API Key 配置
+
+```yaml
+api_keys:
+  - key: "sk-gateway-dev-key-001"
+    name: "dev-client-1"
+  - key: "sk-gateway-dev-key-002"
+    name: "dev-client-2"
+
+# 跳过认证的路径（支持 /* 前缀匹配）
+auth_whitelist:
+  - "/health"
+  - "/metrics"
+  - "/usage/*"
+  - "/admin/*"
+```
+
+## API 接口
+
+### 代理接口（转发到上游 LLM）
+
+| 端点 | 协议 | 说明 |
+|---|---|---|
+| `POST /v1/chat/completions` | OpenAI 格式 | 聊天补全（非流式 / SSE 流式） |
+| `POST /v1/completions` | OpenAI 格式 | 补全（兼容） |
+| `POST /v1/messages` | Anthropic 格式 | Anthropic Messages API 代理 |
+| `POST /v1/messages/count_tokens` | Anthropic 格式 | 计数 tokens |
+| `GET /v1/models` | OpenAI 格式 | 列出可用模型 |
+
+### 用量查询
+
+| 端点 | 说明 |
+|---|---|
+| `GET /usage` | 按 API Key 查询用量（支持 model / time range 过滤） |
+| `GET /usage/{request_id}` | 按请求 ID 查询单条记录 |
+| `GET /usage/stats` | 聚合统计（日 / 周 / 月） |
+
+### 管理接口
+
+| 端点 | 说明 |
+|---|---|
+| `GET /admin/usage` | 管理员：时间范围内总 Token 数 |
+| `GET /admin/usage/daily` | 管理员：每日聚合统计 |
+| `GET /admin/usage/stats` | 管理员：总请求数 / Token 数统计 |
+| `GET /admin/calibration` | 本地估算 vs 上游真实用量的校准比例 |
+
+### 监控
+
+| 端点 | 说明 |
+|---|---|
+| `GET /health` | 健康检查 |
+| `GET /metrics` | Prometheus 指标（JSON / Prometheus 格式） |
+
+## Token 用量持久化
+
+网关支持三种存储后端，按优先级自动降级：
+
+1. **PostgreSQL**（首选）— 自动建表，SQL 聚合查询，高并发
+2. **Redis** — 基于 List，带容量上限（10K/API Key, 100K 全局）
+3. **文件存储**（最终降级）— `data/usage.json`，开发调试用
+
+启动时自动检测 PostgreSQL 可用性，连接失败则降级到文件存储。
+
+### PostgreSQL 表结构
+
+```sql
+CREATE TABLE usage_records (
+    id              BIGSERIAL PRIMARY KEY,
+    request_id      VARCHAR(255) NOT NULL UNIQUE,
+    virtual_model   VARCHAR(255) NOT NULL,
+    real_model      VARCHAR(255) NOT NULL,
+    provider        VARCHAR(255) NOT NULL,
+    input_tokens    INTEGER NOT NULL DEFAULT 0,
+    output_tokens   INTEGER NOT NULL DEFAULT 0,
+    total_tokens    INTEGER NOT NULL DEFAULT 0,
+    est_input       INTEGER NOT NULL DEFAULT 0,
+    est_output      INTEGER NOT NULL DEFAULT 0,
+    official_in     INTEGER NOT NULL DEFAULT 0,
+    official_out    INTEGER NOT NULL DEFAULT 0,
+    api_key         VARCHAR(255) NOT NULL,
+    created_at      TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
 ```
 
 ## 项目结构
 
 ```
 llm-gateway/
-├── cmd/gateway/          # 入口
-├── internal/             # 内部代码
-│   ├── config/           # 配置
-│   ├── middleware/       # 中间件
-│   ├── router/           # 路由 & 熔断
-│   ├── mapper/           # 模型名映射
-│   ├── token/            # Token 计算 & 官网同步
-│   ├── provider/         # 上游 Provider 客户端
-│   ├── stream/           # SSE 流处理
-│   ├── metrics/          # Prometheus 指标
-│   └── health/           # 健康检查
-├── pkg/                  # 可复用包
-│   ├── tokenizer/        # Token 计算工具
-│   ├── breaker/          # 熔断器封装
-│   └── ratelimit/        # 限流器
-├── configs/              # 配置文件
-├── deployments/          # 部署配置
-│   ├── docker/           # Docker Compose & Dockerfile
-│   └── k8s/              # Kubernetes 清单
-└── api/                  # API 定义
+├── cmd/gateway/
+│   ├── main.go              # 入口：初始化、依赖注入、路由注册
+│   └── handlers.go          # HTTP 处理器：代理转发、用量查询、管理接口
+├── internal/
+│   ├── auth/
+│   │   └── service.go       # API Key 验证（本地缓存 + 种子 Key + Redis）
+│   ├── config/
+│   │   └── config.go        # 配置结构体定义与加载（Viper）
+│   ├── health/
+│   │   └── health.go        # 健康检查端点
+│   ├── mapper/
+│   │   └── mapper.go        # 模型名 allowlist + 响应 model 字段重写
+│   ├── metrics/
+│   │   └── metrics.go       # Prometheus 指标注册与暴露
+│   ├── middleware/
+│   │   ├── auth.go          # API Key 认证中间件（Bearer / x-api-key）
+│   │   ├── cors.go          # CORS 中间件
+│   │   ├── logger.go        # 请求日志中间件
+│   │   ├── ratelimit.go     # 按 API Key 限流（golang.org/x/time/rate）
+│   │   └── recovery.go      # Panic 恢复中间件
+│   ├── protocol/
+│   │   ├── types.go         # 请求/响应类型定义
+│   │   └── protocol.go      # 协议转换 + 上游请求调度（4 种组合）
+│   ├── provider/
+│   │   ├── provider.go          # Provider 抽象 + HTTP 发送
+│   │   └── anthropic_converter.go  # Anthropic ↔ OpenAI 格式转换
+│   ├── router/
+│   │   └── router.go        # 路由选择 + 熔断器 + 梯次策略
+│   ├── storage/
+│   │   ├── usage.go         # UsageStorage 接口 + FileStorage + RedisStorage
+│   │   └── postgres.go      # PostgresStorage 实现（pgx）
+│   ├── stream/
+│   │   ├── stream.go        # SSE 流式转发 + 重写 + Token 提取
+│   │   └── anthropic_sse.go # Anthropic SSE ↔ OpenAI SSE 转换
+│   └── token/
+│       └── token.go         # Token 估算 + 记录 + 校准
+├── pkg/
+│   ├── breaker/
+│   │   └── breaker.go       # 熔断器封装
+│   ├── ratelimit/
+│   │   └── ratelimit.go     # 限流器封装
+│   ├── redis/
+│   │   └── client.go        # Redis 客户端工厂
+│   └── tokenizer/
+│       └── tokenizer.go     # tiktoken 估算工具
+├── configs/
+│   ├── config.yaml          # 开发环境配置
+│   └── config.prod.yaml     # 生产环境配置覆盖
+├── deployments/
+│   ├── docker/
+│   │   ├── Dockerfile
+│   │   ├── docker-compose.yml
+│   │   └── prometheus.yml
+│   └── k8s/
+│       ├── deployment.yaml
+│       └── secret.yaml
+├── migrations/
+│   └── 001_create_usage_records.sql
+└── data/
+    └── usage.json           # 文件存储降级方案（自动生成）
 ```
 
-## 配置说明
+## Docker 部署
 
-见 `configs/config.yaml`
+```bash
+# 构建镜像
+make docker
+
+# 启动完整服务栈（gateway + postgres + redis + prometheus）
+make docker-run
+
+# 仅启动数据库
+make docker-up-db
+
+# 停止
+make docker-down
+```
+
+网关在 Docker Compose 中运行在 `prod` 模式，自动读取项目根目录的 `.env` 文件配置。
+
+## 监控
+
+Prometheus 指标暴露在 `/metrics`（JSON 和 Prometheus 文本格式均可）：
+
+| 指标 | 类型 | 说明 |
+|---|---|---|
+| `llm_gateway_requests_total` | Counter | 请求总数（按 method/path/status/model） |
+| `llm_gateway_request_duration_seconds` | Histogram | 请求耗时 |
+| `llm_gateway_upstream_latency_seconds` | Histogram | 上游 Provider 延迟 |
+| `llm_gateway_token_usage_total` | Counter | Token 用量（按 model/type） |
+| `llm_gateway_circuit_breaker_state` | Gauge | 熔断器状态（0=关闭, 1=开启, 2=半开） |
+| `llm_gateway_rate_limit_hits_total` | Counter | 限流命中次数 |
+
+## 协议转换矩阵
+
+网关自动处理 4 种客户端 ↔ 上游协议组合：
+
+| 客户端协议 | 上游协议 | 非流式 | 流式 (SSE) |
+|---|---|---|---|
+| OpenAI | OpenAI | 直接转发 | 直接转发（重写 model 字段） |
+| OpenAI | Anthropic | 消息格式转换 + 响应转换 | `OpenAIStreamConverter` 包装 |
+| Anthropic | OpenAI | 消息格式转换 + 响应转换 | `AnthropicSSEConverter` 包装 |
+| Anthropic | Anthropic | 直接转发 | 直接转发（含规范化） |
+
+## 开发
+
+```bash
+# 安装依赖
+make deps
+
+# 运行测试
+make test
+
+# 热重载开发
+make dev
+
+# 代码格式化
+make fmt
+
+# Lint
+make lint
+
+# 跨平台构建
+make package
+```
+
+## Makefile 命令速查
+
+| 命令 | 说明 |
+|---|---|
+| `build` | 本地编译 |
+| `run` | 直接运行 |
+| `dev` | 热重载开发（air） |
+| `test` | 运行测试 |
+| `docker` | 构建 Docker 镜像 |
+| `docker-run` | Docker Compose 启动全部服务 |
+| `docker-down` | 停止所有服务 |
+| `docker-up-db` | 启动 PostgreSQL + Redis |
+| `docker-up-redis` | 仅启动 Redis |
+| `docker-up-postgres` | 仅启动 PostgreSQL |
+| `package` | 跨平台打包（darwin/linux/windows） |
+| `fmt` | 代码格式化 |
+| `lint` | Lint 检查 |
+| `deps` | 依赖管理 |
