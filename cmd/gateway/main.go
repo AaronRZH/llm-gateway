@@ -56,11 +56,19 @@ func main() {
 		Str("env", cfg.App.Env).
 		Msg("starting llm-gateway")
 
+	// 构建 modelTiers map（虚拟模型名 -> tier）
+	modelTiers := make(map[string]string, len(cfg.Models))
+	for _, entry := range cfg.Models {
+		if entry.Tier != "" {
+			modelTiers[entry.Name] = entry.Tier
+		}
+	}
+
 	// 初始化各模块
 	mapperService := mapper.New(cfg.Models)
 	tokenService := token.New(cfg.Token)
 	providerManager := provider.NewManager(cfg.Providers)
-	routerService := router.New(cfg.RealModels, providerManager, tokenService, cfg.CircuitBreaker)
+	routerService := router.New(cfg.RealModels, providerManager, tokenService, cfg.CircuitBreaker, modelTiers)
 	streamHandler := stream.New()
 
 	// 初始化 Redis 客户端

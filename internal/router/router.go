@@ -23,6 +23,7 @@ type Service struct {
 	providerManager *provider.Manager
 	tokenService    *token.Service
 	breakers        map[string]*gobreaker.CircuitBreaker
+	modelTiers      map[string]string // virtual model name -> tier
 
 	// round_robin 策略状态
 	roundRobinCounter int
@@ -65,12 +66,14 @@ func New(
 	pm *provider.Manager,
 	ts *token.Service,
 	cbCfg config.CircuitBreakerConfig,
+	modelTiers map[string]string,
 ) *Service {
 	s := &Service{
 		realModelsCfg:    realModelsCfg,
 		providerManager:  pm,
 		tokenService:     ts,
 		breakers:         make(map[string]*gobreaker.CircuitBreaker),
+		modelTiers:       modelTiers,
 		latencyTracker:   make(map[string]float64),
 		latencyEMAAlpha:  0.1,
 		lastRequestTimes: make(map[string]time.Time),
@@ -114,8 +117,8 @@ func (s *Service) latencyWorker() {
 }
 
 // Select 选择目标模型（保持 API 兼容，返回第一个可用候选）
-func (s *Service) Select(ctx context.Context, estimatedTokens int) (*Target, error) {
-	sel, err := s.SelectCandidates(ctx, estimatedTokens)
+func (s *Service) Select(ctx context.Context, virtualModel string, estimatedTokens int) (*Target, error) {
+	sel, err := s.SelectCandidates(ctx, virtualModel, estimatedTokens)
 	if err != nil {
 		return nil, err
 	}
@@ -123,8 +126,15 @@ func (s *Service) Select(ctx context.Context, estimatedTokens int) (*Target, err
 }
 
 // SelectCandidates 返回路由候选列表，handler 通过 Next() 遍历以在请求失败时重试下一个候选
-func (s *Service) SelectCandidates(ctx context.Context, estimatedTokens int) (*Selection, error) {
+func (s *Service) SelectCandidates(ctx context.Context, virtualModel string, estimatedTokens int) (*Selection, error) {
 	chain := s.getOrderedChain(s.realModelsCfg.Strategy, s.realModelsCfg.Models)
+
+	// 按 virtualModel 的 tier 过滤 fallback chain
+	targetTier := s.resolveModelTier(virtualModel)
+	if targetTier != "" {
+		chain = s.filterByTier(chain, targetTier)
+	}
+
 	var candidates []*Target
 	for _, item := range chain {
 		target, err := s.tryProvider(ctx, item)
@@ -142,6 +152,25 @@ func (s *Service) SelectCandidates(ctx context.Context, estimatedTokens int) (*S
 		return nil, fmt.Errorf("no available model")
 	}
 	return &Selection{targets: candidates}, nil
+}
+
+// resolveModelTier 获取虚拟模型对应的 tier
+func (s *Service) resolveModelTier(virtualModel string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.modelTiers[virtualModel]
+}
+
+// filterByTier 按 tier 过滤 fallback chain
+// 保留：tier 匹配的 item，以及 tier 为空的通用 fallback item
+func (s *Service) filterByTier(chain []config.FallbackItem, targetTier string) []config.FallbackItem {
+	var filtered []config.FallbackItem
+	for _, item := range chain {
+		if item.Tier == "" || item.Tier == targetTier {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered
 }
 
 // getOrderedChain 根据策略返回排序后的 fallback chain
