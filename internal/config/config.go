@@ -14,6 +14,7 @@ type Config struct {
 	App            AppConfig                 `mapstructure:"app"`
 	Log            LogConfig                 `mapstructure:"log"`
 	Redis          RedisConfig               `mapstructure:"redis"`
+	Postgres       PostgresConfig            `mapstructure:"postgres"`
 	Models      []string          `mapstructure:"models"`
 	RealModels  RealModelsConfig  `mapstructure:"real_models"`
 	CircuitBreaker CircuitBreakerConfig      `mapstructure:"circuit_breaker"`
@@ -47,6 +48,19 @@ type RedisConfig struct {
 	DialTimeout  time.Duration `mapstructure:"dial_timeout"`
 	ReadTimeout  time.Duration `mapstructure:"read_timeout"`
 	WriteTimeout time.Duration `mapstructure:"write_timeout"`
+}
+
+type PostgresConfig struct {
+	Host        string        `mapstructure:"host"`
+	Port        int           `mapstructure:"port"`
+	User        string        `mapstructure:"user"`
+	Password    string        `mapstructure:"password"`
+	Database    string        `mapstructure:"database"`
+	DSN         string        `mapstructure:"dsn"`
+	SSLMode     string        `mapstructure:"ssl_mode"`
+	MaxConns    int32         `mapstructure:"max_conns"`
+	MinConns    int32         `mapstructure:"min_conns"`
+	ConnTimeout time.Duration `mapstructure:"conn_timeout"`
 }
 
 type RealModelsConfig struct {
@@ -122,6 +136,12 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("app::port", 8080)
 	v.SetDefault("log::level", "info")
 	v.SetDefault("redis::addr", "localhost:6379")
+	v.SetDefault("postgres::host", "localhost")
+	v.SetDefault("postgres::port", 5432)
+	v.SetDefault("postgres::ssl_mode", "disable")
+	v.SetDefault("postgres::max_conns", int32(20))
+	v.SetDefault("postgres::min_conns", int32(0))
+	v.SetDefault("postgres::conn_timeout", 5*time.Second)
 	v.SetDefault("health::enabled", true)
 	v.SetDefault("health::path", "/health")
 	v.SetDefault("metrics::enabled", true)
