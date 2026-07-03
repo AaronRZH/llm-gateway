@@ -15,8 +15,8 @@ type Config struct {
 	Log            LogConfig                 `mapstructure:"log"`
 	Redis          RedisConfig               `mapstructure:"redis"`
 	Postgres       PostgresConfig            `mapstructure:"postgres"`
-	Models      []string          `mapstructure:"models"`
-	RealModels  RealModelsConfig  `mapstructure:"real_models"`
+	Models         []ModelEntry              `mapstructure:"models"`
+	RealModels     RealModelsConfig          `mapstructure:"real_models"`
 	CircuitBreaker CircuitBreakerConfig      `mapstructure:"circuit_breaker"`
 	RateLimit      RateLimitConfig           `mapstructure:"rate_limit"`
 	Providers      map[string]ProviderConfig `mapstructure:"providers"`
@@ -63,6 +63,11 @@ type PostgresConfig struct {
 	ConnTimeout time.Duration `mapstructure:"conn_timeout"`
 }
 
+type ModelEntry struct {
+	Name string `mapstructure:"name"`
+	Tier string `mapstructure:"tier"`
+}
+
 type RealModelsConfig struct {
 	Strategy string         `mapstructure:"strategy"`
 	Models   []FallbackItem `mapstructure:"models"`
@@ -75,6 +80,7 @@ type FallbackItem struct {
 	Timeout  time.Duration `mapstructure:"timeout"`
 	Retry    int           `mapstructure:"retry"`
 	Cost     float64       `mapstructure:"cost"` // 单位请求成本（元），用于 cost_optimized 策略
+	Tier     string        `mapstructure:"tier"` // 分级：premium/standard/economy，空字符串表示通用 fallback
 }
 
 type CircuitBreakerConfig struct {
