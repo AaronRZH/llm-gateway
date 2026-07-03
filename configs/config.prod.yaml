@@ -8,6 +8,17 @@ log:
 redis:
   addr: "redis:6379"
 
+postgres:
+  host: "postgres"
+  port: 5432
+  user: "llm_gateway"
+  password: "${POSTGRES_PASSWORD}"
+  database: "llm_gateway"
+  ssl_mode: "require"
+  max_conns: 50
+  min_conns: 5
+  conn_timeout: 10s
+
 rate_limit:
   requests_per_second: 1000
   burst: 1500
