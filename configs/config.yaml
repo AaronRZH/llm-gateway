@@ -31,13 +31,18 @@ postgres:
   min_conns: 0
   conn_timeout: 5s
 
-# 模型名 allowlist（对外暴露）
+# 模型名 allowlist（对外暴露），带 tier 分级
 models:
-  - "gpt-4"
-  - "gpt-4-mini"
-  - "claude"
-  - "deepseek"
-  - "deepseek-v4-pro"
+  - name: "gpt-4"
+    tier: "premium"
+  - name: "gpt-4-mini"
+    tier: "standard"
+  - name: "claude"
+    tier: "premium"
+  - name: "deepseek"
+    tier: "economy"
+  - name: "deepseek-v4-pro"
+    tier: "economy"
 
 # Provider 配置（API Keys 建议通过环境变量注入）
 # provider name 仅作路由标识，不影响行为
@@ -83,31 +88,37 @@ real_models:
     #   weight: 70
     #   timeout: 3000s
     #   cost: 0
+    #   tier: "premium"
     # - provider: "openai"
     #   model: "gpt-5"
     #   weight: 50
     #   timeout: 3000s
     #   cost: 0
+    #   tier: "premium"
     # - provider: "deepseek_anthropic"
     #   model: "deepseek-v4-flash"
     #   weight: 10
     #   timeout: 3000s
     #   cost: 0.03
+    #   tier: "economy"
     - provider: "seneenova"
       model: "sensenova-6.7-flash-lite"
       weight: 80
       timeout: 3000s
       cost: 0
+      tier: "standard"
     - provider: "seneenova"
       model: "deepseek-v4-flash"
       weight: 90
       timeout: 3000s
       cost: 0
+      tier: "economy"
     # - provider: "xiaomi_tp"
     #   model: "mimo-v2.5-pro"
     #   weight: 100
     #   timeout: 3000s
     #   cost: 0
+    #   tier: "standard"
 
 # 熔断器配置
 circuit_breaker:
