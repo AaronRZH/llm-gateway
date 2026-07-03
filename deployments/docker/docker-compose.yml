@@ -16,6 +16,20 @@ services:
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
     depends_on:
       - redis
+      - postgres
+    networks:
+      - llm-gateway
+
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=llm_gateway
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-llm_gateway_dev}
+      - POSTGRES_DB=llm_gateway
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
     networks:
       - llm-gateway
 
@@ -39,6 +53,7 @@ services:
 
 volumes:
   redis-data:
+  postgres-data:
 
 networks:
   llm-gateway:
