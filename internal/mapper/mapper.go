@@ -5,21 +5,28 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"llm-gateway/internal/config"
 )
 
 // Service 模型名 allowlist 服务
 type Service struct {
-	mu     sync.RWMutex
-	models map[string]bool
+	mu       sync.RWMutex
+	models   map[string]bool       // allowlist
+	modelTiers map[string]string   // name -> tier
 }
 
-// New 创建 allowlist 服务
-func New(models []string) *Service {
+// New 创建 allowlist 服务，接受 ModelEntry 列表
+func New(entries []config.ModelEntry) *Service {
 	s := &Service{
-		models: make(map[string]bool, len(models)),
+		models:     make(map[string]bool, len(entries)),
+		modelTiers: make(map[string]string, len(entries)),
 	}
-	for _, m := range models {
-		s.models[m] = true
+	for _, e := range entries {
+		s.models[e.Name] = true
+		if e.Tier != "" {
+			s.modelTiers[e.Name] = e.Tier
+		}
 	}
 	return s
 }
@@ -35,6 +42,13 @@ func (s *Service) Validate(name string) error {
 	return fmt.Errorf("model not found: %s", name)
 }
 
+// GetTier 获取虚拟模型的 tier，未配置时返回空字符串
+func (s *Service) GetTier(name string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.modelTiers[name]
+}
+
 // ListVirtualModels 列出所有对外暴露的模型
 func (s *Service) ListVirtualModels() []map[string]interface{} {
 	s.mu.RLock()
@@ -42,12 +56,16 @@ func (s *Service) ListVirtualModels() []map[string]interface{} {
 
 	var models []map[string]interface{}
 	for name := range s.models {
-		models = append(models, map[string]interface{}{
+		model := map[string]interface{}{
 			"id":       name,
 			"object":   "model",
 			"created":  time.Now().Unix(),
 			"owned_by": "llm-gateway",
-		})
+		}
+		if tier, ok := s.modelTiers[name]; ok {
+			model["tier"] = tier
+		}
+		models = append(models, model)
 	}
 	return models
 }
