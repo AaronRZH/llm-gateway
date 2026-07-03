@@ -58,7 +58,7 @@ func handleChatCompletion(
 		log.Debug().Int("input_tokens", inputTokens).Msg("token estimated")
 
 		// 3. 路由选择 — 获取候选列表（支持 fallback 重试）
-		sel, err := routerSvc.SelectCandidates(c.Request.Context(), inputTokens)
+		sel, err := routerSvc.SelectCandidates(c.Request.Context(), req.Model, inputTokens)
 		if err != nil {
 			log.Error().Err(err).Msg("router selection failed")
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no available model"})
@@ -351,7 +351,7 @@ func handleCountTokens(mapper *mapper.Service, routerSvc *router.Service, provid
 			}
 
 			// 通过路由获取真实模型（支持 fallback chain）
-			sel, err := routerSvc.SelectCandidates(c.Request.Context(), 0)
+			sel, err := routerSvc.SelectCandidates(c.Request.Context(), parseReq.Model, 0)
 			if err != nil {
 				log.Warn().Str("model", parseReq.Model).Msg("count_tokens router selection failed")
 				c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("model '%s' has no available target", parseReq.Model)})
@@ -493,7 +493,7 @@ func handleAnthropicMessages(
 		log.Debug().Int("input_tokens", inputTokens).Msg("anthropic token estimated")
 
 		// 3. 路由选择 — 获取候选列表（支持 fallback 重试）
-		sel, err := routerSvc.SelectCandidates(c.Request.Context(), inputTokens)
+		sel, err := routerSvc.SelectCandidates(c.Request.Context(), req.Model, inputTokens)
 		if err != nil {
 			log.Error().Err(err).Msg("anthropic router selection failed")
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no available model"})
