@@ -78,8 +78,8 @@ func main() {
 	seedKeys := buildSeedKeys(cfg.APIKeys)
 	authService := auth.New(redisClient, seedKeys)
 
-	// 初始化存储层（Redis → 文件降级）
-	usageStorage := storage.NewRedisStorage(redisClient)
+	// 初始化存储层（PostgreSQL → 文件降级）
+	usageStorage := storage.NewPostgresStorage(cfg.Postgres)
 	tokenService.SetStorage(usageStorage)
 
 	// 创建 Gin 引擎
@@ -154,6 +154,13 @@ func main() {
 	if redisClient != nil {
 		if err := redisClient.Close(); err != nil {
 			log.Error().Err(err).Msg("redis close failed")
+		}
+	}
+
+	// 关闭存储连接
+	if usageStorage != nil {
+		if err := usageStorage.Close(); err != nil {
+			log.Error().Err(err).Msg("usage storage close failed")
 		}
 	}
 
