@@ -19,6 +19,18 @@ redis:
   read_timeout: 3s
   write_timeout: 3s
 
+# PostgreSQL 配置（PostgreSQL 优先 → 文件存储降级）
+postgres:
+  host: "localhost"
+  port: 5432
+  user: "llm_gateway"
+  password: "${POSTGRES_PASSWORD}"
+  database: "llm_gateway"
+  ssl_mode: "disable"
+  max_conns: 20
+  min_conns: 0
+  conn_timeout: 5s
+
 # 模型名 allowlist（对外暴露）
 models:
   - "gpt-4"
