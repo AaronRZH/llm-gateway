@@ -3,7 +3,7 @@
 APP_NAME := llm-gateway
 BUILD_DIR := ./build
 GO_FILES := $(shell find . -name '*.go' -not -path './vendor/*')
-DOCKER_COMPOSE := docker-compose -f deployments/docker/docker-compose.yml
+DOCKER_COMPOSE := docker-compose -f deployments/docker/docker-compose.yml --project-directory .
 
 # 本地编译
 build:

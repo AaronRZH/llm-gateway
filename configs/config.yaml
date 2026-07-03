@@ -78,6 +78,11 @@ providers:
     api_key: "${XIAOMI_TP_AUTH_TOKEN}"
     timeout: 3000s
     protocol: "openai" # 上游是 OpenAI 兼容接口
+  glm:
+    base_url: "https://open.bigmodel.cn/api/paas/v4"
+    api_key: "${GLM_AUTH_TOKEN}"
+    timeout: 3000s
+    protocol: "openai" # 上游是 OpenAI 兼容接口
 
 # provider 和 model 必须是真实存在的
 real_models:
@@ -112,13 +117,19 @@ real_models:
       weight: 90
       timeout: 3000s
       cost: 0
-      tier: "economy"
+      tier: "premium"
     # - provider: "xiaomi_tp"
     #   model: "mimo-v2.5-pro"
     #   weight: 100
     #   timeout: 3000s
     #   cost: 0
     #   tier: "standard"
+    - provider: "glm"
+      model: "glm-4.7-flash"
+      weight: 100
+      timeout: 3000s
+      cost: 0
+      tier: "economy"
 
 # 熔断器配置
 circuit_breaker:

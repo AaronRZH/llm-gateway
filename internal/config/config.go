@@ -174,11 +174,13 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("unmarshal config failed: %w", err)
 	}
 
-	// 解析环境变量中的 API Key（如 ${OPENAI_API_KEY}）
+	// 解析环境变量中的敏感字段（如 ${ENV_VAR}）
 	for name, p := range cfg.Providers {
 		p.APIKey = resolveEnv(p.APIKey)
 		cfg.Providers[name] = p
 	}
+	cfg.Postgres.Password = resolveEnv(cfg.Postgres.Password)
+	cfg.Redis.Password = resolveEnv(cfg.Redis.Password)
 
 	return &cfg, nil
 }
