@@ -80,6 +80,11 @@ docker-down:
 docker-up-redis:
 	$(DOCKER_COMPOSE) up -d redis
 
+docker-up-postgres:
+	$(DOCKER_COMPOSE) up -d postgres
+
+docker-up-db: docker-up-redis docker-up-postgres
+
 fmt:
 	go fmt ./...
 
