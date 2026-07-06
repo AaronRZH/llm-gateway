@@ -1145,3 +1145,11 @@ func handleAdminCalibration(tokenService *token.Service) gin.HandlerFunc {
 		c.JSON(http.StatusOK, info)
 	}
 }
+
+// handleAdminBreakers 返回所有熔断器状态
+func handleAdminBreakers(routerSvc *router.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		states := routerSvc.BreakerStates()
+		c.JSON(http.StatusOK, states)
+	}
+}

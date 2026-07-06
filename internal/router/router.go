@@ -341,6 +341,31 @@ func (s *Service) RecordLatency(providerName, model string, latencyMs float64) {
 	s.recordLatency(providerName, model, latencyMs)
 }
 
+// BreakerStates 返回所有熔断器的当前状态（用于管理端展示）
+func (s *Service) BreakerStates() map[string]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	states := make(map[string]string, len(s.breakers))
+	for key, cb := range s.breakers {
+		states[key] = stateString(cb.State())
+	}
+	return states
+}
+
+func stateString(s gobreaker.State) string {
+	switch s {
+	case gobreaker.StateClosed:
+		return "closed"
+	case gobreaker.StateOpen:
+		return "open"
+	case gobreaker.StateHalfOpen:
+		return "half-open"
+	default:
+		return "unknown"
+	}
+}
+
 func (s *Service) breakerKey(provider, model string) string {
 	return fmt.Sprintf("%s:%s", provider, model)
 }

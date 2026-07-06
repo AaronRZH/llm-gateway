@@ -33,16 +33,12 @@ postgres:
 
 # 模型名 allowlist（对外暴露），带 tier 分级
 models:
-  - name: "gpt-4"
-    tier: "premium"
-  - name: "gpt-4-mini"
+  - name: "sensenova-6.7-flash-lite"
+    tier: "economy"
+  - name: "deepseek-v4-flash"
     tier: "standard"
-  - name: "claude"
-    tier: "premium"
-  - name: "deepseek"
-    tier: "economy"
   - name: "deepseek-v4-pro"
-    tier: "economy"
+    tier: "premium"
 
 # Provider 配置（API Keys 建议通过环境变量注入）
 # provider name 仅作路由标识，不影响行为
@@ -100,36 +96,36 @@ real_models:
     #   timeout: 3000s
     #   cost: 0
     #   tier: "premium"
-    # - provider: "deepseek_anthropic"
-    #   model: "deepseek-v4-flash"
-    #   weight: 10
-    #   timeout: 3000s
-    #   cost: 0.03
-    #   tier: "economy"
+    - provider: "deepseek_anthropic"
+      model: "deepseek-v4-pro"
+      weight: 10
+      timeout: 3000s
+      cost: 0.03
+      tier: "premium"
     - provider: "seneenova"
       model: "sensenova-6.7-flash-lite"
       weight: 80
       timeout: 3000s
       cost: 0
-      tier: "standard"
+      tier: "economy"
     - provider: "seneenova"
       model: "deepseek-v4-flash"
       weight: 90
       timeout: 3000s
       cost: 0
-      tier: "premium"
+      tier: "standard"
     # - provider: "xiaomi_tp"
     #   model: "mimo-v2.5-pro"
     #   weight: 100
     #   timeout: 3000s
     #   cost: 0
     #   tier: "standard"
-    - provider: "glm"
-      model: "glm-4.7-flash"
-      weight: 100
-      timeout: 3000s
-      cost: 0
-      tier: "economy"
+    # - provider: "glm"
+    #   model: "glm-4.7-flash"
+    #   weight: 100
+    #   timeout: 3000s
+    #   cost: 0
+    #   tier: "economy"
 
 # 熔断器配置
 circuit_breaker:

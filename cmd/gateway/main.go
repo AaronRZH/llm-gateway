@@ -129,6 +129,7 @@ func main() {
 	r.GET("/admin/usage/daily", handleAdminDailyUsage(tokenService))
 	r.GET("/admin/usage/stats", handleAdminStats(tokenService))
 	r.GET("/admin/calibration", handleAdminCalibration(tokenService))
+	r.GET("/admin/breakers", handleAdminBreakers(routerService))
 
 	// 启动 HTTP 服务
 	srv := &http.Server{
