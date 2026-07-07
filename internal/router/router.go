@@ -341,6 +341,13 @@ func (s *Service) RecordLatency(providerName, model string, latencyMs float64) {
 	s.recordLatency(providerName, model, latencyMs)
 }
 
+// SyncModelTiers 同步虚拟模型 → tier 映射（models 后台变更后调用）
+func (s *Service) SyncModelTiers(tiers map[string]string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.modelTiers = tiers
+}
+
 // SetStrategy 动态更新路由策略
 func (s *Service) SetStrategy(strategy string) {
 	s.mu.Lock()

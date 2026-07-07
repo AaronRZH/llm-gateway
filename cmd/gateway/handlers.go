@@ -1521,7 +1521,7 @@ func handleAdminModels(mapperService *mapper.Service) gin.HandlerFunc {
 }
 
 // handleAdminAddModel 新增虚拟模型
-func handleAdminAddModel(mapperService *mapper.Service, cfg *config.Config) gin.HandlerFunc {
+func handleAdminAddModel(mapperService *mapper.Service, routerSvc *router.Service, cfg *config.Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req struct {
 			Name string `json:"name"`
@@ -1535,10 +1535,12 @@ func handleAdminAddModel(mapperService *mapper.Service, cfg *config.Config) gin.
 			c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 			return
 		}
-		if ok := mapperService.AddModel(req.Name, req.Tier); !ok {
+	if ok := mapperService.AddModel(req.Name, req.Tier); !ok {
 			c.JSON(http.StatusConflict, gin.H{"error": "model already exists"})
 			return
 		}
+		// 同步路由器的 modelTiers 映射
+		routerSvc.SyncModelTiers(buildModelTiers(mapperService))
 		// 持久化：更新 Config.Models
 		cfg.Models = append(cfg.Models, config.ModelEntry{Name: req.Name, Tier: req.Tier})
 		if err := cfg.AppendModel(config.ModelEntry{Name: req.Name, Tier: req.Tier}); err != nil {
@@ -1549,7 +1551,7 @@ func handleAdminAddModel(mapperService *mapper.Service, cfg *config.Config) gin.
 }
 
 // handleAdminDeleteModel 删除虚拟模型
-func handleAdminDeleteModel(mapperService *mapper.Service, cfg *config.Config) gin.HandlerFunc {
+func handleAdminDeleteModel(mapperService *mapper.Service, routerSvc *router.Service, cfg *config.Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		name := c.Param("name")
 		// URL encode support
@@ -1560,6 +1562,8 @@ func handleAdminDeleteModel(mapperService *mapper.Service, cfg *config.Config) g
 			c.JSON(http.StatusNotFound, gin.H{"error": "model not found"})
 			return
 		}
+		// 同步路由器的 modelTiers 映射
+		routerSvc.SyncModelTiers(buildModelTiers(mapperService))
 		// 持久化：从 Config.Models 中移除
 		for i, m := range cfg.Models {
 			if m.Name == name {
@@ -1790,4 +1794,17 @@ func handleAdminLogin(cfg *config.Config) gin.HandlerFunc {
 			"token_type":  "Bearer",
 		})
 	}
+}
+
+// buildModelTiers 从 mapper 提取虚拟模型 → tier 映射
+func buildModelTiers(mapperService *mapper.Service) map[string]string {
+	models := mapperService.ListVirtualModels()
+	tiers := make(map[string]string, len(models))
+	for _, m := range models {
+		id, _ := m["id"].(string)
+		if tier, ok := m["tier"].(string); ok && tier != "" {
+			tiers[id] = tier
+		}
+	}
+	return tiers
 }
