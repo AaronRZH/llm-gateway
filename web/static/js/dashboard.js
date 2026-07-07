@@ -6,18 +6,6 @@ function getAuthHeaders() {
   return { Authorization: "Bearer " + stored };
 }
 
-async function apiFetch(url) {
-  try {
-    const res = await fetch(url, { headers: getAuthHeaders() });
-    if (res.status === 401) {
-      localStorage.removeItem("admin_token");
-      return null;
-    }
-    if (!res.ok) { console.error("API error:", url, res.status); return null; }
-    return res.json();
-  } catch (err) { console.error("Fetch error:", err); return null; }
-}
-
 // Chart Manager
 const chartInstances = {};
 function destroyChart(name) {
@@ -87,6 +75,21 @@ const app = createApp({
     const loginPassword = ref("");
     const loginError = ref("");
     const loggingIn = ref(false);
+
+    async function apiFetch(url) {
+      try {
+        const stored = localStorage.getItem("admin_token");
+        const headers = stored ? { Authorization: "Bearer " + stored } : {};
+        const res = await fetch(url, { headers });
+        if (res.status === 401) {
+          localStorage.removeItem("admin_token");
+          isAuthenticated.value = false;
+          return null;
+        }
+        if (!res.ok) { console.error("API error:", url, res.status); return null; }
+        return res.json();
+      } catch (err) { console.error("Fetch error:", err); return null; }
+    }
 
     const overview = reactive({ totalRequests: 0, totalTokens: 0, totalInput: 0, totalOutput: 0 });
     const usageGranularity = ref("daily");
