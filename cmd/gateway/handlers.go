@@ -1590,7 +1590,7 @@ func handleAdminRealModels(routerSvc *router.Service, cfg *config.Config) gin.Ha
 }
 
 // handleAdminAddRealModel 新增 real_model 路由配置
-func handleAdminAddRealModel(cfg *config.Config) gin.HandlerFunc {
+func handleAdminAddRealModel(cfg *config.Config, routerSvc *router.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req struct {
 			Provider string  `json:"provider"`
@@ -1629,12 +1629,14 @@ func handleAdminAddRealModel(cfg *config.Config) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist config"})
 			return
 		}
+		// 立即生效：更新路由服务内存状态
+		routerSvc.AddRealModel(item)
 		c.JSON(http.StatusCreated, gin.H{"message": "real model added", "model": item})
 	}
 }
 
 // handleAdminUpdateRealModel 更新 real_model 路由配置（按索引）
-func handleAdminUpdateRealModel(cfg *config.Config) gin.HandlerFunc {
+func handleAdminUpdateRealModel(cfg *config.Config, routerSvc *router.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		idx, err := parseIndex(c.Param("index"), len(cfg.RealModels.Models))
 		if err != nil {
@@ -1675,15 +1677,15 @@ func handleAdminUpdateRealModel(cfg *config.Config) gin.HandlerFunc {
 		cfg.RealModels.Models[idx] = item
 		if err := cfg.UpdateRealModel(idx, item); err != nil {
 			log.Error().Err(err).Msg("failed to save config after updating real model")
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist config"})
-			return
 		}
+		// 立即生效：更新路由服务内存状态
+		routerSvc.UpdateRealModel(idx, item)
 		c.JSON(http.StatusOK, gin.H{"message": "real model updated", "model": item})
 	}
 }
 
 // handleAdminDeleteRealModel 删除 real_model 路由配置（按索引）
-func handleAdminDeleteRealModel(cfg *config.Config) gin.HandlerFunc {
+func handleAdminDeleteRealModel(cfg *config.Config, routerSvc *router.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		idx, err := parseIndex(c.Param("index"), len(cfg.RealModels.Models))
 		if err != nil {
@@ -1694,9 +1696,9 @@ func handleAdminDeleteRealModel(cfg *config.Config) gin.HandlerFunc {
 		cfg.RealModels.Models = append(cfg.RealModels.Models[:idx], cfg.RealModels.Models[idx+1:]...)
 		if err := cfg.RemoveRealModel(idx); err != nil {
 			log.Error().Err(err).Msg("failed to save config after deleting real model")
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist config"})
-			return
 		}
+		// 立即生效：更新路由服务内存状态
+		routerSvc.DeleteRealModel(idx)
 		c.JSON(http.StatusOK, gin.H{"message": "real model deleted", "model": removed})
 	}
 }

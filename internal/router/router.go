@@ -349,6 +349,63 @@ func (s *Service) SetStrategy(strategy string) {
 	log.Info().Str("strategy", strategy).Msg("routing strategy updated")
 }
 
+// AddRealModel 动态添加一条 real_model 路由配置
+func (s *Service) AddRealModel(item config.FallbackItem) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.realModelsCfg.Models = append(s.realModelsCfg.Models, item)
+	// 初始化熔断器
+	key := s.breakerKey(item.Provider, item.Model)
+	if _, exists := s.breakers[key]; !exists {
+		s.breakers[key] = breaker.New(key, breaker.Settings{
+			MaxRequests:      5,
+			Interval:         60 * time.Second,
+			Timeout:          30 * time.Second,
+			FailureThreshold: 5,
+			Cooldown:         5 * time.Second,
+		})
+	}
+	log.Info().Str("provider", item.Provider).Str("model", item.Model).Msg("real model added to router")
+}
+
+// UpdateRealModel 动态更新指定索引的 real_model 路由配置
+func (s *Service) UpdateRealModel(index int, item config.FallbackItem) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if index < 0 || index >= len(s.realModelsCfg.Models) {
+		log.Warn().Int("index", index).Msg("UpdateRealModel index out of range")
+		return
+	}
+	s.realModelsCfg.Models[index] = item
+	// 熔断器 key 可能变了，移除旧 key 的熔断器并创建新的
+	// 但最简单的方式是确保新 key 有熔断器
+	key := s.breakerKey(item.Provider, item.Model)
+	if _, exists := s.breakers[key]; !exists {
+		s.breakers[key] = breaker.New(key, breaker.Settings{
+			MaxRequests:      5,
+			Interval:         60 * time.Second,
+			Timeout:          30 * time.Second,
+			FailureThreshold: 5,
+			Cooldown:         5 * time.Second,
+		})
+	}
+	log.Info().Int("index", index).Str("provider", item.Provider).Str("model", item.Model).Msg("real model updated in router")
+}
+
+// DeleteRealModel 动态删除指定索引的 real_model 路由配置
+func (s *Service) DeleteRealModel(index int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if index < 0 || index >= len(s.realModelsCfg.Models) {
+		log.Warn().Int("index", index).Msg("DeleteRealModel index out of range")
+		return
+	}
+	removed := s.realModelsCfg.Models[index]
+	s.realModelsCfg.Models = append(s.realModelsCfg.Models[:index], s.realModelsCfg.Models[index+1:]...)
+	// 注意：不删除熔断器，避免正在进行的请求受影响；熔断器会自然过期或被覆盖
+	log.Info().Int("index", index).Str("provider", removed.Provider).Str("model", removed.Model).Msg("real model deleted from router")
+}
+
 // GetStrategy 获取当前路由策略
 func (s *Service) GetStrategy() string {
 	s.mu.RLock()

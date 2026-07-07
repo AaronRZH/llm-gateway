@@ -145,9 +145,9 @@ func main() {
 		adminAPI.POST("/models", handleAdminAddModel(mapperService, cfg))
 		adminAPI.DELETE("/models/:name", handleAdminDeleteModel(mapperService, cfg))
 		adminAPI.GET("/real-models", handleAdminRealModels(routerService, cfg))
-		adminAPI.POST("/real-models", handleAdminAddRealModel(cfg))
-		adminAPI.PUT("/real-models/:index", handleAdminUpdateRealModel(cfg))
-		adminAPI.DELETE("/real-models/:index", handleAdminDeleteRealModel(cfg))
+		adminAPI.POST("/real-models", handleAdminAddRealModel(cfg, routerService))
+		adminAPI.PUT("/real-models/:index", handleAdminUpdateRealModel(cfg, routerService))
+		adminAPI.DELETE("/real-models/:index", handleAdminDeleteRealModel(cfg, routerService))
 		adminAPI.PATCH("/real-models/strategy", handleAdminUpdateStrategy(routerService, cfg))
 		adminAPI.GET("/config", handleAdminConfig(cfg.App, mapperService))
 	}
