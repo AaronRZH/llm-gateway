@@ -53,6 +53,7 @@ type UsageStorage interface {
 	AggregateDaily(startTime, endTime string) ([]UsageSummary, error)
 	AggregateWeekly(startTime, endTime string) ([]UsageSummary, error)
 	AggregateMonthly(startTime, endTime string) ([]UsageSummary, error)
+	AggregateByRealModel(startTime, endTime string) ([]UsageSummary, error)
 	SumTokensByAPIKey(apiKey, model, startTime, endTime string) (inputTokens, outputTokens, totalTokens, requestCount int, err error)
 	SumTokensByTimeRange(startTime, endTime string) (inputTokens, outputTokens, totalTokens, requestCount int, err error)
 	AdminTotalStats(startTime, endTime string) (map[string]int64, error)
@@ -177,6 +178,34 @@ func (s *FileStorage) AdminTotalStats(startTime, endTime string) (map[string]int
 
 func (s *FileStorage) AdminDailyStats(startTime, endTime string) ([]UsageSummary, error) {
 	return s.AggregateDaily(startTime, endTime)
+}
+
+// AggregateByRealModel 按 real_model 聚合 token 统计（所有 provider 分别统计）
+func (s *FileStorage) AggregateByRealModel(startTime, endTime string) ([]UsageSummary, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	records, _ := s.filter(s.records, "", "", startTime, endTime)
+
+	type rk struct{ Model, Provider string }
+	buckets := make(map[rk]*UsageSummary)
+	for _, r := range records {
+		key := rk{r.RealModel, r.Provider}
+		b, ok := buckets[key]
+		if !ok {
+			buckets[key] = &UsageSummary{Model: key.Model, Provider: key.Provider}
+			b = buckets[key]
+		}
+		b.TotalInput += r.InputTokens
+		b.TotalOutput += r.OutputTokens
+		b.TotalTokens += r.TotalTokens
+		b.RequestCount++
+	}
+	out := make([]UsageSummary, 0, len(buckets))
+	for _, b := range buckets {
+		out = append(out, *b)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].TotalTokens > out[j].TotalTokens })
+	return out, nil
 }
 
 func (s *FileStorage) Close() error {
@@ -464,6 +493,14 @@ func (s *RedisStorage) AggregateMonthly(startTime, endTime string) ([]UsageSumma
 	return s.summarizeRecordsMonthly(raw, startTime, endTime), nil
 }
 
+func (s *RedisStorage) AggregateByRealModel(startTime, endTime string) ([]UsageSummary, error) {
+	raw, err := s.redis.LRange(s.ctx, "usage:recent:all", 0, -1).Result()
+	if err != nil {
+		return nil, err
+	}
+	return s.summarizeRecordsByRealModel(raw, startTime, endTime), nil
+}
+
 func (s *RedisStorage) AdminTotalStats(startTime, endTime string) (map[string]int64, error) {
 	raw, err := s.redis.LRange(s.ctx, "usage:recent:all", 0, -1).Result()
 	if err != nil {
@@ -618,6 +655,35 @@ func (s *RedisStorage) summarizeRecordsMonthly(raw []string, startTime, endTime 
 		out = append(out, *b)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Date > out[j].Date })
+	return out
+}
+
+func (s *RedisStorage) summarizeRecordsByRealModel(raw []string, startTime, endTime string) []UsageSummary {
+	type rk struct{ Model, Provider string }
+	buckets := make(map[rk]*UsageSummary)
+	for _, r := range raw {
+		var rec UsageRecord
+		if json.Unmarshal([]byte(r), &rec) != nil {
+			continue
+		}
+		if !inTimeRange(rec.CreatedAt, startTime, endTime) {
+			continue
+		}
+		key := rk{rec.RealModel, rec.Provider}
+		b, ok := buckets[key]
+		if !ok {
+			buckets[key] = &UsageSummary{Model: key.Model, Provider: key.Provider}
+		}
+		b.TotalInput += rec.InputTokens
+		b.TotalOutput += rec.OutputTokens
+		b.TotalTokens += rec.TotalTokens
+		b.RequestCount++
+	}
+	out := make([]UsageSummary, 0, len(buckets))
+	for _, b := range buckets {
+		out = append(out, *b)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].TotalTokens > out[j].TotalTokens })
 	return out
 }
 

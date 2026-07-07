@@ -79,10 +79,15 @@ providers:
     api_key: "${GLM_AUTH_TOKEN}"
     timeout: 3000s
     protocol: "openai" # 上游是 OpenAI 兼容接口
+  nvidia:
+    base_url: "https://integrate.api.nvidia.com/v1"
+    api_key: "${NVIDIA_AUTH_TOKEN}"
+    timeout: 3000s
+    protocol: "openai" # 上游是 OpenAI 兼容接口
 
 # provider 和 model 必须是真实存在的
 real_models:
-  strategy: "priority" # priority | round_robin | latency_optimized | cost_optimized
+  strategy: "round_robin" # priority | round_robin | latency_optimized | cost_optimized
   models:
     # - provider: "anthropic"
     #   model: "claude-fable-5"
@@ -96,12 +101,12 @@ real_models:
     #   timeout: 3000s
     #   cost: 0
     #   tier: "premium"
-    - provider: "deepseek_anthropic"
-      model: "deepseek-v4-pro"
-      weight: 10
-      timeout: 3000s
-      cost: 0.03
-      tier: "premium"
+    # - provider: "deepseek_anthropic"
+    #   model: "deepseek-v4-pro"
+    #   weight: 10
+    #   timeout: 3000s
+    #   cost: 0.03
+    #   tier: "premium"
     - provider: "seneenova"
       model: "sensenova-6.7-flash-lite"
       weight: 80
@@ -113,7 +118,7 @@ real_models:
       weight: 90
       timeout: 3000s
       cost: 0
-      tier: "standard"
+      tier: "economy"
     # - provider: "xiaomi_tp"
     #   model: "mimo-v2.5-pro"
     #   weight: 100
@@ -126,6 +131,43 @@ real_models:
     #   timeout: 3000s
     #   cost: 0
     #   tier: "economy"
+    - provider: "nvidia"
+      model: "deepseek-ai/deepseek-v4-pro"
+      weight: 90
+      timeout: 3000s
+      cost: 0
+      tier: "economy"
+    - provider: "nvidia"
+      model: "z-ai/glm-5.2"
+      weight: 90
+      timeout: 3000s
+      cost: 0
+      tier: "economy"
+    - provider: "nvidia"
+      model: "minimaxai/minimax-m3"
+      weight: 90
+      timeout: 3000s
+      cost: 0
+      tier: "economy"
+    - provider: "nvidia"
+      model: "moonshotai/kimi-k2.6"
+      weight: 90
+      timeout: 3000s
+      cost: 0
+      tier: "economy"
+    - provider: "nvidia"
+      model: "deepseek-ai/deepseek-v4-flash"
+      weight: 90
+      timeout: 3000s
+      cost: 0
+      tier: "economy"
+    - provider: "nvidia"
+      model: "google/gemma-4-31b-it"
+      weight: 90
+      timeout: 3000s
+      cost: 0
+      tier: "economy"
+
 
 # 熔断器配置
 circuit_breaker:

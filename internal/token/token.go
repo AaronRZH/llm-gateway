@@ -260,6 +260,14 @@ func (s *Service) AdminDailyStats(startTime, endTime string) ([]storage.UsageSum
 	return s.storage.AdminDailyStats(startTime, endTime)
 }
 
+// AggregateByRealModel 按 real_model 聚合 token 统计
+func (s *Service) AggregateByRealModel(startTime, endTime string) ([]storage.UsageSummary, error) {
+	if s.storage == nil {
+		return nil, nil
+	}
+	return s.storage.AggregateByRealModel(startTime, endTime)
+}
+
 // syncWorker 后台处理用量记录：持久化日志 + 估算校准
 func (s *Service) syncWorker() {
 	for record := range s.syncQueue {

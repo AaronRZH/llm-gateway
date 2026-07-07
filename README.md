@@ -315,7 +315,9 @@ auth_whitelist:
 | `GET /admin/usage` | 管理员：时间范围内总 Token 数 |
 | `GET /admin/usage/daily` | 管理员：每日聚合统计 |
 | `GET /admin/usage/stats` | 管理员：总请求数 / Token 数统计 |
+| `GET /admin/usage/by-real-model` | 管理员：按真实模型 (real_model) 汇总 Token 统计 |
 | `GET /admin/calibration` | 本地估算 vs 上游真实用量的校准比例 |
+| `GET /admin/breakers` | 查看所有熔断器状态 |
 
 ### 监控
 

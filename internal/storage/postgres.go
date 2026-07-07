@@ -344,6 +344,32 @@ func (s *PostgresStorage) AdminTotalStats(startTime, endTime string) (map[string
 	}, nil
 }
 
+func (s *PostgresStorage) AggregateByRealModel(startTime, endTime string) ([]UsageSummary, error) {
+	start, end, hasStart, hasEnd := parseTimeRange(startTime, endTime)
+	args := []interface{}{}
+	argNum := 1
+	sql := `
+		SELECT real_model, provider,
+			COALESCE(SUM(input_tokens), 0),
+			COALESCE(SUM(output_tokens), 0),
+			COALESCE(SUM(total_tokens), 0),
+			COUNT(*)
+		FROM usage_records
+		WHERE 1=1
+	`
+	if hasStart {
+		sql += fmt.Sprintf(" AND created_at >= $%d", argNum)
+		args = append(args, start)
+		argNum++
+	}
+	if hasEnd {
+		sql += fmt.Sprintf(" AND created_at <= $%d", argNum)
+		args = append(args, end)
+	}
+	sql += ` GROUP BY real_model, provider ORDER BY total_tokens DESC`
+	return querySummariesNoDate(s.pool, s.ctx, sql, args...)
+}
+
 func (s *PostgresStorage) AdminDailyStats(startTime, endTime string) ([]UsageSummary, error) {
 	return s.AggregateDaily(startTime, endTime)
 }
@@ -392,6 +418,26 @@ func querySummaries(pool *pgxpool.Pool, ctx context.Context, sql string, args ..
 	for rows.Next() {
 		var s UsageSummary
 		err := rows.Scan(&s.Date, &s.Model, &s.Provider, &s.TotalInput, &s.TotalOutput, &s.TotalTokens, &s.RequestCount)
+		if err != nil {
+			return nil, err
+		}
+		summaries = append(summaries, s)
+	}
+	return summaries, rows.Err()
+}
+
+// querySummariesNoDate 执行聚合查询（不带日期字段）并返回 UsageSummary 列表
+func querySummariesNoDate(pool *pgxpool.Pool, ctx context.Context, sql string, args ...interface{}) ([]UsageSummary, error) {
+	rows, err := pool.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var summaries []UsageSummary
+	for rows.Next() {
+		var s UsageSummary
+		err := rows.Scan(&s.Model, &s.Provider, &s.TotalInput, &s.TotalOutput, &s.TotalTokens, &s.RequestCount)
 		if err != nil {
 			return nil, err
 		}

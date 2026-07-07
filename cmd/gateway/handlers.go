@@ -1153,3 +1153,25 @@ func handleAdminBreakers(routerSvc *router.Service) gin.HandlerFunc {
 		c.JSON(http.StatusOK, states)
 	}
 }
+
+// handleAdminUsageByRealModel 管理员查询按 real_model 汇总的 token 统计
+func handleAdminUsageByRealModel(tokenService *token.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		startTime := c.Query("start_time")
+		endTime := c.Query("end_time")
+
+		summaries, err := tokenService.AggregateByRealModel(startTime, endTime)
+		if err != nil {
+			log.Error().Err(err).Msg("aggregate by real model failed")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "query failed"})
+			return
+		}
+		if summaries == nil {
+			summaries = []storage.UsageSummary{}
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"data":        summaries,
+			"model_count": len(summaries),
+		})
+	}
+}
