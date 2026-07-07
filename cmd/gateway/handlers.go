@@ -1243,6 +1243,17 @@ func providerNameToEnvKey(name string) string {
 	return s + "_KEY"
 }
 
+// resolveEnvKey 从现有 config 的 api_key 字段提取 env key 名称，
+// 如果不存在则从 provider name 推导。
+// 例如 "${SENSENOVA_AUTH_TOKEN}" → "SENSENOVA_AUTH_TOKEN"
+//     "" (新 provider) → providerNameToEnvKey(name)
+func resolveEnvKey(apiKeyRef string, providerName string) string {
+	if strings.HasPrefix(apiKeyRef, "${") && strings.HasSuffix(apiKeyRef, "}") {
+		return apiKeyRef[2 : len(apiKeyRef)-1]
+	}
+	return providerNameToEnvKey(providerName)
+}
+
 // updateEnvFile 在 .env 文件中设置 KEY=VALUE（追加或替换）
 func updateEnvFile(key, value string) error {
 	configDir := filepath.Dir("configs/config.yaml")
@@ -1429,7 +1440,8 @@ func handleAdminUpdateProvider(cfg *config.Config, providerMgr *provider.Manager
 		}
 		if req.APIKey != "" {
 			actualKey = req.APIKey
-			envKey := providerNameToEnvKey(name)
+			// 复用现有 env key 名称，或从 provider name 推导
+			envKey := resolveEnvKey(p.APIKey, name)
 			if err := updateEnvFile(envKey, actualKey); err != nil {
 				log.Error().Err(err).Msg("failed to update .env file")
 			}

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -225,11 +226,14 @@ func (c *Config) Save() error {
 	if c.filePath == "" {
 		return fmt.Errorf("config file path not set")
 	}
-	data, err := yaml.Marshal(c)
-	if err != nil {
-		return fmt.Errorf("marshal config failed: %w", err)
+	var buf bytes.Buffer
+	encoder := yaml.NewEncoder(&buf)
+	encoder.SetIndent(2)
+	if err := encoder.Encode(c); err != nil {
+		return fmt.Errorf("encode config failed: %w", err)
 	}
-	return os.WriteFile(c.filePath, data, 0644)
+	encoder.Close()
+	return os.WriteFile(c.filePath, buf.Bytes(), 0644)
 }
 
 // ==================== 手术式 YAML 持久化 ====================
@@ -248,13 +252,16 @@ func (c *Config) readYAMLDoc() (*yaml.Node, error) {
 	return &doc, nil
 }
 
-// writeYAMLDoc 将 Node 树写回 YAML 文件
+// writeYAMLDoc 将 Node 树写回 YAML 文件（统一用 2 空格缩进）
 func (c *Config) writeYAMLDoc(doc *yaml.Node) error {
-	output, err := yaml.Marshal(doc)
-	if err != nil {
-		return fmt.Errorf("marshal config failed: %w", err)
+	var buf bytes.Buffer
+	encoder := yaml.NewEncoder(&buf)
+	encoder.SetIndent(2)
+	if err := encoder.Encode(doc); err != nil {
+		return fmt.Errorf("encode config failed: %w", err)
 	}
-	return os.WriteFile(c.filePath, output, 0644)
+	encoder.Close()
+	return os.WriteFile(c.filePath, buf.Bytes(), 0644)
 }
 
 // findMappingKey 在 MappingNode 中查找指定 key 的 value node
