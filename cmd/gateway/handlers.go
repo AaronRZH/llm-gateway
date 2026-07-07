@@ -1240,7 +1240,7 @@ func handleAdminProviders(routerSvc *router.Service) gin.HandlerFunc {
 func providerNameToEnvKey(name string) string {
 	s := strings.ToUpper(name)
 	s = strings.NewReplacer("-", "_", ".", "_", " ", "_").Replace(s)
-	return s + "_KEY"
+	return s + "_API_KEY"
 }
 
 // resolveEnvKey 从现有 config 的 api_key 字段提取 env key 名称，

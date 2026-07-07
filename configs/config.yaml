@@ -46,17 +46,17 @@ models:
 providers:
   openai:
     base_url: "https://api.openai.com/v1"
-    api_key: "${ANTHROPIC_AUTH_TOKEN}"
+    api_key: "${OPENAI_API_KEY}"
     timeout: 3000s
     protocol: "openai" # 上游是 OpenAI 兼容接口
   seneenova:
     base_url: "https://token.sensenova.cn/v1"
-    api_key: "${SENSENOVA_AUTH_TOKEN}"
+    api_key: "${SENSENOVA_API_KEY}"
     timeout: 3000s
     protocol: "openai" # 上游是 OpenAI 兼容接口
   anthropic:
     base_url: "https://api.anthropic.com/v1"
-    api_key: "${ANTHROPIC_AUTH_TOKEN}"
+    api_key: "${ANTHROPIC_API_KEY}"
     timeout: 3000s
     protocol: "anthropic" # 上游是 Anthropic 兼容接口
   deepseek_openai:
@@ -71,17 +71,17 @@ providers:
     protocol: "anthropic" # 上游是 Anthropic 兼容接口
   xiaomi_tp:
     base_url: "https://token-plan-cn.xiaomimimo.com/v1"
-    api_key: "${XIAOMI_TP_AUTH_TOKEN}"
+    api_key: "${XIAOMI_TP_API_KEY}"
     timeout: 3000s
     protocol: "openai" # 上游是 OpenAI 兼容接口
   glm:
     base_url: "https://open.bigmodel.cn/api/paas/v4"
-    api_key: "${GLM_AUTH_TOKEN}"
+    api_key: "${GLM_API_KEY}"
     timeout: 3000s
     protocol: "openai" # 上游是 OpenAI 兼容接口
   nvidia:
     base_url: "https://integrate.api.nvidia.com/v1"
-    api_key: "${NVIDIA_AUTH_TOKEN}"
+    api_key: "${NVIDIA_API_KEY}"
     timeout: 3000s
     protocol: "openai" # 上游是 OpenAI 兼容接口
 

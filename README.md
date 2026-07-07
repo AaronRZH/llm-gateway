@@ -95,12 +95,11 @@ cp .env.example .env
 ```bash
 OPENAI_API_KEY=sk-xxx
 ANTHROPIC_API_KEY=sk-ant-xxx
-ANTHROPIC_AUTH_TOKEN=sk-ant-xxx
 DEEPSEEK_API_KEY=sk-xxx
-SENSENOVA_AUTH_TOKEN=sk-xxx
-XIAOMI_TP_AUTH_TOKEN=tp-xxx
-GLM_AUTH_TOKEN=xxx
-NVIDIA_AUTH_TOKEN=xxx
+SENSENOVA_API_KEY=sk-xxx
+XIAOMI_TP_API_KEY=tp-xxx
+GLM_API_KEY=xxx
+NVIDIA_API_KEY=xxx
 REDIS_PASSWORD=password
 POSTGRES_PASSWORD=password
 ADMIN_PASSWORD=your_admin_password_here
@@ -182,7 +181,7 @@ providers:
     protocol: "openai"      # 上游使用的协议
   anthropic:
     base_url: "https://api.anthropic.com/v1"
-    api_key: "${ANTHROPIC_AUTH_TOKEN}"
+    api_key: "${ANTHROPIC_API_KEY}"
     timeout: 300s
     protocol: "anthropic"
   deepseek_openai:
