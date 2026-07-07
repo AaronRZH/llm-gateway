@@ -3,12 +3,10 @@ app:
   version: "1.0.0"
   env: "dev" # dev | prod
   port: 8080
-
 log:
   level: "info" # debug | info | warn | error
   format: "json" # json | console
   output: "stdout" # stdout | file path
-
 # Redis 配置
 redis:
   addr: "localhost:6379"
@@ -18,7 +16,6 @@ redis:
   dial_timeout: 5s
   read_timeout: 3s
   write_timeout: 3s
-
 # PostgreSQL 配置（PostgreSQL 优先 → 文件存储降级）
 postgres:
   host: "localhost"
@@ -30,7 +27,6 @@ postgres:
   max_conns: 20
   min_conns: 0
   conn_timeout: 5s
-
 # 模型名 allowlist（对外暴露），带 tier 分级
 models:
   - name: "sensenova-6.7-flash-lite"
@@ -39,7 +35,6 @@ models:
     tier: "standard"
   - name: "deepseek-v4-pro"
     tier: "premium"
-
 # Provider 配置（API Keys 建议通过环境变量注入）
 # provider name 仅作路由标识，不影响行为
 # protocol 字段：声明上游使用的协议类型（"openai" | "anthropic"），默认为 "openai"
@@ -49,11 +44,11 @@ providers:
     api_key: "${OPENAI_API_KEY}"
     timeout: 3000s
     protocol: "openai" # 上游是 OpenAI 兼容接口
-  seneenova:
-    base_url: "https://token.sensenova.cn/v1"
-    api_key: "${SENSENOVA_API_KEY}"
-    timeout: 3000s
-    protocol: "openai" # 上游是 OpenAI 兼容接口
+  sensenova:
+    base_url: https://token.sensenova.cn/v1
+    api_key: ${SENSENOVA_API_KEY}
+    timeout: 50m0s
+    protocol: openai
   anthropic:
     base_url: "https://api.anthropic.com/v1"
     api_key: "${ANTHROPIC_API_KEY}"
@@ -84,7 +79,6 @@ providers:
     api_key: "${NVIDIA_API_KEY}"
     timeout: 3000s
     protocol: "openai" # 上游是 OpenAI 兼容接口
-
 # provider 和 model 必须是真实存在的
 real_models:
   strategy: "round_robin" # priority | round_robin | latency_optimized | cost_optimized
@@ -107,13 +101,13 @@ real_models:
     #   timeout: 3000s
     #   cost: 0.03
     #   tier: "premium"
-    - provider: "seneenova"
+    - provider: "sensenova"
       model: "sensenova-6.7-flash-lite"
       weight: 80
       timeout: 3000s
       cost: 0
       tier: "economy"
-    - provider: "seneenova"
+    - provider: "sensenova"
       model: "deepseek-v4-flash"
       weight: 90
       timeout: 3000s
@@ -167,8 +161,6 @@ real_models:
       timeout: 3000s
       cost: 0
       tier: "economy"
-
-
 # 熔断器配置
 circuit_breaker:
   max_requests: 3 # 半开状态允许试探请求数
@@ -176,13 +168,11 @@ circuit_breaker:
   timeout: 5s # 请求超时
   failure_threshold: 5 # 连续失败次数触发熔断
   cooldown: 30s # 熔断后冷却时间
-
 # 限流配置
 rate_limit:
   enabled: true
   requests_per_second: 100
   burst: 150
-
 token:
   # 本地估算模型映射
   tokenizer_mapping:
@@ -190,12 +180,10 @@ token:
     "gpt-4o-mini-2024-07-18": "cl100k_base"
     "claude-3-5-sonnet-20241022": "claude"
     "deepseek-chat": "deepseek"
-
 # 健康检查
 health:
   enabled: true
   path: "/health"
-
 # API Key 配置（种子 Key，自动同步到 Redis）
 # 生产环境建议通过 Redis 动态管理
 api_keys:
@@ -203,13 +191,11 @@ api_keys:
     name: "dev-client-1"
   - key: "sk-gateway-dev-key-002"
     name: "dev-client-2"
-
 # Auth 白名单路径（Auth 中间件会跳过这些路径的验证）
 auth_whitelist:
   - "/health"
   - "/admin/*"
-
 admin:
   password: "${ADMIN_PASSWORD}"
-  jwt_secret: "${ADMIN_JWT_SECRET}"                                                                                                                                                                      
-  token_expiry: 24h 
+  jwt_secret: "${ADMIN_JWT_SECRET}"
+  token_expiry: 24h
