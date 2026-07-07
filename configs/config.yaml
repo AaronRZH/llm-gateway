@@ -191,11 +191,6 @@ token:
     "claude-3-5-sonnet-20241022": "claude"
     "deepseek-chat": "deepseek"
 
-# 监控
-metrics:
-  enabled: true
-  path: "/metrics"
-
 # 健康检查
 health:
   enabled: true
@@ -212,6 +207,9 @@ api_keys:
 # Auth 白名单路径（Auth 中间件会跳过这些路径的验证）
 auth_whitelist:
   - "/health"
-  - "/metrics"
-  - "/usage/*"
   - "/admin/*"
+
+admin:
+  password: "${ADMIN_PASSWORD}"
+  jwt_secret: "${ADMIN_JWT_SECRET}"                                                                                                                                                                      
+  token_expiry: 24h 

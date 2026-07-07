@@ -19,13 +19,12 @@ import (
 	"llm-gateway/internal/config"
 	"llm-gateway/internal/health"
 	"llm-gateway/internal/mapper"
-	"llm-gateway/internal/metrics"
 	"llm-gateway/internal/middleware"
 	"llm-gateway/internal/provider"
 	redisutil "llm-gateway/pkg/redis"
 	"llm-gateway/internal/router"
 	"llm-gateway/internal/storage"
-		"llm-gateway/internal/stream"
+	"llm-gateway/internal/stream"
 	"llm-gateway/internal/token"
 )
 
@@ -105,9 +104,6 @@ func main() {
 
 	// 注册公开路由
 	r.GET(cfg.Health.Path, health.Handler())
-	if cfg.Metrics.Enabled {
-		r.GET(cfg.Metrics.Path, metrics.JSONHandler())
-	}
 
 	// API 路由
 	api := r.Group("/v1")
@@ -119,18 +115,48 @@ func main() {
 		api.GET("/models", handleListModels(mapperService))
 	}
 
-	// Token 用量统计查询路由
-	r.GET("/usage", handleUsageQuery(tokenService, authService))
-	r.GET("/usage/:request_id", handleUsageByID(tokenService))
-	r.GET("/usage/stats", handleUsageStats(tokenService))
+	// Token 用量统计查询路由（已删除 /usage，改用 /admin/usage/*）
 
-	// 管理员路由
+	// 管理员路由（基础数据查询，无需密码）
 	r.GET("/admin/usage", handleAdminUsage(tokenService))
 	r.GET("/admin/usage/daily", handleAdminDailyUsage(tokenService))
 	r.GET("/admin/usage/stats", handleAdminStats(tokenService))
 	r.GET("/admin/calibration", handleAdminCalibration(tokenService))
 	r.GET("/admin/breakers", handleAdminBreakers(routerService))
 	r.GET("/admin/usage/by-real-model", handleAdminUsageByRealModel(tokenService))
+		r.GET("/admin/usage/by-api-key", handleAdminUsageByAPIKey(authService, tokenService))
+
+	// 管理后台 API（扩展管理功能，需 AdminAuth 中间件）
+	adminAPI := r.Group("/admin")
+		// 管理后台登录（不需要 AdminAuth 中间件）
+		r.POST("/admin/login", handleAdminLogin(cfg))
+	adminAPI.Use(middleware.AdminAuth(cfg))
+	{
+		adminAPI.GET("/api-keys", handleAdminAPIKeys(authService))
+		adminAPI.POST("/api-keys", handleAdminCreateAPIKey(authService, cfg))
+		adminAPI.DELETE("/api-keys/:key", handleAdminDeleteAPIKey(authService, cfg))
+		adminAPI.GET("/api-keys/:key/usage", handleAdminAPIKeyUsage(authService, tokenService))
+		adminAPI.GET("/providers", handleAdminProviders(routerService))
+		adminAPI.GET("/providers/config", handleAdminProvidersConfig(cfg))
+		adminAPI.POST("/providers", handleAdminAddProvider(cfg, providerManager))
+		adminAPI.PUT("/providers/:name", handleAdminUpdateProvider(cfg, providerManager))
+		adminAPI.DELETE("/providers/:name", handleAdminDeleteProvider(cfg, providerManager))
+		adminAPI.GET("/models", handleAdminModels(mapperService))
+		adminAPI.POST("/models", handleAdminAddModel(mapperService, cfg))
+		adminAPI.DELETE("/models/:name", handleAdminDeleteModel(mapperService, cfg))
+		adminAPI.GET("/real-models", handleAdminRealModels(routerService, cfg))
+		adminAPI.POST("/real-models", handleAdminAddRealModel(cfg))
+		adminAPI.PUT("/real-models/:index", handleAdminUpdateRealModel(cfg))
+		adminAPI.DELETE("/real-models/:index", handleAdminDeleteRealModel(cfg))
+		adminAPI.PATCH("/real-models/strategy", handleAdminUpdateStrategy(routerService, cfg))
+		adminAPI.GET("/config", handleAdminConfig(cfg.App, mapperService))
+	}
+
+	// 管理后台静态文件服务（SPA 模式）
+	r.StaticFS("/admin/assets", http.Dir("web/static"))
+	r.GET("/admin", func(c *gin.Context) {
+		c.File("web/static/index.html")
+	})
 
 	// 启动 HTTP 服务
 	srv := &http.Server{

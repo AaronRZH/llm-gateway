@@ -70,6 +70,38 @@ func (s *Service) ListVirtualModels() []map[string]interface{} {
 	return models
 }
 
+// AddModel 新增虚拟模型（动态添加，不持久化到配置文件）
+func (s *Service) AddModel(name, tier string) bool {
+	if name == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.models[name] {
+		return false // 已存在
+	}
+	s.models[name] = true
+	if tier != "" {
+		s.modelTiers[name] = tier
+	}
+	return true
+}
+
+// DeleteModel 删除虚拟模型（仅动态删除，不影响配置文件）
+func (s *Service) DeleteModel(name string) bool {
+	if name == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.models[name] {
+		return false // 不存在
+	}
+	delete(s.models, name)
+	delete(s.modelTiers, name)
+	return true
+}
+
 // RewriteResponse 重写响应中的模型名字段
 func (s *Service) RewriteResponse(body []byte, virtualName string) []byte {
 	var resp map[string]interface{}

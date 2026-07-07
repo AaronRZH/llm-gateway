@@ -341,6 +341,21 @@ func (s *Service) RecordLatency(providerName, model string, latencyMs float64) {
 	s.recordLatency(providerName, model, latencyMs)
 }
 
+// SetStrategy 动态更新路由策略
+func (s *Service) SetStrategy(strategy string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.realModelsCfg.Strategy = strategy
+	log.Info().Str("strategy", strategy).Msg("routing strategy updated")
+}
+
+// GetStrategy 获取当前路由策略
+func (s *Service) GetStrategy() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.realModelsCfg.Strategy
+}
+
 // BreakerStates 返回所有熔断器的当前状态（用于管理端展示）
 func (s *Service) BreakerStates() map[string]string {
 	s.mu.RLock()

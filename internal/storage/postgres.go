@@ -366,12 +366,50 @@ func (s *PostgresStorage) AggregateByRealModel(startTime, endTime string) ([]Usa
 		sql += fmt.Sprintf(" AND created_at <= $%d", argNum)
 		args = append(args, end)
 	}
-	sql += ` GROUP BY real_model, provider ORDER BY total_tokens DESC`
+	sql += ` GROUP BY real_model, provider ORDER BY 5 DESC`
 	return querySummariesNoDate(s.pool, s.ctx, sql, args...)
 }
 
 func (s *PostgresStorage) AdminDailyStats(startTime, endTime string) ([]UsageSummary, error) {
 	return s.AggregateDaily(startTime, endTime)
+}
+
+// AggregateByAPIKey 按 API Key + 时间粒度聚合统计
+func (s *PostgresStorage) AggregateByAPIKey(apiKey, granularity, startTime, endTime string) ([]UsageSummary, error) {
+	start, end, hasStart, hasEnd := parseTimeRange(startTime, endTime)
+	args := []interface{}{apiKey}
+	argNum := 2
+
+	var dateExpr string
+	switch granularity {
+	case "weekly":
+		dateExpr = "TO_CHAR(DATE_TRUNC('week', created_at), 'YYYY-\"W\"WW')"
+	case "monthly":
+		dateExpr = "TO_CHAR(created_at, 'YYYY-MM')"
+	default:
+		dateExpr = "TO_CHAR(created_at, 'YYYY-MM-DD')"
+	}
+
+	sql := `
+		SELECT ` + dateExpr + ` AS date, real_model, provider,
+			COALESCE(SUM(input_tokens), 0) AS total_input,
+			COALESCE(SUM(output_tokens), 0) AS total_output,
+			COALESCE(SUM(total_tokens), 0) AS total_tokens,
+			COUNT(*) AS request_count
+		FROM usage_records
+		WHERE api_key = $1
+	`
+	if hasStart {
+		sql += fmt.Sprintf(" AND created_at >= $%d", argNum)
+		args = append(args, start)
+		argNum++
+	}
+	if hasEnd {
+		sql += fmt.Sprintf(" AND created_at <= $%d", argNum)
+		args = append(args, end)
+	}
+	sql += ` GROUP BY date, real_model, provider ORDER BY date DESC`
+	return querySummaries(s.pool, s.ctx, sql, args...)
 }
 
 func (s *PostgresStorage) Close() error {

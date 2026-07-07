@@ -87,6 +87,16 @@ func (m *Manager) Get(name string) (Provider, bool) {
 	return p, ok
 }
 
+// UpdateProvider 更新或新增 Provider 配置（运行时生效）
+func (m *Manager) UpdateProvider(name string, cfg config.ProviderConfig) {
+	m.providers[name] = NewProvider(cfg)
+}
+
+// DeleteProvider 删除 Provider（运行时生效）
+func (m *Manager) DeleteProvider(name string) {
+	delete(m.providers, name)
+}
+
 // ==================== 构造函数 ====================
 
 // newBaseProvider 构造基础 Provider 配置
@@ -137,6 +147,11 @@ func (p *Provider) fullURL(suffix string) string {
 // SetName 设置 provider 名称
 func (p *Provider) SetName(name string) {
 	p.name = name
+}
+
+// SetAPIKey 更新 Provider 的 API Key（用于运行时更新，立即生效）
+func (p *Provider) SetAPIKey(key string) {
+	p.apiKey = key
 }
 
 // GetName 获取 provider 名称

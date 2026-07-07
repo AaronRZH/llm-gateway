@@ -8,7 +8,6 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"llm-gateway/internal/config"
-	"llm-gateway/internal/metrics"
 	"llm-gateway/internal/storage"
 )
 
@@ -144,7 +143,6 @@ func (s *Service) RecordUsage(requestID, model, virtualModel, provider string,
 
 	// 实时写入 Prometheus 指标（仅当有真实 token 数据时）
 	if realInput > 0 || realOutput > 0 {
-		metrics.RecordTokenUsage(model, realInput, realOutput)
 	}
 }
 
@@ -266,6 +264,14 @@ func (s *Service) AggregateByRealModel(startTime, endTime string) ([]storage.Usa
 		return nil, nil
 	}
 	return s.storage.AggregateByRealModel(startTime, endTime)
+}
+
+// AggregateByAPIKey 按 API Key + 时间粒度聚合统计
+func (s *Service) AggregateByAPIKey(apiKey, granularity, startTime, endTime string) ([]storage.UsageSummary, error) {
+	if s.storage == nil {
+		return nil, nil
+	}
+	return s.storage.AggregateByAPIKey(apiKey, granularity, startTime, endTime)
 }
 
 // syncWorker 后台处理用量记录：持久化日志 + 估算校准

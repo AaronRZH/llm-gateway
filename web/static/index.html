@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LLM Gateway 管理后台</title>
+  <link rel="stylesheet" href="/admin/assets/css/dashboard.css">
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <div id="app">
+    <!-- 登录界面 -->
+    <div class="login-page" v-if="!isAuthenticated">
+      <div class="login-card">
+        <div class="login-header">
+          <h1 class="login-title">LLM Gateway</h1>
+          <p class="login-subtitle">管理后台</p>
+        </div>
+        <form @submit.prevent="login" class="login-form">
+          <div class="form-group">
+            <label>管理密码</label>
+            <input v-model="loginPassword" type="password" placeholder="请输入密码" class="form-input" autofocus>
+          </div>
+          <p class="login-error" v-if="loginError">{{ loginError }}</p>
+          <button type="submit" class="btn btn-primary login-btn" :disabled="loggingIn">
+            {{ loggingIn ? '登录中...' : '登录' }}
+          </button>
+        </form>
+      </div>
+    </div>
+
+    <template v-if="isAuthenticated">
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <h1 class="sidebar-title">LLM Gateway</h1>
+        <span class="sidebar-env" :class="appEnv">{{ appEnv }}</span>
+      </div>
+      <nav class="nav">
+        <a v-for="item in navItems" :key="item.id"
+           class="nav-item" :class="{ active: currentView === item.id }"
+           href="#" @click.prevent="switchView(item.id)">
+          <span class="nav-icon">{{ item.icon }}</span>
+          <span class="nav-label">{{ item.label }}</span>
+        </a>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="sidebar-footer-info">
+          <span>v{{ appVersion }}</span>
+          <span class="logout-badge" @click="logout" title="退出登录">🚪</span>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <!-- 概览面板 -->
+      <section v-if="currentView === 'overview'" class="panel">
+        <div class="panel-header"><h2>概览</h2></div>
+        <div class="stat-cards">
+          <div class="stat-card">
+            <div class="stat-label">总请求数</div>
+            <div class="stat-value">{{ fmt(overview.totalRequests) }}</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">总 Token 消耗</div>
+            <div class="stat-value">{{ fmt(overview.totalTokens) }}</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">输入 Tokens</div>
+            <div class="stat-value">{{ fmt(overview.totalInput) }}</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">输出 Tokens</div>
+            <div class="stat-value">{{ fmt(overview.totalOutput) }}</div>
+          </div>
+        </div>
+        <div class="chart-grid">
+          <div class="card">
+            <h3 class="card-title">每日 Token 消耗趋势</h3>
+            <div class="chart-container"><canvas id="dailyChart"></canvas></div>
+          </div>
+          <div class="card">
+            <h3 class="card-title">按模型 Token 分布</h3>
+            <div class="chart-container"><canvas id="modelChart"></canvas></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Token 用量面板 -->
+      <section v-if="currentView === 'usage'" class="panel">
+        <div class="panel-header">
+          <h2>Token 用量</h2>
+          <div class="panel-actions">
+            <select v-model="usageGranularity" @change="loadUsageStats">
+              <option value="daily">日</option>
+              <option value="weekly">周</option>
+              <option value="monthly">月</option>
+            </select>
+            <select v-model="selectedUsageKey" @change="loadUsageStats" style="margin-left:8px;min-width:160px;">
+              <option value="">全部 API Key</option>
+              <option v-for="k in apiKeys" :key="k.key" :value="k.key">{{ k.name }}</option>
+            </select>
+          </div>
+        </div>
+        <div class="chart-grid">
+          <div class="card">
+            <h3 class="card-title">用量聚合统计</h3>
+            <div class="chart-container"><canvas id="usageChart"></canvas></div>
+          </div>
+          <div class="card">
+            <h3 class="card-title">按真实模型聚合</h3>
+            <div class="chart-container"><canvas id="byRealModelChart"></canvas></div>
+          </div>
+        </div>
+        <div class="card" style="margin-top:16px;">
+          <h3 class="card-title">用量明细<span v-if="selectedUsageKey" style="margin-left:8px;font-weight:400;font-size:13px;color:var(--text-secondary);">— {{ getKeyName(selectedUsageKey) }}</span></h3>
+          <div style="overflow-x:auto;">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>日期</th>
+                  <th>模型</th>
+                  <th>Provider</th>
+                  <th>输入 Tokens</th>
+                  <th>输出 Tokens</th>
+                  <th>总 Tokens</th>
+                  <th>请求次数</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="(d, i) in usageStatsData" :key="i">
+                  <td><code>{{ d.date }}</code></td>
+                  <td><code>{{ d.model }}</code></td>
+                  <td><code>{{ d.provider }}</code></td>
+                  <td>{{ fmt(d.total_input) }}</td>
+                  <td>{{ fmt(d.total_output) }}</td>
+                  <td><strong>{{ fmt(d.total_tokens) }}</strong></td>
+                  <td>{{ d.request_count }}</td>
+                </tr>
+                <tr v-if="usageStatsData.length === 0">
+                  <td colspan="7" class="text-center text-muted">暂无数据</td>
+                </tr>
+              </tbody>
+              <tfoot v-if="usageStatsData.length > 0">
+                <tr style="font-weight:600;border-top:2px solid var(--border);">
+                  <td colspan="3" style="text-align:right;color:var(--text-secondary);">合计</td>
+                  <td>{{ fmt(usageStatsData.reduce((s, d) => s + (d.total_input || 0), 0)) }}</td>
+                  <td>{{ fmt(usageStatsData.reduce((s, d) => s + (d.total_output || 0), 0)) }}</td>
+                  <td><strong>{{ fmt(usageStatsData.reduce((s, d) => s + (d.total_tokens || 0), 0)) }}</strong></td>
+                  <td>{{ usageStatsData.reduce((s, d) => s + (d.request_count || 0), 0) }}</td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+        </div>
+              </section>
+
+      <!-- API Key 管理面板 -->
+      <section v-if="currentView === 'apikeys'" class="panel">
+        <div class="panel-header">
+          <h2>API Key 管理</h2>
+          <button class="btn btn-primary" @click="showAddKeyModal = true">+ 新增 Key</button>
+        </div>
+        <div class="card">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>API Key</th>
+                <th>创建时间</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="key in apiKeys" :key="key.key">
+                <td>{{ key.name }}</td>
+                <td><code class="key-display">{{ maskKey(key.key) }}</code></td>
+                <td>{{ formatDate(key.created_at) }}</td>
+                <td><button class="btn btn-danger btn-sm" @click="deleteKey(key.key)">删除</button></td>
+              </tr>
+              <tr v-if="apiKeys.length === 0">
+                <td colspan="4" class="text-center text-muted">暂无 API Key</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- API Key 新增弹窗 -->
+      <div class="modal-overlay" v-if="showAddKeyModal" @click.self="showAddKeyModal = false">
+        <div class="modal">
+          <h3>新增 API Key</h3>
+          <form @submit.prevent="addKey">
+            <div class="form-group">
+              <label>名称</label>
+              <input v-model="newKeyName" placeholder="如: dev-client-3" class="form-input">
+            </div>
+            <div class="form-group">
+              <label>API Key</label>
+              <input v-model="newKeyValue" placeholder="如: sk-xxx" class="form-input">
+            </div>
+            <div class="form-actions">
+              <button type="button" class="btn" @click="showAddKeyModal = false">取消</button>
+              <button type="submit" class="btn btn-primary">创建</button>
+            </div>
+          </form>
+        </div>
+      </div>
+
+      <!-- 虚拟模型新增弹窗 -->
+      <div class="modal-overlay" v-if="showAddModelModal" @click.self="showAddModelModal = false">
+        <div class="modal">
+          <h3>新增虚拟模型</h3>
+          <form @submit.prevent="addModel">
+            <div class="form-group">
+              <label>模型名（客户端请求时使用的名称）</label>
+              <input v-model="newModelName" placeholder="如: gpt-4" class="form-input">
+            </div>
+            <div class="form-group">
+              <label>Tier 分级</label>
+              <select v-model="newModelTier" class="form-input">
+                <option value="">不设置</option>
+                <option value="premium">premium</option>
+                <option value="standard">standard</option>
+                <option value="economy">economy</option>
+              </select>
+            </div>
+            <div class="form-actions">
+              <button type="button" class="btn" @click="showAddModelModal = false">取消</button>
+              <button type="submit" class="btn btn-primary">创建</button>
+            </div>
+          </form>
+        </div>
+      </div>
+
+      <!-- 路由配置新增/编辑弹窗 -->
+      <div class="modal-overlay" v-if="showAddRealModelModal" @click.self="closeRealModelModal">
+        <div class="modal">
+          <h3>{{ realModelEditIndex === -1 ? '新增' : '编辑' }}路由配置</h3>
+          <form @submit.prevent="saveRealModel">
+            <div class="form-group">
+              <label>Provider</label>
+              <input v-model="realModelForm.provider" placeholder="如: seneenova" class="form-input" list="provider-list">
+              <datalist id="provider-list">
+                <option v-for="p in providerNames" :key="p" :value="p"></option>
+              </datalist>
+            </div>
+            <div class="form-group">
+              <label>Model</label>
+              <input v-model="realModelForm.model" placeholder="如: deepseek-v4-flash" class="form-input">
+            </div>
+            <div class="form-group" style="display:inline-block;width:48%;margin-right:4%;">
+              <label>权重 (Weight)</label>
+              <input v-model.number="realModelForm.weight" type="number" min="1" placeholder="1" class="form-input">
+            </div>
+            <div class="form-group" style="display:inline-block;width:48%;">
+              <label>Tier</label>
+              <select v-model="realModelForm.tier" class="form-input">
+                <option value="">通用</option>
+                <option value="premium">premium</option>
+                <option value="standard">standard</option>
+                <option value="economy">economy</option>
+              </select>
+            </div>
+            <div class="form-group" style="display:inline-block;width:48%;margin-right:4%;">
+              <label>Cost ($/1K tokens)</label>
+              <input v-model.number="realModelForm.cost" type="number" step="0.001" min="0" placeholder="0" class="form-input">
+            </div>
+            <div class="form-group" style="display:inline-block;width:48%;">
+              <label>超时 (秒)</label>
+              <input v-model.number="realModelForm.timeout" type="number" min="1" placeholder="3000" class="form-input">
+            </div>
+            <div class="form-actions">
+              <button type="button" class="btn" @click="closeRealModelModal">取消</button>
+              <button type="submit" class="btn btn-primary">{{ realModelEditIndex === -1 ? '创建' : '保存' }}</button>
+            </div>
+          </form>
+        </div>
+      </div>
+
+      <!-- Provider 配置新增/编辑弹窗 -->
+      <div class="modal-overlay" v-if="showAddProviderModal" @click.self="closeProviderModal">
+        <div class="modal">
+          <h3>{{ providerEditName ? '编辑' : '新增' }} Provider</h3>
+          <form @submit.prevent="saveProvider">
+            <div class="form-group" v-if="!providerEditName">
+              <label>名称</label>
+              <input v-model="providerForm.name" placeholder="如: my-provider" class="form-input">
+            </div>
+            <div class="form-group">
+              <label>Base URL</label>
+              <input v-model="providerForm.base_url" placeholder="如: https://api.example.com/v1" class="form-input">
+            </div>
+            <div class="form-group">
+              <label>API Key{{ providerEditName ? '（留空不修改）' : '' }}</label>
+              <input v-model="providerForm.api_key" type="password" placeholder="sk-..." class="form-input">
+            </div>
+            <div class="form-group" style="display:inline-block;width:48%;margin-right:4%;">
+              <label>协议</label>
+              <select v-model="providerForm.protocol" class="form-input">
+                <option value="openai">openai</option>
+                <option value="anthropic">anthropic</option>
+              </select>
+            </div>
+            <div class="form-group" style="display:inline-block;width:48%;">
+              <label>超时 (秒)</label>
+              <input v-model.number="providerForm.timeout" type="number" min="1" placeholder="3000" class="form-input">
+            </div>
+            <div class="form-actions">
+              <button type="button" class="btn" @click="closeProviderModal">取消</button>
+              <button type="submit" class="btn btn-primary">{{ providerEditName ? '保存' : '创建' }}</button>
+            </div>
+          </form>
+        </div>
+      </div>
+
+      <!-- Provider 监控面板 -->
+      <section v-if="currentView === 'providers'" class="panel">
+        <div class="panel-header"><h2>Provider & 熔断器监控</h2></div>
+        <div class="card">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>Provider:Model</th>
+                <th>熔断器状态</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="(state, key) in breakerStates" :key="key">
+                <td><code>{{ key }}</code></td>
+                <td>
+                  <span class="breaker-badge" :class="'breaker-' + state">
+                    {{ state }}
+                  </span>
+                </td>
+              </tr>
+              <tr v-if="Object.keys(breakerStates).length === 0">
+                <td colspan="2" class="text-center text-muted">无数据</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 配置查看面板 -->
+      <section v-if="currentView === 'config'" class="panel">
+        <div class="panel-header"><h2>配置</h2></div>
+        <div class="card">
+          <h3 class="card-title">应用信息</h3>
+          <table class="table config-table">
+            <tr><td>名称</td><td><code>{{ appConfig.name }}</code></td></tr>
+            <tr><td>版本</td><td><code>{{ appConfig.version }}</code></td></tr>
+            <tr><td>环境</td><td><code>{{ appConfig.env }}</code></td></tr>
+            <tr><td>端口</td><td><code>{{ appConfig.port }}</code></td></tr>
+          </table>
+        </div>
+        <div class="card" style="margin-top: 16px;">
+          <h3 class="card-title">虚拟模型 ({{ virtualModels.length }}) <button class="btn btn-primary btn-sm" @click="showAddModelModal = true" style="vertical-align: middle; margin-left: 12px;">+ 添加</button></h3>
+          <table class="table">
+            <thead>
+              <tr><th>模型名</th><th>Tier</th><th>操作</th></tr>
+            </thead>
+            <tbody>
+              <tr v-for="m in virtualModels" :key="m.id">
+                <td><code>{{ m.id }}</code></td>
+                <td><span class="tier-badge" v-if="m.tier">{{ m.tier }}</span><span v-else class="text-muted">未设置</span></td>
+                <td><button class="btn btn-danger btn-sm" @click="deleteModel(m.id)">删除</button></td>
+              </tr>
+              <tr v-if="virtualModels.length === 0">
+                <td colspan="3" class="text-center text-muted">暂无虚拟模型</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="card" style="margin-top: 16px;">
+          <h3 class="card-title">Provider 配置 ({{ Object.keys(providersConfig).length }}) <button class="btn btn-primary btn-sm" @click="showAddProviderModal = true" style="vertical-align: middle; margin-left: 12px;">+ 添加</button></h3>
+          <table class="table">
+            <thead>
+              <tr><th>名称</th><th>Base URL</th><th>协议</th><th>超时</th><th>操作</th></tr>
+            </thead>
+            <tbody>
+              <tr v-for="(p, name) in providersConfig" :key="name">
+                <td><code>{{ name }}</code></td>
+                <td><code class="url-wrap">{{ p.base_url }}</code></td>
+                <td><span class="protocol-badge">{{ p.protocol }}</span></td>
+                <td>{{ p.timeout }}</td>
+                <td>
+                  <button class="btn btn-sm" style="background:#238636;color:#fff;border:none;padding:2px 10px;border-radius:4px;cursor:pointer;margin-right:4px;" @click="editProvider(name)">编辑</button>
+                  <button class="btn btn-danger btn-sm" @click="deleteProvider(name)">删除</button>
+                </td>
+              </tr>
+              <tr v-if="Object.keys(providersConfig).length === 0">
+                <td colspan="5" class="text-center text-muted">暂无 Provider 配置</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="card" style="margin-top: 16px;">
+          <h3 class="card-title">路由配置 (策略:
+            <select v-model="realModelConfig.strategy" @change="updateStrategy" style="background:var(--bg-primary);color:var(--text-primary);border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:13px;margin-left:4px;">
+              <option value="priority">priority</option>
+              <option value="round_robin">round_robin</option>
+              <option value="latency_optimized">latency_optimized</option>
+              <option value="cost_optimized">cost_optimized</option>
+            </select>)
+            <button class="btn btn-primary btn-sm" @click="showAddRealModelModal = true" style="vertical-align: middle; margin-left: 12px;">+ 添加</button>
+          </h3>
+          <table class="table">
+            <thead>
+              <tr><th>Provider</th><th>Model</th><th>权重</th><th>Tier</th><th>操作</th></tr>
+            </thead>
+            <tbody>
+              <tr v-for="(m, i) in realModelConfig.models" :key="i">
+                <td><code>{{ m.provider }}</code></td>
+                <td><code>{{ m.model }}</code></td>
+                <td>{{ m.weight }}</td>
+                <td><span class="tier-badge" v-if="m.tier">{{ m.tier }}</span><span v-else class="text-muted">通用</span></td>
+                <td>
+                  <button class="btn btn-sm" style="background:#238636;color:#fff;border:none;padding:2px 10px;border-radius:4px;cursor:pointer;margin-right:4px;" @click="editRealModel(i)">编辑</button>
+                  <button class="btn btn-danger btn-sm" @click="deleteRealModel(i)">删除</button>
+                </td>
+              </tr>
+              <tr v-if="realModelConfig.models.length === 0">
+                <td colspan="5" class="text-center text-muted">暂无路由配置</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+    </template>
+  </div>
+  <script src="/admin/assets/js/dashboard.js"></script>
+</body>
+</html>

@@ -6,6 +6,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -14,8 +18,9 @@ import (
 	"github.com/sony/gobreaker"
 
 	"llm-gateway/internal/auth"
+	"llm-gateway/internal/config"
 	"llm-gateway/internal/mapper"
-	"llm-gateway/internal/metrics"
+	"llm-gateway/internal/middleware"
 	"llm-gateway/internal/protocol"
 	"llm-gateway/internal/provider"
 	"llm-gateway/internal/router"
@@ -182,8 +187,7 @@ func handleChatCompletion(
 			go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
 				inputTokens, estimatedOutput, effInput, effOutput, effTotal, estimatedToolCalls, apiKey)
 
-			metrics.RecordRequest("POST", "/v1/chat/completions", http.StatusOK, req.Model, time.Since(start).Seconds())
-		} else {
+			} else {
 			// 非流式响应 — 遍历候选直到请求成功
 			var targetProvider string
 			var upstreamModel string
@@ -262,8 +266,6 @@ func handleChatCompletion(
 				_ = realTotal // 保留用于未来的扩展
 				go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
 					inputTokens, 0, realInput, realOutput, realTotal, len(toolCalls), apiKey)
-
-				metrics.RecordRequest("POST", "/v1/chat/completions", res.StatusCode, req.Model, time.Since(start).Seconds())
 
 				// 重写响应中的 model 字段
 				body = mapper.RewriteResponse(body, req.Model)
@@ -665,8 +667,6 @@ func handleAnthropicMessages(
 			}
 			go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
 				inputTokens, 0, effInput, effOutput, effTotal, 0, apiKey)
-
-			metrics.RecordRequest("POST", "/v1/messages", protocolResult.StatusCode, req.Model, time.Since(start).Seconds())
 		} else {
 			// 非流式响应：使用 Body（已在 Resolve 中读取并转换）
 			if protocolResult.Response != nil {
@@ -684,8 +684,6 @@ func handleAnthropicMessages(
 			_ = realTotal
 			go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
 				inputTokens, 0, realInput, realOutput, realTotal, len(toolCalls), apiKey)
-
-			metrics.RecordRequest("POST", "/v1/messages", protocolResult.StatusCode, req.Model, time.Since(start).Seconds())
 
 			c.Data(protocolResult.StatusCode, "application/json", protocolResult.Body)
 		}
@@ -984,81 +982,6 @@ func rewriteAnthropicToolCalls(body []byte, providerName string) []byte {
 
 // ================= Token 用量查询 API =================
 
-// handleUsageQuery 按 API Key 查询自己的 token 用量统计（聚合结果，不输出全部记录）
-func handleUsageQuery(tokenService *token.Service, authService *auth.Service) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		apiKeyStr := c.Query("api_key")
-		name := c.Query("name")
-		model := c.Query("model")
-		startTime := c.Query("start_time")
-		endTime := c.Query("end_time")
-
-		// 如果传了 name，先解析为实际 API Key
-		if name != "" && apiKeyStr == "" {
-			if info, ok := authService.FindKeyByName(name); ok {
-				apiKeyStr = info.Key
-			}
-		}
-
-		inputTokens, outputTokens, totalTokens, requestCount, err := tokenService.SumTokensByAPIKey(apiKeyStr, model, startTime, endTime)
-		if err != nil {
-			log.Error().Err(err).Msg("sum tokens failed")
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "query failed"})
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{
-			"input_tokens":  inputTokens,
-			"output_tokens": outputTokens,
-			"total_tokens":  totalTokens,
-			"request_count": requestCount,
-		})
-	}
-}
-
-// handleUsageByID 按 request_id 查询用量（只返回自己的）
-func handleUsageByID(tokenService *token.Service) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		requestID := c.Param("request_id")
-		record, err := tokenService.QueryByRequestID(requestID)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "query failed"})
-			return
-		}
-		if record == nil {
-			c.JSON(http.StatusNotFound, gin.H{"error": "record not found"})
-			return
-		}
-		c.JSON(http.StatusOK, record)
-	}
-}
-
-// handleUsageStats 按 API Key 查询自己的聚合统计
-func handleUsageStats(tokenService *token.Service) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		granularity := c.DefaultQuery("granularity", "daily")
-		startTime := c.Query("start_time")
-		endTime := c.Query("end_time")
-
-		var summaries []storage.UsageSummary
-		var err error
-		switch granularity {
-		case "daily":
-			summaries, err = tokenService.AggregateDaily(startTime, endTime)
-		case "weekly":
-			summaries, err = tokenService.AggregateWeekly(startTime, endTime)
-		case "monthly":
-			summaries, err = tokenService.AggregateMonthly(startTime, endTime)
-		default:
-			summaries, err = tokenService.AggregateDaily(startTime, endTime)
-		}
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "aggregation failed"})
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{"data": summaries, "granularity": granularity})
-	}
-}
-
 // handleAdminUsage 管理员查询所有用量统计（聚合结果）
 func handleAdminUsage(tokenService *token.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -1172,6 +1095,685 @@ func handleAdminUsageByRealModel(tokenService *token.Service) gin.HandlerFunc {
 		c.JSON(http.StatusOK, gin.H{
 			"data":        summaries,
 			"model_count": len(summaries),
+		})
+	}
+}
+
+// handleAdminUsageByAPIKey 管理员按 API Key + 时间粒度查询用量统计
+func handleAdminUsageByAPIKey(authService *auth.Service, tokenService *token.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		apiKey := c.Query("api_key")
+		granularity := c.DefaultQuery("granularity", "daily")
+		startTime := c.Query("start_time")
+		endTime := c.Query("end_time")
+
+		// 支持按名称查询
+		name := c.Query("name")
+		if name != "" && apiKey == "" {
+			if info, ok := authService.FindKeyByName(name); ok {
+				apiKey = info.Key
+			}
+		}
+
+		if apiKey == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "api_key or name is required"})
+			return
+		}
+
+		summaries, err := tokenService.AggregateByAPIKey(apiKey, granularity, startTime, endTime)
+		if err != nil {
+			log.Error().Err(err).Msg("aggregate by api key failed")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "query failed"})
+			return
+		}
+		if summaries == nil {
+			summaries = []storage.UsageSummary{}
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"data":        summaries,
+			"granularity": granularity,
+		})
+	}
+}
+
+// ================= 管理后台扩展 API =================
+
+// handleAdminAPIKeys 列出所有 API Key
+func handleAdminAPIKeys(authService *auth.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		keys := authService.ListSeedKeys()
+		c.JSON(http.StatusOK, gin.H{
+			"data":  keys,
+			"count": len(keys),
+		})
+	}
+}
+
+// handleAdminCreateAPIKey 新增 API Key
+func handleAdminCreateAPIKey(authService *auth.Service, cfg *config.Config) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req struct {
+			Key  string `json:"key"`
+			Name string `json:"name"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+			return
+		}
+		if req.Key == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "key is required"})
+			return
+		}
+		if req.Name == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+			return
+		}
+		if ok := authService.CreateSeedKey(req.Key, req.Name); !ok {
+			c.JSON(http.StatusConflict, gin.H{"error": "key already exists"})
+			return
+		}
+		// 持久化到 config.yaml
+		cfg.APIKeys = append(cfg.APIKeys, config.APIKeyConfig{Key: req.Key, Name: req.Name})
+		if err := cfg.Save(); err != nil {
+			log.Error().Err(err).Msg("failed to save config after creating api key")
+		}
+		c.JSON(http.StatusCreated, gin.H{"message": "key created"})
+	}
+}
+
+// handleAdminDeleteAPIKey 删除 API Key
+func handleAdminDeleteAPIKey(authService *auth.Service, cfg *config.Config) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		key := c.Param("key")
+		if ok := authService.DeleteSeedKey(key); !ok {
+			c.JSON(http.StatusNotFound, gin.H{"error": "key not found"})
+			return
+		}
+		// 从 config.yaml 中移除
+		for i, k := range cfg.APIKeys {
+			if k.Key == key {
+				cfg.APIKeys = append(cfg.APIKeys[:i], cfg.APIKeys[i+1:]...)
+				break
+			}
+		}
+		if err := cfg.Save(); err != nil {
+			log.Error().Err(err).Msg("failed to save config after deleting api key")
+		}
+		c.JSON(http.StatusOK, gin.H{"message": "key deleted"})
+	}
+}
+
+// handleAdminAPIKeyUsage 按 API Key 查询用量统计
+func handleAdminAPIKeyUsage(authService *auth.Service, tokenService *token.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		key := c.Param("key")
+		startTime := c.Query("start_time")
+		endTime := c.Query("end_time")
+
+		inputTokens, outputTokens, totalTokens, requestCount, err := tokenService.SumTokensByAPIKey(key, "", startTime, endTime)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "query failed"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"key":            key,
+			"input_tokens":   inputTokens,
+			"output_tokens":  outputTokens,
+			"total_tokens":   totalTokens,
+			"request_count":  requestCount,
+		})
+	}
+}
+
+// handleAdminProviders 列出所有 Provider 及熔断器状态
+func handleAdminProviders(routerSvc *router.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		breakerStates := routerSvc.BreakerStates()
+		c.JSON(http.StatusOK, gin.H{
+			"breaker_states": breakerStates,
+		})
+	}
+}
+
+// providerNameToEnvKey 把 provider 名转为环境变量 Key
+// 如 "seneenova_me" → "SENEENOVA_ME_KEY"
+func providerNameToEnvKey(name string) string {
+	s := strings.ToUpper(name)
+	s = strings.NewReplacer("-", "_", ".", "_", " ", "_").Replace(s)
+	return s + "_KEY"
+}
+
+// updateEnvFile 在 .env 文件中设置 KEY=VALUE（追加或替换）
+func updateEnvFile(key, value string) error {
+	configDir := filepath.Dir("configs/config.yaml")
+	envPath := filepath.Join(configDir, "..", ".env")
+
+	// 读取当前 .env 文件
+	lines := []string{}
+	data, err := os.ReadFile(envPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("read .env failed: %w", err)
+		}
+	} else {
+		lines = strings.Split(string(data), "\n")
+	}
+
+	// 查找并替换已有的 key，或标记追加
+	found := false
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		eqIdx := strings.Index(trimmed, "=")
+		if eqIdx > 0 && strings.TrimSpace(trimmed[:eqIdx]) == key {
+			lines[i] = key + "=" + value
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		lines = append(lines, key+"="+value)
+	}
+
+	output := strings.Join(lines, "\n")
+	if !strings.HasSuffix(output, "\n") {
+		output += "\n"
+	}
+
+	if err := os.WriteFile(envPath, []byte(output), 0644); err != nil {
+		return fmt.Errorf("write .env failed: %w", err)
+	}
+	return nil
+}
+
+// updateEnvFileRemove 从 .env 文件中移除指定 KEY 的行
+func updateEnvFileRemove(key string) {
+	configDir := filepath.Dir("configs/config.yaml")
+	envPath := filepath.Join(configDir, "..", ".env")
+	data, err := os.ReadFile(envPath)
+	if err != nil {
+		return
+	}
+	lines := strings.Split(string(data), "\n")
+	filtered := make([]string, 0, len(lines))
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		eqIdx := strings.Index(trimmed, "=")
+		if eqIdx > 0 && strings.TrimSpace(trimmed[:eqIdx]) == key {
+			continue
+		}
+		filtered = append(filtered, line)
+	}
+	output := strings.Join(filtered, "\n")
+	if !strings.HasSuffix(output, "\n") {
+		output += "\n"
+	}
+	os.WriteFile(envPath, []byte(output), 0644)
+}
+
+// handleAdminProvidersConfig 列出所有 Provider 配置（隐藏 API Key）
+func handleAdminProvidersConfig(cfg *config.Config) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		type safeProvider struct {
+			BaseURL  string `json:"base_url"`
+			Protocol string `json:"protocol"`
+			Timeout  string `json:"timeout"`
+		}
+		providers := make(map[string]safeProvider)
+		for name, p := range cfg.Providers {
+			providers[name] = safeProvider{
+				BaseURL:  p.BaseURL,
+				Protocol: p.Protocol,
+				Timeout:  p.Timeout.String(),
+			}
+		}
+		c.JSON(http.StatusOK, gin.H{"data": providers})
+	}
+}
+
+// handleAdminAddProvider 新增 Provider 配置
+func handleAdminAddProvider(cfg *config.Config, providerMgr *provider.Manager) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req struct {
+			Name     string `json:"name"`
+			BaseURL  string `json:"base_url"`
+			APIKey   string `json:"api_key"`
+			Protocol string `json:"protocol"`
+			Timeout  string `json:"timeout"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body: " + err.Error()})
+			return
+		}
+		if req.Name == "" || req.BaseURL == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "name and base_url are required"})
+			return
+		}
+		if _, exists := cfg.Providers[req.Name]; exists {
+			c.JSON(http.StatusConflict, gin.H{"error": "provider already exists"})
+			return
+		}
+		if req.Protocol == "" {
+			req.Protocol = "openai"
+		}
+		timeout, err := time.ParseDuration(req.Timeout)
+		if err != nil || timeout <= 0 {
+			timeout = 3000 * time.Second
+		}
+
+		// 处理 API Key：存环境变量引用到 config.yaml，实际值写到 .env
+		apiKeyRef := req.APIKey
+		if apiKeyRef != "" {
+			envKey := providerNameToEnvKey(req.Name)
+			if err := updateEnvFile(envKey, apiKeyRef); err != nil {
+				log.Error().Err(err).Msg("failed to update .env file")
+			}
+			apiKeyRef = "${" + envKey + "}"
+		}
+
+		cfg.Providers[req.Name] = config.ProviderConfig{
+			BaseURL:  req.BaseURL,
+			APIKey:   apiKeyRef,
+			Protocol: req.Protocol,
+			Timeout:  timeout,
+		}
+		if err := cfg.Save(); err != nil {
+			log.Error().Err(err).Msg("failed to save config after adding provider")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist config"})
+			return
+		}
+
+		// 立即生效：用实际 API Key 更新运行时的 Provider
+		providerMgr.UpdateProvider(req.Name, config.ProviderConfig{
+			BaseURL:  req.BaseURL,
+			APIKey:   req.APIKey,
+			Protocol: req.Protocol,
+			Timeout:  timeout,
+		})
+
+		c.JSON(http.StatusCreated, gin.H{"message": "provider added"})
+	}
+}
+
+// handleAdminUpdateProvider 更新 Provider 配置
+func handleAdminUpdateProvider(cfg *config.Config, providerMgr *provider.Manager) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		name := c.Param("name")
+		if _, exists := cfg.Providers[name]; !exists {
+			c.JSON(http.StatusNotFound, gin.H{"error": "provider not found"})
+			return
+		}
+		var req struct {
+			BaseURL  string `json:"base_url"`
+			APIKey   string `json:"api_key"`
+			Protocol string `json:"protocol"`
+			Timeout  string `json:"timeout"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body: " + err.Error()})
+			return
+		}
+		p := cfg.Providers[name]
+		actualKey := ""
+		if req.BaseURL != "" {
+			p.BaseURL = req.BaseURL
+		}
+		if req.Protocol != "" {
+			p.Protocol = req.Protocol
+		}
+		if req.APIKey != "" {
+			actualKey = req.APIKey
+			envKey := providerNameToEnvKey(name)
+			if err := updateEnvFile(envKey, actualKey); err != nil {
+				log.Error().Err(err).Msg("failed to update .env file")
+			}
+			p.APIKey = "${" + envKey + "}"
+		}
+		if req.Timeout != "" {
+			timeout, err := time.ParseDuration(req.Timeout)
+			if err == nil && timeout > 0 {
+				p.Timeout = timeout
+			}
+		}
+		cfg.Providers[name] = p
+		if err := cfg.Save(); err != nil {
+			log.Error().Err(err).Msg("failed to save config after updating provider")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist config"})
+			return
+		}
+
+		// 立即生效：更新运行时的 Provider
+		providerMgr.UpdateProvider(name, config.ProviderConfig{
+			BaseURL:  p.BaseURL,
+			APIKey:   actualKey,
+			Protocol: p.Protocol,
+			Timeout:  p.Timeout,
+		})
+		if actualKey == "" {
+			// 没有新 API Key，从环境变量取回实际值
+			ref := p.APIKey
+			if strings.HasPrefix(ref, "$") && strings.HasSuffix(ref, "}") {
+				if envVal := os.Getenv(ref[2 : len(ref)-1]); envVal != "" {
+					if prov, ok := providerMgr.Get(name); ok {
+						prov.SetAPIKey(envVal)
+					}
+				}
+			}
+		}
+
+		c.JSON(http.StatusOK, gin.H{"message": "provider updated"})
+	}
+}
+
+// handleAdminDeleteProvider 删除 Provider 配置
+func handleAdminDeleteProvider(cfg *config.Config, providerMgr *provider.Manager) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		name := c.Param("name")
+		if _, exists := cfg.Providers[name]; !exists {
+			c.JSON(http.StatusNotFound, gin.H{"error": "provider not found"})
+			return
+		}
+		delete(cfg.Providers, name)
+		if err := cfg.Save(); err != nil {
+			log.Error().Err(err).Msg("failed to save config after deleting provider")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist config"})
+			return
+		}
+
+		// 立即生效：删除运行时的 Provider
+		providerMgr.DeleteProvider(name)
+
+		// 清理 .env 中的对应环境变量
+		envKey := providerNameToEnvKey(name)
+		updateEnvFileRemove(envKey)
+
+		c.JSON(http.StatusOK, gin.H{"message": "provider deleted"})
+	}
+}
+
+// handleAdminModels 列出所有虚拟模型
+func handleAdminModels(mapperService *mapper.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		models := mapperService.ListVirtualModels()
+		c.JSON(http.StatusOK, gin.H{
+			"data":  models,
+			"count": len(models),
+		})
+	}
+}
+
+// handleAdminAddModel 新增虚拟模型
+func handleAdminAddModel(mapperService *mapper.Service, cfg *config.Config) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req struct {
+			Name string `json:"name"`
+			Tier string `json:"tier"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+			return
+		}
+		if req.Name == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+			return
+		}
+		if ok := mapperService.AddModel(req.Name, req.Tier); !ok {
+			c.JSON(http.StatusConflict, gin.H{"error": "model already exists"})
+			return
+		}
+		// 持久化：更新 Config.Models
+		cfg.Models = append(cfg.Models, config.ModelEntry{Name: req.Name, Tier: req.Tier})
+		if err := cfg.Save(); err != nil {
+			log.Error().Err(err).Msg("failed to save config after add model")
+		}
+		c.JSON(http.StatusCreated, gin.H{"message": "model added"})
+	}
+}
+
+// handleAdminDeleteModel 删除虚拟模型
+func handleAdminDeleteModel(mapperService *mapper.Service, cfg *config.Config) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		name := c.Param("name")
+		// URL encode support
+		if decoded, err := pathUnescape(name); err == nil {
+			name = decoded
+		}
+		if ok := mapperService.DeleteModel(name); !ok {
+			c.JSON(http.StatusNotFound, gin.H{"error": "model not found"})
+			return
+		}
+		// 持久化：从 Config.Models 中移除
+		for i, m := range cfg.Models {
+			if m.Name == name {
+				cfg.Models = append(cfg.Models[:i], cfg.Models[i+1:]...)
+				break
+			}
+		}
+		if err := cfg.Save(); err != nil {
+			log.Error().Err(err).Msg("failed to save config after delete model")
+		}
+		c.JSON(http.StatusOK, gin.H{"message": "model deleted"})
+	}
+}
+
+// pathUnescape 简单的 URL 解码
+func pathUnescape(s string) (string, error) {
+	return url.PathUnescape(s)
+}
+
+// handleAdminRealModels 列出所有 real_model 路由配置
+func handleAdminRealModels(routerSvc *router.Service, cfg *config.Config) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"strategy": routerSvc.GetStrategy(),
+			"models":   cfg.RealModels.Models,
+		})
+	}
+}
+
+// handleAdminAddRealModel 新增 real_model 路由配置
+func handleAdminAddRealModel(cfg *config.Config) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req struct {
+			Provider string  `json:"provider"`
+			Model    string  `json:"model"`
+			Weight   int     `json:"weight"`
+			Tier     string  `json:"tier"`
+			Cost     float64 `json:"cost"`
+			Timeout  string  `json:"timeout"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body: " + err.Error()})
+			return
+		}
+		if req.Provider == "" || req.Model == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "provider and model are required"})
+			return
+		}
+		if req.Weight <= 0 {
+			req.Weight = 1
+		}
+		timeout, err := time.ParseDuration(req.Timeout)
+		if err != nil || timeout <= 0 {
+			timeout = 3000 * time.Second
+		}
+		item := config.FallbackItem{
+			Provider: req.Provider,
+			Model:    req.Model,
+			Weight:   req.Weight,
+			Tier:     req.Tier,
+			Cost:     req.Cost,
+			Timeout:  timeout,
+		}
+		cfg.RealModels.Models = append(cfg.RealModels.Models, item)
+		if err := cfg.Save(); err != nil {
+			log.Error().Err(err).Msg("failed to save config after adding real model")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist config"})
+			return
+		}
+		c.JSON(http.StatusCreated, gin.H{"message": "real model added", "model": item})
+	}
+}
+
+// handleAdminUpdateRealModel 更新 real_model 路由配置（按索引）
+func handleAdminUpdateRealModel(cfg *config.Config) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		idx, err := parseIndex(c.Param("index"), len(cfg.RealModels.Models))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		var req struct {
+			Provider string  `json:"provider"`
+			Model    string  `json:"model"`
+			Weight   int     `json:"weight"`
+			Tier     string  `json:"tier"`
+			Cost     float64 `json:"cost"`
+			Timeout  string  `json:"timeout"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body: " + err.Error()})
+			return
+		}
+		if req.Provider == "" || req.Model == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "provider and model are required"})
+			return
+		}
+		if req.Weight <= 0 {
+			req.Weight = 1
+		}
+		timeout, err := time.ParseDuration(req.Timeout)
+		if err != nil || timeout <= 0 {
+			timeout = 3000 * time.Second
+		}
+		item := config.FallbackItem{
+			Provider: req.Provider,
+			Model:    req.Model,
+			Weight:   req.Weight,
+			Tier:     req.Tier,
+			Cost:     req.Cost,
+			Timeout:  timeout,
+		}
+		cfg.RealModels.Models[idx] = item
+		if err := cfg.Save(); err != nil {
+			log.Error().Err(err).Msg("failed to save config after updating real model")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist config"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"message": "real model updated", "model": item})
+	}
+}
+
+// handleAdminDeleteRealModel 删除 real_model 路由配置（按索引）
+func handleAdminDeleteRealModel(cfg *config.Config) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		idx, err := parseIndex(c.Param("index"), len(cfg.RealModels.Models))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		removed := cfg.RealModels.Models[idx]
+		cfg.RealModels.Models = append(cfg.RealModels.Models[:idx], cfg.RealModels.Models[idx+1:]...)
+		if err := cfg.Save(); err != nil {
+			log.Error().Err(err).Msg("failed to save config after deleting real model")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist config"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"message": "real model deleted", "model": removed})
+	}
+}
+
+// parseIndex 解析路径中的索引参数
+func parseIndex(raw string, length int) (int, error) {
+	var n int
+	if _, err := fmt.Sscanf(raw, "%d", &n); err != nil {
+		return 0, fmt.Errorf("invalid index: %w", err)
+	}
+	if n < 0 || n >= length {
+		return 0, fmt.Errorf("index out of range: %d (valid: 0-%d)", n, length-1)
+	}
+	return n, nil
+}
+
+// handleAdminUpdateStrategy 更新路由策略
+func handleAdminUpdateStrategy(routerSvc *router.Service, cfg *config.Config) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req struct {
+			Strategy string `json:"strategy"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+			return
+		}
+		valid := map[string]bool{"priority": true, "round_robin": true, "latency_optimized": true, "cost_optimized": true}
+		if !valid[req.Strategy] {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid strategy, must be one of: priority, round_robin, latency_optimized, cost_optimized"})
+			return
+		}
+		routerSvc.SetStrategy(req.Strategy)
+		// 持久化
+		cfg.RealModels.Strategy = req.Strategy
+		if err := cfg.Save(); err != nil {
+			log.Error().Err(err).Msg("failed to save config after strategy update")
+		}
+		c.JSON(http.StatusOK, gin.H{"message": "strategy updated", "strategy": req.Strategy})
+	}
+}
+
+// handleAdminConfig 返回当前配置概览
+func handleAdminConfig(appCfg config.AppConfig, mapperService *mapper.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		models := mapperService.ListVirtualModels()
+		c.JSON(http.StatusOK, gin.H{
+			"app": gin.H{
+				"name":    appCfg.Name,
+				"version": appCfg.Version,
+				"env":     appCfg.Env,
+				"port":    appCfg.Port,
+			},
+			"virtual_model_count": len(models),
+		})
+	}
+}
+
+// handleAdminLogin 管理后台登录
+func handleAdminLogin(cfg *config.Config) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req struct {
+			Password string `json:"password"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+			return
+		}
+
+		if cfg.Admin.Password != "" && req.Password != cfg.Admin.Password {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid password"})
+			return
+		}
+
+		expiry := cfg.Admin.TokenExpiry
+		if expiry <= 0 {
+			expiry = 24 * time.Hour
+		}
+
+		token, exp, err := middleware.GenerateAdminToken(cfg.Admin.JWTSecret, expiry)
+		if err != nil {
+			log.Error().Err(err).Msg("failed to generate admin token")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate token"})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"token":       token,
+			"expires_in":  exp,
+			"token_type":  "Bearer",
 		})
 	}
 }

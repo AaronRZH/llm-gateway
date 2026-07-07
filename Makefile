@@ -16,6 +16,7 @@ darwin-amd64:
 	GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" \
 		-o $(BUILD_DIR)/darwin-amd64/$(APP_NAME) ./cmd/gateway
 	@cp -r configs $(BUILD_DIR)/darwin-amd64/
+	@cp -r web $(BUILD_DIR)/darwin-amd64/
 
 # macOS Apple Silicon (arm64)
 darwin-arm64:
@@ -23,6 +24,7 @@ darwin-arm64:
 	GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" \
 		-o $(BUILD_DIR)/darwin-arm64/$(APP_NAME) ./cmd/gateway
 	@cp -r configs $(BUILD_DIR)/darwin-arm64/
+	@cp -r web $(BUILD_DIR)/darwin-arm64/
 
 # Linux x86_64
 linux-amd64:
@@ -30,6 +32,7 @@ linux-amd64:
 	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" \
 		-o $(BUILD_DIR)/linux-amd64/$(APP_NAME) ./cmd/gateway
 	@cp -r configs $(BUILD_DIR)/linux-amd64/
+	@cp -r web $(BUILD_DIR)/linux-amd64/
 
 # Windows x86_64
 windows-amd64:
@@ -37,6 +40,7 @@ windows-amd64:
 	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" \
 		-o $(BUILD_DIR)/windows-amd64/$(APP_NAME).exe ./cmd/gateway
 	@cp -r configs $(BUILD_DIR)/windows-amd64/
+	@cp -r web $(BUILD_DIR)/windows-amd64/
 
 # 打包所有平台 + 包含 .evn.example 到每个压缩包
 package: darwin-amd64 darwin-arm64 linux-amd64 windows-amd64

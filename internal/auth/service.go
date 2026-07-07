@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -64,6 +65,74 @@ func (s *Service) FindKeyByName(name string) (*KeyInfo, bool) {
 		}
 	}
 	return nil, false
+}
+
+// ListSeedKeys 返回所有种子 Key（管理后台用）
+func (s *Service) ListSeedKeys() []*KeyInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	keys := make([]*KeyInfo, 0, len(s.seedKeys))
+	for _, info := range s.seedKeys {
+		// 拷贝一份避免外部修改
+		infoCopy := *info
+		keys = append(keys, &infoCopy)
+	}
+	return keys
+}
+
+// CreateSeedKey 新增一个种子 Key
+func (s *Service) CreateSeedKey(key string, name string) bool {
+	if key == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.seedKeys[key]; ok {
+		return false // 已存在
+	}
+	info := &KeyInfo{
+		Key:       key,
+		Name:      name,
+		CreatedAt: time.Now(),
+	}
+	s.seedKeys[key] = info
+	// 同步到 Redis
+	if s.rdb != nil {
+		ctx := context.Background()
+		pipe := s.rdb.Pipeline()
+		pipe.HSet(ctx, apikeyPrefix+key, "name", name)
+		pipe.HSet(ctx, apikeyPrefix+key, "created_at", info.CreatedAt.Format(time.RFC3339))
+		pipe.Expire(ctx, apikeyPrefix+key, 0)
+		if _, err := pipe.Exec(ctx); err != nil {
+			log.Warn().Err(err).Str("key_prefix", key[:min(8, len(key))]+"...").Msg("create key sync to redis failed")
+		}
+	}
+	return true
+}
+
+// DeleteSeedKey 删除一个种子 Key
+func (s *Service) DeleteSeedKey(key string) bool {
+	if key == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.seedKeys[key]; !ok {
+		return false // 不存在
+	}
+	delete(s.seedKeys, key)
+	// 从本地缓存中清除
+	for k := range s.cache {
+		if strings.HasPrefix(k, key) {
+			delete(s.cache, k)
+		}
+	}
+	// 从 Redis 中删除
+	if s.rdb != nil {
+		ctx := context.Background()
+		_ = s.rdb.Del(ctx, apikeyPrefix+key)
+	}
+	return true
 }
 
 // Validate 验证 API Key 是否有效

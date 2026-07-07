@@ -54,7 +54,8 @@ type UsageStorage interface {
 	AggregateWeekly(startTime, endTime string) ([]UsageSummary, error)
 	AggregateMonthly(startTime, endTime string) ([]UsageSummary, error)
 	AggregateByRealModel(startTime, endTime string) ([]UsageSummary, error)
-	SumTokensByAPIKey(apiKey, model, startTime, endTime string) (inputTokens, outputTokens, totalTokens, requestCount int, err error)
+	AggregateByAPIKey(apiKey, granularity, startTime, endTime string) ([]UsageSummary, error)
+		SumTokensByAPIKey(apiKey, model, startTime, endTime string) (inputTokens, outputTokens, totalTokens, requestCount int, err error)
 	SumTokensByTimeRange(startTime, endTime string) (inputTokens, outputTokens, totalTokens, requestCount int, err error)
 	AdminTotalStats(startTime, endTime string) (map[string]int64, error)
 	AdminDailyStats(startTime, endTime string) ([]UsageSummary, error)
@@ -178,6 +179,21 @@ func (s *FileStorage) AdminTotalStats(startTime, endTime string) (map[string]int
 
 func (s *FileStorage) AdminDailyStats(startTime, endTime string) ([]UsageSummary, error) {
 	return s.AggregateDaily(startTime, endTime)
+}
+
+// AggregateByAPIKey 按 API Key + 时间粒度聚合统计
+func (s *FileStorage) AggregateByAPIKey(apiKey, granularity, startTime, endTime string) ([]UsageSummary, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	records, _ := s.filter(s.records, apiKey, "", startTime, endTime)
+	switch granularity {
+	case "weekly":
+		return s.summarizeWeekly(records)
+	case "monthly":
+		return s.summarizeMonthly(records), nil
+	default:
+		return s.summarizeDaily(records)
+	}
 }
 
 // AggregateByRealModel 按 real_model 聚合 token 统计（所有 provider 分别统计）
@@ -322,6 +338,7 @@ func (s *FileStorage) summarizeMonthly(records []UsageRecord) []UsageSummary {
 		b, ok := buckets[key]
 		if !ok {
 			buckets[key] = &UsageSummary{Date: key.Month, Model: key.Model, Provider: key.Provider}
+			b = buckets[key]
 		}
 		b.TotalInput += r.InputTokens
 		b.TotalOutput += r.OutputTokens
@@ -530,6 +547,22 @@ func (s *RedisStorage) AdminTotalStats(startTime, endTime string) (map[string]in
 
 func (s *RedisStorage) AdminDailyStats(startTime, endTime string) ([]UsageSummary, error) {
 	return s.AggregateDaily(startTime, endTime)
+}
+
+// AggregateByAPIKey 按 API Key + 时间粒度聚合统计
+func (s *RedisStorage) AggregateByAPIKey(apiKey, granularity, startTime, endTime string) ([]UsageSummary, error) {
+	raw, err := s.redis.LRange(s.ctx, "usage:recent:"+apiKey, 0, -1).Result()
+	if err != nil {
+		return nil, err
+	}
+	switch granularity {
+	case "weekly":
+		return s.summarizeRecordsWeekly(raw, startTime, endTime)
+	case "monthly":
+		return s.summarizeRecordsMonthly(raw, startTime, endTime), nil
+	default:
+		return s.summarizeRecordsDaily(raw, startTime, endTime)
+	}
 }
 
 func (s *RedisStorage) Close() error { return nil }
