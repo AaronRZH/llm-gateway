@@ -1,16 +1,16 @@
 # LLM Gateway
 
-大模型 API 网关，支持多 Provider 路由、协议自动转换（OpenAI ↔ Anthropic）、Token 用量统计与持久化、熔断降级、限流与监控。
+大模型 API 网关，支持多 Provider 路由、协议自动转换（OpenAI ↔ Anthropic）、Token 用量统计与持久化、熔断降级、限流与内置管理后台。
 
 ## 核心特性
 
-- **多 Provider 路由** — 支持 OpenAI / Anthropic / DeepSeek / 商汤日日新 / 小米 Turbo 等多个上游，按 priority / round_robin / latency_optimized / cost_optimized 策略自动选路
+- **多 Provider 路由** — 支持 OpenAI / Anthropic / DeepSeek / 商汤日日新 / 小米 Turbo / GLM / NVIDIA 等多个上游，按 priority / round_robin / latency_optimized / cost_optimized 策略自动选路
 - **协议转换** — 客户端使用 OpenAI 格式，自动转换为 Anthropic 格式发往上游，反之亦然（非流式 + SSE 流式）
 - **模型 Tier 分级** — 虚拟模型名支持 `premium / standard / economy` 分级，路由时自动按级匹配和降级 fallback
 - **Token 估算 & 用量持久化** — 基于 `tiktoken-go` 本地估算，同时获取上游真实用量，写入 PostgreSQL（支持文件降级）
 - **熔断保护** — 基于 `gobreaker` 的熔断器，Provider 异常时自动降级到其他候选
 - **API Key 管理** — 支持配置文件种子 Key + Redis 动态 Key，三层缓存验证
-- **Prometheus 监控** — 请求数 / 耗时 / Token 用量 / 上游延迟 / 熔断器状态
+- **内置管理后台** — Web 管理界面 + REST API，支持 JWT / Basic Auth 认证，动态管理 Provider、API Key、模型配置
 - **SSE 流式转发** — 实时转发并重写 model 字段，兼容客户端 SDK
 
 ## 架构概览
@@ -25,9 +25,11 @@
 ├──────────────┤     │              │     ├─────────────────┤
 │              │     │              │     │  商汤 (OpenAI)    │
 │ Anthropic    │────▶│              │────▶├─────────────────┤
-│ SDK          │     │              │     │  小米 Turbo (OAI)│
-│ (/messages)  │     │              │     └─────────────────┘
-└──────────────┘     └──────┬───────┘
+│ SDK          │     │  管理后台     │     │  小米 Turbo (OAI)│
+│ (/messages)  │     │   /admin     │     ├─────────────────┤
+└──────────────┘     │              │     │  GLM / NVIDIA   │
+                     │  Web UI      │     └─────────────────┘
+                     └──────┬───────┘
                             │
                     ┌───────┴───────┐
                     │               │
@@ -63,12 +65,12 @@
 | 组件 | 库 |
 |---|---|
 | Web 框架 | [Gin](https://github.com/gin-gonic/gin) |
-| 配置管理 | [Viper](https://github.com/spf13/viper) |
+| 配置管理 | [Viper](https://github.com/spf13/viper) + YAML 序列化 |
 | PostgreSQL | [pgx/v5](https://github.com/jackc/pgx) |
 | Redis | [go-redis](https://github.com/redis/go-redis) |
 | Token 估算 | [tiktoken-go](https://github.com/pkoukk/tiktoken-go) |
 | 熔断器 | [gobreaker](https://github.com/sony/gobreaker) |
-| 监控 | [Prometheus](https://prometheus.io/) |
+| 管理后台认证 | [golang-jwt/jwt/v5](https://github.com/golang-jwt/jwt) |
 | 日志 | [zerolog](https://github.com/rs/zerolog) |
 
 ## 快速开始
@@ -97,8 +99,12 @@ ANTHROPIC_AUTH_TOKEN=sk-ant-xxx
 DEEPSEEK_API_KEY=sk-xxx
 SENSENOVA_AUTH_TOKEN=sk-xxx
 XIAOMI_TP_AUTH_TOKEN=tp-xxx
+GLM_AUTH_TOKEN=xxx
+NVIDIA_AUTH_TOKEN=xxx
 REDIS_PASSWORD=password
 POSTGRES_PASSWORD=password
+ADMIN_PASSWORD=your_admin_password_here
+ADMIN_JWT_SECRET=your_admin_jwt_secret_here
 ```
 
 ### 2. 启动依赖服务
@@ -142,6 +148,9 @@ curl http://localhost:8080/v1/messages \
     "messages": [{"role": "user", "content": "Hello!"}],
     "max_tokens": 1024
   }'
+
+# 打开管理后台
+open http://localhost:8080/admin
 ```
 
 ## 配置指南
@@ -283,9 +292,16 @@ api_keys:
 # 跳过认证的路径（支持 /* 前缀匹配）
 auth_whitelist:
   - "/health"
-  - "/metrics"
-  - "/usage/*"
   - "/admin/*"
+```
+
+### 管理员配置
+
+```yaml
+admin:
+  password: "${ADMIN_PASSWORD}"      # 管理员登录密码（支持 ${ENV_VAR} 引用）
+  jwt_secret: "${ADMIN_JWT_SECRET}"  # JWT 签名密钥（为空时自动生成 256-bit 随机密钥）
+  token_expiry: 24h                  # JWT token 有效期
 ```
 
 ## API 接口
@@ -300,31 +316,53 @@ auth_whitelist:
 | `POST /v1/messages/count_tokens` | Anthropic 格式 | 计数 tokens |
 | `GET /v1/models` | OpenAI 格式 | 列出可用模型 |
 
-### 用量查询
+### 管理员查询接口（无需认证）
 
 | 端点 | 说明 |
 |---|---|
-| `GET /usage` | 按 API Key 查询用量（支持 model / time range 过滤） |
-| `GET /usage/{request_id}` | 按请求 ID 查询单条记录 |
-| `GET /usage/stats` | 聚合统计（日 / 周 / 月） |
-
-### 管理接口
-
-| 端点 | 说明 |
-|---|---|
-| `GET /admin/usage` | 管理员：时间范围内总 Token 数 |
-| `GET /admin/usage/daily` | 管理员：每日聚合统计 |
-| `GET /admin/usage/stats` | 管理员：总请求数 / Token 数统计 |
-| `GET /admin/usage/by-real-model` | 管理员：按真实模型 (real_model) 汇总 Token 统计 |
+| `GET /admin/usage` | 时间范围内总 Token 数 |
+| `GET /admin/usage/daily` | 每日聚合统计 |
+| `GET /admin/usage/stats` | 总请求数 / Token 数统计 |
+| `GET /admin/usage/by-real-model` | 按真实模型 (real_model) 汇总 Token 统计 |
+| `GET /admin/usage/by-api-key` | 按 API Key + 时间粒度查询用量统计 |
 | `GET /admin/calibration` | 本地估算 vs 上游真实用量的校准比例 |
 | `GET /admin/breakers` | 查看所有熔断器状态 |
 
-### 监控
+### 管理后台 API（需 JWT / Basic Auth 认证）
+
+| 端点 | 方法 | 说明 |
+|---|---|---|
+| `POST /admin/login` | POST | 管理员登录，返回 JWT token |
+| `GET /admin/api-keys` | GET | 列出所有 API Key |
+| `POST /admin/api-keys` | POST | 新增 API Key |
+| `DELETE /admin/api-keys/:key` | DELETE | 删除 API Key |
+| `GET /admin/api-keys/:key/usage` | GET | 查询指定 API Key 的用量统计 |
+| `GET /admin/providers` | GET | 列出所有 Provider 熔断器状态 |
+| `GET /admin/providers/config` | GET | 列出所有 Provider 配置（隐藏 API Key） |
+| `POST /admin/providers` | POST | 新增 Provider |
+| `PUT /admin/providers/:name` | PUT | 更新 Provider 配置 |
+| `DELETE /admin/providers/:name` | DELETE | 删除 Provider |
+| `GET /admin/models` | GET | 列出所有虚拟模型 |
+| `POST /admin/models` | POST | 新增虚拟模型 |
+| `DELETE /admin/models/:name` | DELETE | 删除虚拟模型 |
+| `GET /admin/real-models` | GET | 列出所有真实模型（real_models） |
+| `POST /admin/real-models` | POST | 新增 real_model 条目 |
+| `PUT /admin/real-models/:index` | PUT | 更新 real_model 条目 |
+| `DELETE /admin/real-models/:index` | DELETE | 删除 real_model 条目 |
+| `PATCH /admin/real-models/strategy` | PATCH | 更新路由策略 |
+| `GET /admin/config` | GET | 查看运行中配置摘要 |
+| `GET /admin` | GET | 管理后台 Web UI（SPA） |
+| `GET /admin/assets/*` | GET | 静态资源文件 |
+
+> **认证方式**: 管理后台 API 支持两种认证方式：
+> 1. **JWT Bearer**（推荐）— `POST /admin/login` 获取 token，后续请求使用 `Authorization: Bearer <token>`
+> 2. **Basic Auth** — `Authorization: Basic base64("admin:<password>")`（需配置 `admin.password`）
+
+### 通用
 
 | 端点 | 说明 |
 |---|---|
 | `GET /health` | 健康检查 |
-| `GET /metrics` | Prometheus 指标（JSON / Prometheus 格式） |
 
 ## Token 用量持久化
 
@@ -357,6 +395,25 @@ CREATE TABLE usage_records (
 );
 ```
 
+## 管理后台
+
+网关内置 Web 管理界面，支持浏览器直接访问 `http://localhost:8080/admin`。
+
+### 登录方式
+
+1. 配置 `ADMIN_PASSWORD` 环境变量
+2. 打开 `http://localhost:8080/admin`
+3. 在登录页面输入密码，获取 JWT token（自动存储到 localStorage）
+4. 后续 API 请求自动携带 Bearer token
+
+### 管理能力
+
+- **Provider 管理** — 新增/编辑/删除上游 Provider，实时生效
+- **API Key 管理** — 新增/删除访问密钥，同步至 Redis
+- **模型配置管理** — 管理虚拟模型和 real_model 列表，切换路由策略
+- **用量监控** — 按 API Key / 模型 / 时间粒度查询 Token 用量
+- **熔断器状态** — 实时查看各 Provider 熔断器状态
+
 ## 项目结构
 
 ```
@@ -368,14 +425,13 @@ llm-gateway/
 │   ├── auth/
 │   │   └── service.go       # API Key 验证（本地缓存 + 种子 Key + Redis）
 │   ├── config/
-│   │   └── config.go        # 配置结构体定义与加载（Viper）
+│   │   └── config.go        # 配置结构体定义与加载（Viper + YAML 序列化）
 │   ├── health/
 │   │   └── health.go        # 健康检查端点
 │   ├── mapper/
 │   │   └── mapper.go        # 模型名 allowlist + 响应 model 字段重写
-│   ├── metrics/
-│   │   └── metrics.go       # Prometheus 指标注册与暴露
 │   ├── middleware/
+│   │   ├── adminauth.go     # 管理后台 JWT / Basic Auth 认证中间件
 │   │   ├── auth.go          # API Key 认证中间件（Bearer / x-api-key）
 │   │   ├── cors.go          # CORS 中间件
 │   │   ├── logger.go        # 请求日志中间件
@@ -406,6 +462,13 @@ llm-gateway/
 │   │   └── client.go        # Redis 客户端工厂
 │   └── tokenizer/
 │       └── tokenizer.go     # tiktoken 估算工具
+├── web/
+│   └── static/
+│       ├── index.html       # 管理后台 SPA 入口
+│       ├── css/
+│       │   └── dashboard.css
+│       └── js/
+│           └── dashboard.js
 ├── configs/
 │   ├── config.yaml          # 开发环境配置
 │   └── config.prod.yaml     # 生产环境配置覆盖
@@ -413,7 +476,7 @@ llm-gateway/
 │   ├── docker/
 │   │   ├── Dockerfile
 │   │   ├── docker-compose.yml
-│   │   └── prometheus.yml
+│   │   └── prometheus.yml   # Prometheus 配置（保留兼容，但网关不再暴露 /metrics）
 │   └── k8s/
 │       ├── deployment.yaml
 │       └── secret.yaml
@@ -429,7 +492,7 @@ llm-gateway/
 # 构建镜像
 make docker
 
-# 启动完整服务栈（gateway + postgres + redis + prometheus）
+# 启动完整服务栈（gateway + postgres + redis）
 make docker-run
 
 # 仅启动数据库
@@ -441,18 +504,7 @@ make docker-down
 
 网关在 Docker Compose 中运行在 `prod` 模式，自动读取项目根目录的 `.env` 文件配置。
 
-## 监控
-
-Prometheus 指标暴露在 `/metrics`（JSON 和 Prometheus 文本格式均可）：
-
-| 指标 | 类型 | 说明 |
-|---|---|---|
-| `llm_gateway_requests_total` | Counter | 请求总数（按 method/path/status/model） |
-| `llm_gateway_request_duration_seconds` | Histogram | 请求耗时 |
-| `llm_gateway_upstream_latency_seconds` | Histogram | 上游 Provider 延迟 |
-| `llm_gateway_token_usage_total` | Counter | Token 用量（按 model/type） |
-| `llm_gateway_circuit_breaker_state` | Gauge | 熔断器状态（0=关闭, 1=开启, 2=半开） |
-| `llm_gateway_rate_limit_hits_total` | Counter | 限流命中次数 |
+> **注意**：Docker Compose 中仍包含 Prometheus 容器（端口 9091），但网关已不再暴露 `/metrics` 端点。如需监控请自行配置或移除 Prometheus 服务。
 
 ## 协议转换矩阵
 
@@ -501,7 +553,7 @@ make package
 | `docker-up-db` | 启动 PostgreSQL + Redis |
 | `docker-up-redis` | 仅启动 Redis |
 | `docker-up-postgres` | 仅启动 PostgreSQL |
-| `package` | 跨平台打包（darwin/linux/windows） |
+| `package` | 跨平台打包（darwin/linux/windows，含 web 资源） |
 | `fmt` | 代码格式化 |
 | `lint` | Lint 检查 |
 | `deps` | 依赖管理 |
