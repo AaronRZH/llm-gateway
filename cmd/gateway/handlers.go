@@ -1174,7 +1174,7 @@ func handleAdminCreateAPIKey(authService *auth.Service, cfg *config.Config) gin.
 		}
 		// 持久化到 config.yaml
 		cfg.APIKeys = append(cfg.APIKeys, config.APIKeyConfig{Key: req.Key, Name: req.Name})
-		if err := cfg.Save(); err != nil {
+		if err := cfg.AppendAPIKey(config.APIKeyConfig{Key: req.Key, Name: req.Name}); err != nil {
 			log.Error().Err(err).Msg("failed to save config after creating api key")
 		}
 		c.JSON(http.StatusCreated, gin.H{"message": "key created"})
@@ -1196,7 +1196,7 @@ func handleAdminDeleteAPIKey(authService *auth.Service, cfg *config.Config) gin.
 				break
 			}
 		}
-		if err := cfg.Save(); err != nil {
+		if err := cfg.RemoveAPIKey(key); err != nil {
 			log.Error().Err(err).Msg("failed to save config after deleting api key")
 		}
 		c.JSON(http.StatusOK, gin.H{"message": "key deleted"})
@@ -1383,7 +1383,7 @@ func handleAdminAddProvider(cfg *config.Config, providerMgr *provider.Manager) g
 			Protocol: req.Protocol,
 			Timeout:  timeout,
 		}
-		if err := cfg.Save(); err != nil {
+		if err := cfg.SaveProvider(req.Name, cfg.Providers[req.Name]); err != nil {
 			log.Error().Err(err).Msg("failed to save config after adding provider")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist config"})
 			return
@@ -1442,7 +1442,7 @@ func handleAdminUpdateProvider(cfg *config.Config, providerMgr *provider.Manager
 			}
 		}
 		cfg.Providers[name] = p
-		if err := cfg.Save(); err != nil {
+		if err := cfg.SaveProvider(name, cfg.Providers[name]); err != nil {
 			log.Error().Err(err).Msg("failed to save config after updating provider")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist config"})
 			return
@@ -1480,7 +1480,7 @@ func handleAdminDeleteProvider(cfg *config.Config, providerMgr *provider.Manager
 			return
 		}
 		delete(cfg.Providers, name)
-		if err := cfg.Save(); err != nil {
+		if err := cfg.DeleteProvider(name); err != nil {
 			log.Error().Err(err).Msg("failed to save config after deleting provider")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist config"})
 			return
@@ -1529,7 +1529,7 @@ func handleAdminAddModel(mapperService *mapper.Service, cfg *config.Config) gin.
 		}
 		// 持久化：更新 Config.Models
 		cfg.Models = append(cfg.Models, config.ModelEntry{Name: req.Name, Tier: req.Tier})
-		if err := cfg.Save(); err != nil {
+		if err := cfg.AppendModel(config.ModelEntry{Name: req.Name, Tier: req.Tier}); err != nil {
 			log.Error().Err(err).Msg("failed to save config after add model")
 		}
 		c.JSON(http.StatusCreated, gin.H{"message": "model added"})
@@ -1555,7 +1555,7 @@ func handleAdminDeleteModel(mapperService *mapper.Service, cfg *config.Config) g
 				break
 			}
 		}
-		if err := cfg.Save(); err != nil {
+		if err := cfg.RemoveModel(name); err != nil {
 			log.Error().Err(err).Msg("failed to save config after delete model")
 		}
 		c.JSON(http.StatusOK, gin.H{"message": "model deleted"})
@@ -1612,7 +1612,7 @@ func handleAdminAddRealModel(cfg *config.Config) gin.HandlerFunc {
 			Timeout:  timeout,
 		}
 		cfg.RealModels.Models = append(cfg.RealModels.Models, item)
-		if err := cfg.Save(); err != nil {
+		if err := cfg.AppendRealModel(item); err != nil {
 			log.Error().Err(err).Msg("failed to save config after adding real model")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist config"})
 			return
@@ -1661,7 +1661,7 @@ func handleAdminUpdateRealModel(cfg *config.Config) gin.HandlerFunc {
 			Timeout:  timeout,
 		}
 		cfg.RealModels.Models[idx] = item
-		if err := cfg.Save(); err != nil {
+		if err := cfg.UpdateRealModel(idx, item); err != nil {
 			log.Error().Err(err).Msg("failed to save config after updating real model")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist config"})
 			return
@@ -1680,7 +1680,7 @@ func handleAdminDeleteRealModel(cfg *config.Config) gin.HandlerFunc {
 		}
 		removed := cfg.RealModels.Models[idx]
 		cfg.RealModels.Models = append(cfg.RealModels.Models[:idx], cfg.RealModels.Models[idx+1:]...)
-		if err := cfg.Save(); err != nil {
+		if err := cfg.RemoveRealModel(idx); err != nil {
 			log.Error().Err(err).Msg("failed to save config after deleting real model")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist config"})
 			return
@@ -1719,7 +1719,7 @@ func handleAdminUpdateStrategy(routerSvc *router.Service, cfg *config.Config) gi
 		routerSvc.SetStrategy(req.Strategy)
 		// 持久化
 		cfg.RealModels.Strategy = req.Strategy
-		if err := cfg.Save(); err != nil {
+		if err := cfg.SaveStrategy(req.Strategy); err != nil {
 			log.Error().Err(err).Msg("failed to save config after strategy update")
 		}
 		c.JSON(http.StatusOK, gin.H{"message": "strategy updated", "strategy": req.Strategy})

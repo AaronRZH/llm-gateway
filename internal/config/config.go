@@ -106,17 +106,11 @@ type ProviderConfig struct {
 	BaseURL  string        `mapstructure:"base_url" yaml:"base_url"`
 	APIKey   string        `mapstructure:"api_key" yaml:"api_key"`
 	Timeout  time.Duration `mapstructure:"timeout" yaml:"timeout"`
-	Endpoint string        `mapstructure:"endpoint" yaml:"endpoint"`
 	Protocol string        `mapstructure:"protocol" yaml:"protocol"`
 }
 
 type TokenConfig struct {
 	TokenizerMapping map[string]string `mapstructure:"tokenizer_mapping" yaml:"tokenizer_mapping"`
-}
-
-type MetricsConfig struct {
-	Enabled bool   `mapstructure:"enabled" yaml:"enabled"`
-	Path    string `mapstructure:"path" yaml:"path"`
 }
 
 type HealthConfig struct {
@@ -224,7 +218,9 @@ func resolveEnv(value string) string {
 	return value
 }
 
-// Save 将配置持久化到 YAML 文件
+// Save 将配置持久化到 YAML 文件（保留注释和 ${ENV_VAR} 引用）
+// 注意：此方法重新序列化整个配置，会丢失 YAML 注释。
+// 推荐使用 SaveProvider / AppendAPIKey 等手术式方法。
 func (c *Config) Save() error {
 	if c.filePath == "" {
 		return fmt.Errorf("config file path not set")
@@ -234,4 +230,294 @@ func (c *Config) Save() error {
 		return fmt.Errorf("marshal config failed: %w", err)
 	}
 	return os.WriteFile(c.filePath, data, 0644)
+}
+
+// ==================== 手术式 YAML 持久化 ====================
+// 以下方法读取原始 YAML → 修改指定节点 → 写回，保留注释、格式和 ${ENV_VAR} 引用。
+
+// readYAMLDoc 读取 YAML 文件并解析为 Node 树
+func (c *Config) readYAMLDoc() (*yaml.Node, error) {
+	data, err := os.ReadFile(c.filePath)
+	if err != nil {
+		return nil, fmt.Errorf("read config failed: %w", err)
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return nil, fmt.Errorf("parse config failed: %w", err)
+	}
+	return &doc, nil
+}
+
+// writeYAMLDoc 将 Node 树写回 YAML 文件
+func (c *Config) writeYAMLDoc(doc *yaml.Node) error {
+	output, err := yaml.Marshal(doc)
+	if err != nil {
+		return fmt.Errorf("marshal config failed: %w", err)
+	}
+	return os.WriteFile(c.filePath, output, 0644)
+}
+
+// findMappingKey 在 MappingNode 中查找指定 key 的 value node
+// MappingNode 的 Content 是交替的 [key1, value1, key2, value2, ...]
+func findMappingKey(node *yaml.Node, key string) (int, *yaml.Node) {
+	if node.Kind != yaml.MappingNode {
+		return -1, nil
+	}
+	for i := 0; i < len(node.Content)-1; i += 2 {
+		if node.Content[i].Value == key {
+			return i + 1, node.Content[i+1]
+		}
+	}
+	return -1, nil
+}
+
+// findMappingIndex 在 MappingNode 中查找指定 key 的索引位置
+func findMappingIndex(node *yaml.Node, key string) int {
+	if node.Kind != yaml.MappingNode {
+		return -1
+	}
+	for i := 0; i < len(node.Content)-1; i += 2 {
+		if node.Content[i].Value == key {
+			return i
+		}
+	}
+	return -1
+}
+
+// valueToNode 将任意值序列化为 yaml.Node
+func valueToNode(v interface{}) *yaml.Node {
+	data, err := yaml.Marshal(v)
+	if err != nil {
+		// 回退：标量字符串
+		return &yaml.Node{Kind: yaml.ScalarNode, Value: fmt.Sprintf("%v", v), Tag: "!!str"}
+	}
+	var n yaml.Node
+	if err := yaml.Unmarshal(data, &n); err != nil {
+		return &yaml.Node{Kind: yaml.ScalarNode, Value: fmt.Sprintf("%v", v), Tag: "!!str"}
+	}
+	// Document 包装，取第一个子节点
+	if n.Kind == yaml.DocumentNode && len(n.Content) > 0 {
+		return n.Content[0]
+	}
+	return &n
+}
+
+// setMappingKey 在 MappingNode 中设置 key→value（key 存在则替换，不存在则追加）
+func setMappingKey(node *yaml.Node, key string, value interface{}) {
+	if node.Kind != yaml.MappingNode {
+		return
+	}
+	idx := findMappingIndex(node, key)
+	valNode := valueToNode(value)
+	if idx >= 0 {
+		// 替换已有 key 对应的 value node
+		node.Content[idx+1] = valNode
+	} else {
+		// 追加新 key-value
+		node.Content = append(node.Content, &yaml.Node{Kind: yaml.ScalarNode, Value: key, Tag: "!!str"}, valNode)
+	}
+}
+
+// deleteMappingKey 在 MappingNode 中删除指定 key 及其 value
+func deleteMappingKey(node *yaml.Node, key string) {
+	if node.Kind != yaml.MappingNode {
+		return
+	}
+	idx := findMappingIndex(node, key)
+	if idx < 0 {
+		return
+	}
+	node.Content = append(node.Content[:idx], node.Content[idx+2:]...)
+}
+
+// ==================== 手术式方法 ====================
+
+// SaveProvider 新增或更新 Provider 配置（保留注释和格式）
+func (c *Config) SaveProvider(name string, p ProviderConfig) error {
+	doc, err := c.readYAMLDoc()
+	if err != nil {
+		return err
+	}
+	root := doc.Content[0] // Document → Mapping
+	_, providersNode := findMappingKey(root, "providers")
+	if providersNode == nil {
+		return fmt.Errorf("providers key not found in config")
+	}
+	setMappingKey(providersNode, name, p)
+	return c.writeYAMLDoc(doc)
+}
+
+// DeleteProvider 删除 Provider 配置
+func (c *Config) DeleteProvider(name string) error {
+	doc, err := c.readYAMLDoc()
+	if err != nil {
+		return err
+	}
+	root := doc.Content[0]
+	_, providersNode := findMappingKey(root, "providers")
+	if providersNode == nil {
+		return fmt.Errorf("providers key not found in config")
+	}
+	deleteMappingKey(providersNode, name)
+	return c.writeYAMLDoc(doc)
+}
+
+// AppendAPIKey 追加一个 API Key 到 api_keys 列表
+func (c *Config) AppendAPIKey(k APIKeyConfig) error {
+	doc, err := c.readYAMLDoc()
+	if err != nil {
+		return err
+	}
+	root := doc.Content[0]
+	_, keysNode := findMappingKey(root, "api_keys")
+	if keysNode != nil && keysNode.Kind == yaml.SequenceNode {
+		keysNode.Content = append(keysNode.Content, valueToNode(k))
+		return c.writeYAMLDoc(doc)
+	}
+	return fmt.Errorf("api_keys sequence not found in config")
+}
+
+// RemoveAPIKey 从 api_keys 列表中删除指定 key 的条目
+func (c *Config) RemoveAPIKey(key string) error {
+	doc, err := c.readYAMLDoc()
+	if err != nil {
+		return err
+	}
+	root := doc.Content[0]
+	_, keysNode := findMappingKey(root, "api_keys")
+	if keysNode == nil || keysNode.Kind != yaml.SequenceNode {
+		return fmt.Errorf("api_keys sequence not found in config")
+	}
+	filtered := make([]*yaml.Node, 0, len(keysNode.Content))
+	for _, item := range keysNode.Content {
+		if item.Kind != yaml.MappingNode {
+			continue
+		}
+		_, keyNode := findMappingKey(item, "key")
+		if keyNode != nil && keyNode.Value == key {
+			continue // 跳过匹配项
+		}
+		filtered = append(filtered, item)
+	}
+	keysNode.Content = filtered
+	return c.writeYAMLDoc(doc)
+}
+
+// AppendModel 追加一个虚拟模型
+func (c *Config) AppendModel(m ModelEntry) error {
+	doc, err := c.readYAMLDoc()
+	if err != nil {
+		return err
+	}
+	root := doc.Content[0]
+	_, modelsNode := findMappingKey(root, "models")
+	if modelsNode != nil && modelsNode.Kind == yaml.SequenceNode {
+		modelsNode.Content = append(modelsNode.Content, valueToNode(m))
+		return c.writeYAMLDoc(doc)
+	}
+	return fmt.Errorf("models sequence not found in config")
+}
+
+// RemoveModel 从 models 列表中删除指定名称的虚拟模型
+func (c *Config) RemoveModel(name string) error {
+	doc, err := c.readYAMLDoc()
+	if err != nil {
+		return err
+	}
+	root := doc.Content[0]
+	_, modelsNode := findMappingKey(root, "models")
+	if modelsNode == nil || modelsNode.Kind != yaml.SequenceNode {
+		return fmt.Errorf("models sequence not found in config")
+	}
+	filtered := make([]*yaml.Node, 0, len(modelsNode.Content))
+	for _, item := range modelsNode.Content {
+		if item.Kind != yaml.MappingNode {
+			continue
+		}
+		_, nameNode := findMappingKey(item, "name")
+		if nameNode != nil && nameNode.Value == name {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	modelsNode.Content = filtered
+	return c.writeYAMLDoc(doc)
+}
+
+// SaveStrategy 更新 real_models 的路由策略
+func (c *Config) SaveStrategy(strategy string) error {
+	doc, err := c.readYAMLDoc()
+	if err != nil {
+		return err
+	}
+	root := doc.Content[0]
+	_, realModelsNode := findMappingKey(root, "real_models")
+	if realModelsNode == nil {
+		return fmt.Errorf("real_models key not found in config")
+	}
+	setMappingKey(realModelsNode, "strategy", strategy)
+	return c.writeYAMLDoc(doc)
+}
+
+// AppendRealModel 追加一个 real_model 条目
+func (c *Config) AppendRealModel(m FallbackItem) error {
+	doc, err := c.readYAMLDoc()
+	if err != nil {
+		return err
+	}
+	root := doc.Content[0]
+	_, realModelsNode := findMappingKey(root, "real_models")
+	if realModelsNode == nil {
+		return fmt.Errorf("real_models key not found in config")
+	}
+	_, modelsNode := findMappingKey(realModelsNode, "models")
+	if modelsNode != nil && modelsNode.Kind == yaml.SequenceNode {
+		modelsNode.Content = append(modelsNode.Content, valueToNode(m))
+		return c.writeYAMLDoc(doc)
+	}
+	return fmt.Errorf("real_models.models sequence not found in config")
+}
+
+// UpdateRealModel 更新指定索引的 real_model 条目
+func (c *Config) UpdateRealModel(index int, m FallbackItem) error {
+	doc, err := c.readYAMLDoc()
+	if err != nil {
+		return err
+	}
+	root := doc.Content[0]
+	_, realModelsNode := findMappingKey(root, "real_models")
+	if realModelsNode == nil {
+		return fmt.Errorf("real_models key not found in config")
+	}
+	_, modelsNode := findMappingKey(realModelsNode, "models")
+	if modelsNode == nil || modelsNode.Kind != yaml.SequenceNode {
+		return fmt.Errorf("real_models.models sequence not found in config")
+	}
+	if index < 0 || index >= len(modelsNode.Content) {
+		return fmt.Errorf("index %d out of range", index)
+	}
+	modelsNode.Content[index] = valueToNode(m)
+	return c.writeYAMLDoc(doc)
+}
+
+// RemoveRealModel 删除指定索引的 real_model 条目
+func (c *Config) RemoveRealModel(index int) error {
+	doc, err := c.readYAMLDoc()
+	if err != nil {
+		return err
+	}
+	root := doc.Content[0]
+	_, realModelsNode := findMappingKey(root, "real_models")
+	if realModelsNode == nil {
+		return fmt.Errorf("real_models key not found in config")
+	}
+	_, modelsNode := findMappingKey(realModelsNode, "models")
+	if modelsNode == nil || modelsNode.Kind != yaml.SequenceNode {
+		return fmt.Errorf("real_models.models sequence not found in config")
+	}
+	if index < 0 || index >= len(modelsNode.Content) {
+		return fmt.Errorf("index %d out of range", index)
+	}
+	modelsNode.Content = append(modelsNode.Content[:index], modelsNode.Content[index+1:]...)
+	return c.writeYAMLDoc(doc)
 }

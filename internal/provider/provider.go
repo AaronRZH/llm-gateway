@@ -56,7 +56,6 @@ type Provider struct {
 	name       string
 	baseURL    string
 	apiKey     string
-	endpoint   string         // 可选：覆盖默认的 upstream 端点路径
 	protocol   ClientProtocol // 上游协议类型（openai / anthropic）
 	httpClient *http.Client
 
@@ -100,23 +99,22 @@ func (m *Manager) DeleteProvider(name string) {
 // ==================== 构造函数 ====================
 
 // newBaseProvider 构造基础 Provider 配置
-func newBaseProvider(cfg config.ProviderConfig) (string, string, string, ClientProtocol, *http.Client) {
+func newBaseProvider(cfg config.ProviderConfig) (string, string, ClientProtocol, *http.Client) {
 	proto := ProtocolOpenAI
 	if cfg.Protocol == "anthropic" {
 		proto = ProtocolAnthropic
 	}
-	return cfg.BaseURL, cfg.APIKey, cfg.Endpoint, proto, &http.Client{
+	return cfg.BaseURL, cfg.APIKey, proto, &http.Client{
 		Timeout: cfg.Timeout,
 	}
 }
 
 // NewProvider 创建统一 Provider
 func NewProvider(cfg config.ProviderConfig) Provider {
-	baseURL, apiKey, endpoint, proto, httpClient := newBaseProvider(cfg)
+	baseURL, apiKey, proto, httpClient := newBaseProvider(cfg)
 	return Provider{
 		baseURL:    baseURL,
 		apiKey:     apiKey,
-		endpoint:   endpoint,
 		protocol:   proto,
 		httpClient: httpClient,
 	}
@@ -135,13 +133,8 @@ func (p *Provider) getDefaultPath() string {
 }
 
 // fullURL 构建完整的 upstream URL
-// 如果配置了自定义 endpoint 则使用，否则使用 provider 类型的默认值
 func (p *Provider) fullURL(suffix string) string {
-	path := p.getDefaultPath()
-	if p.endpoint != "" {
-		path = p.endpoint
-	}
-	return p.baseURL + path + suffix
+	return p.baseURL + p.getDefaultPath() + suffix
 }
 
 // SetName 设置 provider 名称
