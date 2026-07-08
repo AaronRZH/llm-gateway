@@ -1483,8 +1483,8 @@ func handleAdminUpdateProvider(cfg *config.Config, providerMgr *provider.Manager
 	}
 }
 
-// handleAdminDeleteProvider 删除 Provider 配置
-func handleAdminDeleteProvider(cfg *config.Config, providerMgr *provider.Manager) gin.HandlerFunc {
+// handleAdminDeleteProvider 删除 Provider 配置（同时清理对应的 real_models 路由条目）
+func handleAdminDeleteProvider(cfg *config.Config, providerMgr *provider.Manager, routerSvc *router.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		name := c.Param("name")
 		if _, exists := cfg.Providers[name]; !exists {
@@ -1500,6 +1500,20 @@ func handleAdminDeleteProvider(cfg *config.Config, providerMgr *provider.Manager
 
 		// 立即生效：删除运行时的 Provider
 		providerMgr.DeleteProvider(name)
+
+		// 清理 real_models 中该 provider 的所有路由配置
+		rmFiltered := make([]config.FallbackItem, 0, len(cfg.RealModels.Models))
+		for _, item := range cfg.RealModels.Models {
+			if item.Provider == name {
+				continue
+			}
+			rmFiltered = append(rmFiltered, item)
+		}
+		cfg.RealModels.Models = rmFiltered
+		if err := cfg.RemoveRealModelsByProvider(name); err != nil {
+			log.Error().Err(err).Msg("failed to persist real_models cleanup after deleting provider")
+		}
+		routerSvc.DeleteRealModelsByProvider(name)
 
 		// 清理 .env 中的对应环境变量
 		envKey := providerNameToEnvKey(name)

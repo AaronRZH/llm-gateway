@@ -528,3 +528,34 @@ func (c *Config) RemoveRealModel(index int) error {
 	modelsNode.Content = append(modelsNode.Content[:index], modelsNode.Content[index+1:]...)
 	return c.writeYAMLDoc(doc)
 }
+
+// RemoveRealModelsByProvider 从 real_models.models 列表中删除指定 provider 的所有条目
+func (c *Config) RemoveRealModelsByProvider(providerName string) error {
+	doc, err := c.readYAMLDoc()
+	if err != nil {
+		return err
+	}
+	root := doc.Content[0]
+	_, realModelsNode := findMappingKey(root, "real_models")
+	if realModelsNode == nil {
+		return fmt.Errorf("real_models key not found in config")
+	}
+	_, modelsNode := findMappingKey(realModelsNode, "models")
+	if modelsNode == nil || modelsNode.Kind != yaml.SequenceNode {
+		return fmt.Errorf("real_models.models sequence not found in config")
+	}
+
+	filtered := make([]*yaml.Node, 0, len(modelsNode.Content))
+	for _, item := range modelsNode.Content {
+		if item.Kind != yaml.MappingNode {
+			filtered = append(filtered, item)
+			continue
+		}
+		_, providerNode := findMappingKey(item, "provider")
+		if providerNode == nil || providerNode.Value != providerName {
+			filtered = append(filtered, item)
+		}
+	}
+	modelsNode.Content = filtered
+	return c.writeYAMLDoc(doc)
+}

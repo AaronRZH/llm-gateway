@@ -140,7 +140,7 @@ func main() {
 		adminAPI.GET("/providers/config", handleAdminProvidersConfig(cfg))
 		adminAPI.POST("/providers", handleAdminAddProvider(cfg, providerManager))
 		adminAPI.PUT("/providers/:name", handleAdminUpdateProvider(cfg, providerManager))
-		adminAPI.DELETE("/providers/:name", handleAdminDeleteProvider(cfg, providerManager))
+		adminAPI.DELETE("/providers/:name", handleAdminDeleteProvider(cfg, providerManager, routerService))
 		adminAPI.GET("/models", handleAdminModels(mapperService))
 		adminAPI.POST("/models", handleAdminAddModel(mapperService, routerService, cfg))
 		adminAPI.DELETE("/models/:name", handleAdminDeleteModel(mapperService, routerService, cfg))

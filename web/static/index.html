@@ -246,10 +246,10 @@
           <form @submit.prevent="saveRealModel">
             <div class="form-group">
               <label>Provider</label>
-              <input v-model="realModelForm.provider" placeholder="如: seneenova" class="form-input" list="provider-list">
-              <datalist id="provider-list">
-                <option v-for="p in providerNames" :key="p" :value="p"></option>
-              </datalist>
+              <select v-model="realModelForm.provider" class="form-input" required>
+                <option value="" disabled>请选择 Provider</option>
+                <option v-for="p in providerNames" :key="p" :value="p">{{ p }}</option>
+              </select>
             </div>
             <div class="form-group">
               <label>Model</label>

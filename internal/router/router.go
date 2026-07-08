@@ -127,7 +127,14 @@ func (s *Service) Select(ctx context.Context, virtualModel string, estimatedToke
 
 // SelectCandidates 返回路由候选列表，handler 通过 Next() 遍历以在请求失败时重试下一个候选
 func (s *Service) SelectCandidates(ctx context.Context, virtualModel string, estimatedTokens int) (*Selection, error) {
-	chain := s.getOrderedChain(s.realModelsCfg.Strategy, s.realModelsCfg.Models)
+	// 加读锁拷贝 Strategy 和 Models，避免并发读写 realModelsCfg。
+	// 释放读锁后再调 getOrderedChain，防止死锁（其内部 sortedByLatency/roundRobinOrder 会再获取 s.mu）。
+	s.mu.RLock()
+	strategy := s.realModelsCfg.Strategy
+	chain := cloneFallbackChain(s.realModelsCfg.Models)
+	s.mu.RUnlock()
+
+	chain = s.getOrderedChain(strategy, chain)
 
 	// 按 virtualModel 的 tier 过滤 fallback chain
 	targetTier := s.resolveModelTier(virtualModel)
@@ -283,7 +290,8 @@ func (s *Service) sortedByCost(chain []config.FallbackItem) []config.FallbackIte
 // tryProvider 检查单个 provider 的断路器状态，返回可用的 Target
 func (s *Service) tryProvider(ctx context.Context, item config.FallbackItem) (*Target, error) {
 	key := s.breakerKey(item.Provider, item.Model)
-	cb := s.breakers[key]
+
+	cb := s.getBreaker(key)
 	if cb == nil {
 		return nil, fmt.Errorf("circuit breaker not found")
 	}
@@ -413,6 +421,26 @@ func (s *Service) DeleteRealModel(index int) {
 	log.Info().Int("index", index).Str("provider", removed.Provider).Str("model", removed.Model).Msg("real model deleted from router")
 }
 
+// DeleteRealModelsByProvider 删除指定 provider 名称的所有 real_model 路由配置
+func (s *Service) DeleteRealModelsByProvider(providerName string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	filtered := make([]config.FallbackItem, 0, len(s.realModelsCfg.Models))
+	for _, item := range s.realModelsCfg.Models {
+		if item.Provider == providerName {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	removedCount := len(s.realModelsCfg.Models) - len(filtered)
+	s.realModelsCfg.Models = filtered
+
+	if removedCount > 0 {
+		log.Info().Int("count", removedCount).Str("provider", providerName).Msg("real models removed from router")
+	}
+}
+
 // GetStrategy 获取当前路由策略
 func (s *Service) GetStrategy() string {
 	s.mu.RLock()
@@ -447,4 +475,18 @@ func stateString(s gobreaker.State) string {
 
 func (s *Service) breakerKey(provider, model string) string {
 	return fmt.Sprintf("%s:%s", provider, model)
+}
+
+// getBreaker 安全地获取指定 key 的断路器（加读锁避免与 AddRealModel 写操作竞争）
+func (s *Service) getBreaker(key string) *gobreaker.CircuitBreaker {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.breakers[key]
+}
+
+// cloneFallbackChain 深拷贝 FallbackItem 切片，避免并发读写 realModelsCfg.Models
+func cloneFallbackChain(src []config.FallbackItem) []config.FallbackItem {
+	dst := make([]config.FallbackItem, len(src))
+	copy(dst, src)
+	return dst
 }
