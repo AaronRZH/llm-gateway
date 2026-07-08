@@ -196,7 +196,7 @@
       </section>
 
       <!-- API Key 新增弹窗 -->
-      <div class="modal-overlay" v-if="showAddKeyModal" @click.self="showAddKeyModal = false">
+      <div class="modal-overlay" v-if="showAddKeyModal">
         <div class="modal">
           <h3>新增 API Key</h3>
           <form @submit.prevent="addKey">
@@ -217,7 +217,7 @@
       </div>
 
       <!-- 虚拟模型新增弹窗 -->
-      <div class="modal-overlay" v-if="showAddModelModal" @click.self="showAddModelModal = false">
+      <div class="modal-overlay" v-if="showAddModelModal">
         <div class="modal">
           <h3>新增虚拟模型</h3>
           <form @submit.prevent="addModel">
@@ -243,7 +243,7 @@
       </div>
 
       <!-- 路由配置新增/编辑弹窗 -->
-      <div class="modal-overlay" v-if="showAddRealModelModal" @click.self="closeRealModelModal">
+      <div class="modal-overlay" v-if="showAddRealModelModal">
         <div class="modal">
           <h3>{{ realModelEditIndex === -1 ? '新增' : '编辑' }}路由配置</h3>
           <form @submit.prevent="saveRealModel">
@@ -288,7 +288,7 @@
       </div>
 
       <!-- Provider 配置新增/编辑弹窗 -->
-      <div class="modal-overlay" v-if="showAddProviderModal" @click.self="closeProviderModal">
+      <div class="modal-overlay" v-if="showAddProviderModal">
         <div class="modal">
           <h3>{{ providerEditName ? '编辑' : '新增' }} Provider</h3>
           <form @submit.prevent="saveProvider">
