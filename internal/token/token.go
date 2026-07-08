@@ -1,6 +1,7 @@
 package token
 
 import (
+	"encoding/json"
 	"math"
 	"sync"
 	"time"
@@ -41,6 +42,7 @@ type UsageRecord struct {
 	VirtualModel        string
 	EstimatedInput      int // 本地 tiktoken 估算输入
 	EstimatedOutput     int // 本地 tiktoken 估算输出
+	EstimatedToolCalls  int // 本地 tiktoken 估算 tool_calls 输出 token
 	RealInput           int // 上游 API 返回的 prompt_tokens
 	RealOutput          int // 上游 API 返回的 completion_tokens
 	RealTotal           int // 上游 API 返回的 total_tokens
@@ -116,24 +118,58 @@ func (s *Service) EstimateOutput(text string, model string) int {
 	return len(enc.EncodeOrdinary(text))
 }
 
+// EstimateToolCallsOutput 估算 tool calls 的 token 开销
+func (s *Service) EstimateToolCallsOutput(toolCalls []map[string]interface{}, model string) int {
+	s.mu.RLock()
+	enc, encOk := s.encoders[model]
+	s.mu.RUnlock()
+
+	total := 0
+	for _, tc := range toolCalls {
+		// 每个 tool_call 的 JSON 包装 ~20 tokens
+		total += 20
+		if fn, ok := tc["function"]; ok {
+			if fnMap, ok := fn.(map[string]interface{}); ok {
+				if args, ok := fnMap["arguments"]; ok {
+					argsStr := ""
+					switch v := args.(type) {
+ 					case string:
+						argsStr = v
+					default:
+						bytes, _ := json.Marshal(v)
+						argsStr = string(bytes)
+					}
+					if encOk {
+						total += len(enc.EncodeOrdinary(argsStr))
+					} else {
+						total += len(argsStr) / 4
+					}
+				}
+			}
+		}
+	}
+	return total
+}
+
 // RecordUsage 记录用量（异步），包含估算值和上游真实值
 func (s *Service) RecordUsage(requestID, model, virtualModel, provider string,
-	estimatedInput, estimatedOutput int,
+	estimatedInput, estimatedOutput, estimatedToolCalls int,
 	realInput, realOutput, realTotal int, toolCalls int, apiKey string) {
 
 	record := UsageRecord{
-		RequestID:       requestID,
-		Model:           model,
-		VirtualModel:    virtualModel,
-		EstimatedInput:  estimatedInput,
-		EstimatedOutput: estimatedOutput,
-		RealInput:       realInput,
-		RealOutput:      realOutput,
-		RealTotal:       realTotal,
-		Provider:        provider,
-		ToolCalls:       toolCalls,
-		APIKey:          apiKey,
-		Timestamp:       time.Now().Unix(),
+		RequestID:         requestID,
+		Model:             model,
+		VirtualModel:      virtualModel,
+		EstimatedInput:    estimatedInput,
+		EstimatedOutput:   estimatedOutput,
+		EstimatedToolCalls: estimatedToolCalls,
+		RealInput:         realInput,
+		RealOutput:        realOutput,
+		RealTotal:         realTotal,
+		Provider:          provider,
+		ToolCalls:         toolCalls,
+		APIKey:            apiKey,
+		Timestamp:         time.Now().Unix(),
 	}
 
 	select {
@@ -149,12 +185,12 @@ func (s *Service) RecordUsage(requestID, model, virtualModel, provider string,
 
 // RecordUsageNow 同步记录用量 + 持久化（适用于非流式，直接写存储）
 func (s *Service) RecordUsageNow(requestID, model, virtualModel, provider string,
-	estimatedInput, estimatedOutput int,
+	estimatedInput, estimatedOutput, estimatedToolCalls int,
 	realInput, realOutput, realTotal int, toolCalls int, apiKey string) {
 
 	// 先通过异步队列记录日志和指标
 	s.RecordUsage(requestID, model, virtualModel, provider,
-		estimatedInput, estimatedOutput, realInput, realOutput, realTotal, toolCalls, apiKey)
+		estimatedInput, estimatedOutput, estimatedToolCalls, realInput, realOutput, realTotal, toolCalls, apiKey)
 
 	// 同步持久化到存储层
 	if s.storage != nil {

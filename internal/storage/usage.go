@@ -1,6 +1,8 @@
 package storage
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -87,11 +89,41 @@ func NewFileStorage(dir string) UsageStorage {
 	}
 
 	s := &FileStorage{filePath: path, file: f}
+
+	// 读取现有数据，兼容 JSON 数组（旧格式）和 JSON Lines（新格式）
 	data, err := os.ReadFile(path)
 	if err == nil && len(data) > 0 {
-		json.Unmarshal(data, &s.records)
+		trimmed := bytes.TrimSpace(data)
+		if len(trimmed) > 0 && trimmed[0] == '[' {
+			// 旧格式：JSON 数组 [{...},{...},...]
+			json.Unmarshal(data, &s.records)
+			// 立即转换为 JSON Lines 格式
+			f.Truncate(0)
+			f.Seek(0, 0)
+			for _, rec := range s.records {
+				line, _ := json.Marshal(rec)
+				f.Write(line)
+				f.Write([]byte("\n"))
+			}
+		} else {
+			// 新格式：JSON Lines，逐行读取
+			scanner := bufio.NewScanner(bytes.NewReader(data))
+			for scanner.Scan() {
+				line := bytes.TrimSpace(scanner.Bytes())
+				if len(line) == 0 {
+					continue
+				}
+				var rec UsageRecord
+				if json.Unmarshal(line, &rec) == nil {
+					s.records = append(s.records, rec)
+				}
+			}
+		}
 	}
-	log.Info().Str("file", path).Msg("token usage file storage enabled")
+	// seek 到文件末尾准备追加
+	f.Seek(0, 2)
+
+	log.Info().Int("records", len(s.records)).Str("file", path).Msg("token usage file storage enabled")
 	return s
 }
 
@@ -107,11 +139,36 @@ func (s *FileStorage) Persist(record UsageRecord) error {
 	}
 
 	s.records = append(s.records, record)
-	_ = s.file.Truncate(0)
-	s.file.Seek(0, 0)
-	data, _ := json.Marshal(s.records)
-	s.file.Write(data)
+
+	// Append-only: 只写一条 JSON Line，不做全量重写
+	line, err := json.Marshal(record)
+	if err != nil {
+		return fmt.Errorf("marshal record: %w", err)
+	}
+	if _, err := s.file.Write(line); err != nil {
+		return fmt.Errorf("append record: %w", err)
+	}
+	if _, err := s.file.Write([]byte("\n")); err != nil {
+		return fmt.Errorf("append newline: %w", err)
+	}
+
+	// 每 10000 条触发一次压缩（重写整个文件去除可能损坏的行）
+	if len(s.records)%10000 == 0 {
+		s.compact()
+	}
+
 	return nil
+}
+
+// compact 重写整个文件，去除可能损坏的行
+func (s *FileStorage) compact() {
+	s.file.Truncate(0)
+	s.file.Seek(0, 0)
+	for _, rec := range s.records {
+		data, _ := json.Marshal(rec)
+		s.file.Write(data)
+		s.file.Write([]byte("\n"))
+	}
 }
 
 func (s *FileStorage) QueryByAPIKey(apiKey, model, startTime, endTime string) ([]UsageRecord, error) {

@@ -162,25 +162,9 @@ func handleChatCompletion(
 			// 5. 流式：根据累计内容估算输出 token，异步记录用量
 			estimatedOutput := tokenService.EstimateOutput(result.AccumulatedContent, req.Model)
 			toolCalls := streamHandler.ExtractToolCalls(result)
-			estimatedToolCalls := len(toolCalls)
-			// 补充 tool_calls arguments 的 token 开销
-			for _, tc := range toolCalls {
-				if fn, ok := tc["function"]; ok {
-					if fnMap, ok := fn.(map[string]interface{}); ok {
-						if args, ok := fnMap["arguments"]; ok {
-							argsStr := ""
-							switch v := args.(type) {
-							case string:
-								argsStr = v
-							default:
-								argsBytes, _ := json.Marshal(v)
-								argsStr = string(argsBytes)
-							}
-							estimatedOutput += tokenService.EstimateOutput(argsStr, req.Model)
-						}
-					}
-				}
-			}
+			// 补充 tool_calls 的 token 开销（JSON 包装 + arguments 文本）
+			estimatedToolCallsTokens := tokenService.EstimateToolCallsOutput(toolCalls, req.Model)
+			estimatedOutput += estimatedToolCallsTokens
 
 			// 优先使用从 SSE 提取的真实 token 数，没有则回退到本地估算值
 			var realInput, realOutput, realTotal int
@@ -203,7 +187,7 @@ func handleChatCompletion(
 				effTotal = realTotal
 			}
 			go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
-				inputTokens, estimatedOutput, effInput, effOutput, effTotal, estimatedToolCalls, apiKey)
+				inputTokens, estimatedOutput, estimatedToolCallsTokens, effInput, effOutput, effTotal, len(toolCalls), apiKey)
 
 			} else {
 			// 非流式响应 — 遍历候选直到请求成功
@@ -283,7 +267,7 @@ func handleChatCompletion(
 				toolCalls := parseToolCalls(body, targetProvider)
 				_ = realTotal // 保留用于未来的扩展
 				go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
-					inputTokens, 0, realInput, realOutput, realTotal, len(toolCalls), apiKey)
+					inputTokens, 0, 0, realInput, realOutput, realTotal, len(toolCalls), apiKey)
 
 				// 重写响应中的 model 字段
 				body = mapper.RewriteResponse(body, req.Model)
@@ -658,6 +642,12 @@ func handleAnthropicMessages(
 
 			result := streamHandler.RewriteAndForward(c.Writer, protocolResult.StreamBody, req.Model)
 
+			// 估算输出 token（含 tool_calls）
+			estimatedOutput := tokenService.EstimateOutput(result.AccumulatedContent, req.Model)
+			toolCalls := streamHandler.ExtractToolCalls(result)
+			estimatedToolCallsTokens := tokenService.EstimateToolCallsOutput(toolCalls, req.Model)
+			estimatedOutput += estimatedToolCallsTokens
+
 			// 记录用量：优先使用从 SSE 提取的真实 token 数，没有则使用本地估算值
 			var realInput, realOutput, realTotal int
 			if result.Usage != nil {
@@ -671,12 +661,15 @@ func handleAnthropicMessages(
 				effInput = inputTokens
 			}
 			effOutput := realOutput
+			if effOutput == 0 {
+				effOutput = estimatedOutput
+			}
 			effTotal := effInput + effOutput
 			if realTotal > 0 {
 				effTotal = realTotal
 			}
 			go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
-				inputTokens, 0, effInput, effOutput, effTotal, 0, apiKey)
+				inputTokens, estimatedOutput, estimatedToolCallsTokens, effInput, effOutput, effTotal, len(toolCalls), apiKey)
 		} else {
 			// 非流式响应：使用 Body（已在 Resolve 中读取并转换）
 			if protocolResult.Response != nil {
@@ -693,7 +686,7 @@ func handleAnthropicMessages(
 			toolCalls := parseToolCalls(protocolResult.Body, targetProvider)
 			_ = realTotal
 			go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
-				inputTokens, 0, realInput, realOutput, realTotal, len(toolCalls), apiKey)
+				inputTokens, 0, 0, realInput, realOutput, realTotal, len(toolCalls), apiKey)
 
 			c.Data(protocolResult.StatusCode, "application/json", protocolResult.Body)
 		}
