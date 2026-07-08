@@ -60,6 +60,7 @@ type AnthropicSSEConverter struct {
 	model       string // 虚拟模型名
 	hasContent  bool   // 是否已发送 content_block_start
 	promptTokens int
+	completionTokens int // from upstream usage
 	usageDone   bool
 
 	// wg 等待 convert goroutine 完成
@@ -261,6 +262,7 @@ func (c *AnthropicSSEConverter) convert() {
 		// === 处理 usage ===
 		if event.Usage != nil && !c.usageDone {
 			c.promptTokens = event.Usage.PromptTokens
+			c.completionTokens = event.Usage.CompletionTokens
 			c.usageDone = true
 		}
 	}
@@ -295,7 +297,7 @@ func (c *AnthropicSSEConverter) finish(hasOpenBlock bool, inTool bool, toolID, t
 
 	// message_delta
 	usage := map[string]interface{}{
-		"output_tokens": 0,
+		"output_tokens": c.completionTokens,
 	}
 	if c.promptTokens > 0 {
 		usage["input_tokens"] = c.promptTokens

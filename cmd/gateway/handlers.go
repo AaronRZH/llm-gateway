@@ -128,7 +128,7 @@ func handleChatCompletion(
 				if res.StatusCode == 429 {
 					backoff := parseRetryAfter(res.Body, 5*time.Second)
 					log.Warn().Dur("backoff", backoff).Str("provider", targetProvider).Msg("rate limited (429), backing off")
-					time.Sleep(backoff)
+					sleepWithContext(c.Request.Context(), backoff)
 					continue
 				}
 				upstream = res.StreamBody
@@ -262,7 +262,7 @@ func handleChatCompletion(
 				if res.StatusCode == 429 {
 					backoff := parseRetryAfter(res.Body, 5*time.Second)
 					log.Warn().Dur("backoff", backoff).Str("provider", targetProvider).Msg("rate limited (429), backing off")
-					time.Sleep(backoff)
+					sleepWithContext(c.Request.Context(), backoff)
 					continue
 				}
 				// Body 已在 protocol.Resolve 中读取并转换，直接使用
@@ -607,7 +607,7 @@ func handleAnthropicMessages(
 			if res.StatusCode == 429 {
 				backoff := parseRetryAfter(res.Body, 5*time.Second)
 				log.Warn().Dur("backoff", backoff).Str("provider", targetProvider).Msg("rate limited (429), backing off")
-				time.Sleep(backoff)
+				sleepWithContext(c.Request.Context(), backoff)
 				continue
 			}
 			protocolResult = res
@@ -1085,7 +1085,7 @@ func parseRetryAfter(body []byte, fallback time.Duration) time.Duration {
 	if errMsg, ok := parsed["error"].(map[string]interface{}); ok {
 		if retryAfter, ok := errMsg["retry_after"].(float64); ok {
 			d := time.Duration(retryAfter) * time.Second
-			if d > 0 && d <= 300*time.Second {
+			if d > 0 && d <= 30*time.Second {
 				return d
 			}
 		}
@@ -1093,11 +1093,26 @@ func parseRetryAfter(body []byte, fallback time.Duration) time.Duration {
 	// 尝试顶层 retry_after 字段
 	if retryAfter, ok := parsed["retry_after"].(float64); ok {
 		d := time.Duration(retryAfter) * time.Second
-		if d > 0 && d <= 300*time.Second {
+		if d > 0 && d <= 30*time.Second {
 			return d
 		}
 	}
 	return fallback
+}
+
+// sleepWithContext 可被 context 取消的 sleep，避免 goroutine 被阻塞
+func sleepWithContext(ctx context.Context, d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return
+	case <-ctx.Done():
+		return
+	}
 }
 
 // handleAdminCalibration 管理端校准信息
