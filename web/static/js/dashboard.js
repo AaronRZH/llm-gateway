@@ -429,6 +429,7 @@ const app = createApp({
 
     function formatDate(iso) { if (!iso) return ""; try { return new Date(iso).toLocaleString("zh-CN"); } catch { return iso; } }
     function maskKey(key) { if (!key || key.length <= 12) return key; return key.slice(0, 8) + "..." + key.slice(-4); }
+    function copyKey(key) { navigator.clipboard.writeText(key).then(() => { const toast = document.createElement('div'); toast.textContent = '已复制到剪贴板'; toast.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);background:var(--accent);color:#fff;padding:8px 16px;border-radius:4px;font-size:13px;z-index:9999;animation:fadeIn 0.3s ease;'; document.body.appendChild(toast); setTimeout(() => toast.remove(), 2000); }); }
     function getKeyName(key) { const k = apiKeys.value.find(k => k.key === key); return k ? k.name : (key || "—"); }
 
     function logout() {
@@ -463,7 +464,7 @@ const app = createApp({
       editRealModel, closeRealModelModal, saveRealModel, deleteRealModel,
       providersConfig, showAddProviderModal, providerEditName, providerForm,
       editProvider, closeProviderModal, saveProvider, deleteProvider,
-      maskKey, formatDate, formatNumber,
+      maskKey, copyKey, formatDate, formatNumber,
       fmt: formatNumber,
       fixed: (n, d) => (n == null ? "" : n.toFixed(d || 2)),
     };
