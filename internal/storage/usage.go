@@ -259,6 +259,8 @@ func (s *FileStorage) filter(records []UsageRecord, apiKey, model, startTime, en
 
 // SumTokensByAPIKey 按 API Key 聚合 token 统计
 func (s *FileStorage) SumTokensByAPIKey(apiKey, model, startTime, endTime string) (int, int, int, int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	records, _ := s.filter(s.records, apiKey, model, startTime, endTime)
 	var inputTokens, outputTokens, totalTokens, requestCount int
 	for _, r := range records {
@@ -272,6 +274,8 @@ func (s *FileStorage) SumTokensByAPIKey(apiKey, model, startTime, endTime string
 
 // SumTokensByTimeRange 按时间范围聚合所有 token 统计
 func (s *FileStorage) SumTokensByTimeRange(startTime, endTime string) (int, int, int, int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	records, _ := s.filter(s.records, "", "", startTime, endTime)
 	var inputTokens, outputTokens, totalTokens, requestCount int
 	for _, r := range records {

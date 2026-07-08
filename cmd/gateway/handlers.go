@@ -163,6 +163,24 @@ func handleChatCompletion(
 			estimatedOutput := tokenService.EstimateOutput(result.AccumulatedContent, req.Model)
 			toolCalls := streamHandler.ExtractToolCalls(result)
 			estimatedToolCalls := len(toolCalls)
+			// 补充 tool_calls arguments 的 token 开销
+			for _, tc := range toolCalls {
+				if fn, ok := tc["function"]; ok {
+					if fnMap, ok := fn.(map[string]interface{}); ok {
+						if args, ok := fnMap["arguments"]; ok {
+							argsStr := ""
+							switch v := args.(type) {
+							case string:
+								argsStr = v
+							default:
+								argsBytes, _ := json.Marshal(v)
+								argsStr = string(argsBytes)
+							}
+							estimatedOutput += tokenService.EstimateOutput(argsStr, req.Model)
+						}
+					}
+				}
+			}
 
 			// 优先使用从 SSE 提取的真实 token 数，没有则回退到本地估算值
 			var realInput, realOutput, realTotal int
@@ -479,18 +497,10 @@ func handleAnthropicMessages(
 		}
 		log.Debug().Str("model", req.Model).Msg("anthropic model validated")
 
-		// 2. 估算输入 token
-		var inputTokens int
-		for _, msg := range req.Messages {
-			if content, ok := msg["content"].(string); ok {
-				inputTokens += len([]rune(content)) / 4
-			}
-			if tools, ok := msg["tool_calls"].([]interface{}); ok {
-				inputTokens += len(tools) * 20
-			}
-		}
+		// 2. 估算输入 token（使用 tiktoken，与 OpenAI handler 一致）
+		inputTokens := tokenService.EstimateInput(toTokenMessagesFromAnthropic(req.Messages), req.Model)
 		if len(req.Tools) > 0 {
-			inputTokens += len(req.Tools) * 80
+			inputTokens += len(req.Tools) * 80 // 每个 tool 定义约 80 tokens 开销
 		}
 		log.Debug().Int("input_tokens", inputTokens).Msg("anthropic token estimated")
 
@@ -702,6 +712,35 @@ func toTokenMessages(msgs []protocol.Message) []token.Message {
 	out := make([]token.Message, len(msgs))
 	for i, m := range msgs {
 		out[i] = token.Message{Role: m.Role, Content: m.Content}
+	}
+	return out
+}
+
+// toTokenMessagesFromAnthropic 将 Anthropic 格式消息（[]map[string]interface{}）转为 token.Message 列表
+// content blocks 会被展平为纯文本
+func toTokenMessagesFromAnthropic(msgs []map[string]interface{}) []token.Message {
+	var out []token.Message
+	for _, msg := range msgs {
+		role, _ := msg["role"].(string)
+		if role == "" {
+			continue
+		}
+		content := ""
+		switch v := msg["content"].(type) {
+		case string:
+			content = v
+		case []interface{}:
+			for _, block := range v {
+				if b, ok := block.(map[string]interface{}); ok {
+					if b["type"] == "text" {
+						if t, ok := b["text"].(string); ok {
+							content += t
+						}
+					}
+				}
+			}
+		}
+		out = append(out, token.Message{Role: role, Content: content})
 	}
 	return out
 }

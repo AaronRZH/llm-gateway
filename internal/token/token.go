@@ -1,6 +1,7 @@
 package token
 
 import (
+	"math"
 	"sync"
 	"time"
 
@@ -288,15 +289,26 @@ func (s *Service) syncWorker() {
 
 		if record.RealTotal > 0 {
 			// 有上游真实用量，记录并与估算对比
+			estimatedTotal := record.EstimatedInput + record.EstimatedOutput
+			errorPct := calcErrorPct(estimatedTotal, record.RealTotal)
 			logEvent.
 				Int("real_input", record.RealInput).
 				Int("real_output", record.RealOutput).
 				Int("real_total", record.RealTotal).
-				Float64("estimation_error_pct", calcErrorPct(
-					record.EstimatedInput+record.EstimatedOutput,
-					record.RealTotal,
-				)).
+				Float64("estimation_error_pct", errorPct).
 				Msg("usage recorded (with real data)")
+
+			// 估算偏差超过 50% 时打 warn 日志，便于后续校准
+			if math.Abs(errorPct) > 50 {
+				log.Warn().
+					Str("request_id", record.RequestID).
+					Str("model", record.Model).
+					Str("provider", record.Provider).
+					Int("estimated_total", estimatedTotal).
+					Int("real_total", record.RealTotal).
+					Float64("error_pct", errorPct).
+					Msg("large estimation deviation")
+			}
 
 			// 累计校准统计
 			s.mu.Lock()
