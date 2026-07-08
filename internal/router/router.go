@@ -427,8 +427,10 @@ func (s *Service) DeleteRealModelsByProvider(providerName string) {
 	defer s.mu.Unlock()
 
 	filtered := make([]config.FallbackItem, 0, len(s.realModelsCfg.Models))
+	breakerKeys := make([]string, 0)
 	for _, item := range s.realModelsCfg.Models {
 		if item.Provider == providerName {
+			breakerKeys = append(breakerKeys, s.breakerKey(item.Provider, item.Model))
 			continue
 		}
 		filtered = append(filtered, item)
@@ -438,6 +440,11 @@ func (s *Service) DeleteRealModelsByProvider(providerName string) {
 
 	if removedCount > 0 {
 		log.Info().Int("count", removedCount).Str("provider", providerName).Msg("real models removed from router")
+	}
+
+	// 同步清理对应的熔断器
+	for _, key := range breakerKeys {
+		delete(s.breakers, key)
 	}
 }
 
