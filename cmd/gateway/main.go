@@ -160,8 +160,11 @@ func main() {
 
 	// 启动 HTTP 服务
 	srv := &http.Server{
-		Addr:    fmt.Sprintf(":%d", cfg.App.Port),
-		Handler: r,
+		Addr:         fmt.Sprintf(":%d", cfg.App.Port),
+		Handler:      r,
+		ReadTimeout:  cfg.App.ReadTimeout,
+		WriteTimeout: cfg.App.WriteTimeout,
+		IdleTimeout:  cfg.App.IdleTimeout,
 	}
 
 	go func() {

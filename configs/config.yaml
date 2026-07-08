@@ -3,6 +3,9 @@ app:
   version: "1.0.0"
   env: "dev" # dev | prod
   port: 8080
+  read_timeout: 60s
+  write_timeout: 120s
+  idle_timeout: 600s
 log:
   level: "info" # debug | info | warn | error
   format: "json" # json | console

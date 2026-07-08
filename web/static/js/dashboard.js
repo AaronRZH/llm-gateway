@@ -107,7 +107,7 @@ const app = createApp({
     const showAddRealModelModal = ref(false);
     const realModelEditIndex = ref(-1);
     const realModelForm = reactive({ provider: "", model: "", weight: 1, tier: "", cost: 0, timeout: 3000 });
-    const providerNames = ["seneenova", "seneenova_me", "deepseek_openai", "deepseek_anthropic", "openai", "anthropic", "xiaomi_tp", "glm", "nvidia"];
+    const providerNames = computed(() => { const keys = Object.keys(providersConfig); return keys.length ? keys : ["seneenova", "seneenova_me", "deepseek_openai", "deepseek_anthropic", "openai", "anthropic", "xiaomi_tp", "glm", "nvidia"]; });
         const providersConfig = reactive({});
     const showAddProviderModal = ref(false);
     const providerEditName = ref("");
@@ -172,7 +172,7 @@ const app = createApp({
     }
 
     async function loadUsageStats() {
-      let url = "/admin/usage/daily?start_time=" + daysAgo(30);
+      let url = "/admin/usage/daily?start_time=" + daysAgo(30) + "&granularity=" + usageGranularity.value;
       if (selectedUsageKey.value) {
         url = "/admin/usage/by-api-key?api_key=" + encodeURIComponent(selectedUsageKey.value) + "&granularity=" + usageGranularity.value + "&start_time=" + daysAgo(30);
       }
@@ -447,6 +447,7 @@ const app = createApp({
       const timer = setInterval(async () => {
         if (!isAuthenticated.value) return;
         if (currentView.value === "overview") await loadOverview();
+        else if (currentView.value === "usage") await loadUsageStats();
         else if (currentView.value === "providers") await loadBreakers();
       }, 30000);
       onUnmounted(() => clearInterval(timer));

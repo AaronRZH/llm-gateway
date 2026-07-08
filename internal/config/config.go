@@ -34,10 +34,13 @@ type Config struct {
 }
 
 type AppConfig struct {
-	Name    string `mapstructure:"name" yaml:"name"`
-	Version string `mapstructure:"version" yaml:"version"`
-	Env     string `mapstructure:"env" yaml:"env"`
-	Port    int    `mapstructure:"port" yaml:"port"`
+	Name         string        `mapstructure:"name" yaml:"name"`
+	Version      string        `mapstructure:"version" yaml:"version"`
+	Env          string        `mapstructure:"env" yaml:"env"`
+	Port         int           `mapstructure:"port" yaml:"port"`
+	ReadTimeout  time.Duration `mapstructure:"read_timeout" yaml:"read_timeout"`
+	WriteTimeout time.Duration `mapstructure:"write_timeout" yaml:"write_timeout"`
+	IdleTimeout  time.Duration `mapstructure:"idle_timeout" yaml:"idle_timeout"`
 }
 
 type LogConfig struct {
@@ -146,6 +149,9 @@ func Load(path string) (*Config, error) {
 
 	// 默认值
 	v.SetDefault("app::port", 8080)
+	v.SetDefault("app::read_timeout", 60*time.Second)
+	v.SetDefault("app::write_timeout", 120*time.Second)
+	v.SetDefault("app::idle_timeout", 120*time.Second)
 	v.SetDefault("log::level", "info")
 	v.SetDefault("redis::addr", "localhost:6379")
 	v.SetDefault("postgres::host", "localhost")

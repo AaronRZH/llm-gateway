@@ -1035,18 +1035,28 @@ func handleAdminUsage(tokenService *token.Service) gin.HandlerFunc {
 	}
 }
 
-// handleAdminDailyUsage 管理端按日统计
+// handleAdminDailyUsage 管理端按时间粒度统计（支持 daily/weekly/monthly）
 func handleAdminDailyUsage(tokenService *token.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		startTime := c.Query("start_time")
 		endTime := c.Query("end_time")
+		granularity := c.DefaultQuery("granularity", "daily")
 
-		summaries, err := tokenService.AdminDailyStats(startTime, endTime)
+		var summaries []storage.UsageSummary
+		var err error
+		switch granularity {
+		case "weekly":
+			summaries, err = tokenService.AggregateWeekly(startTime, endTime)
+		case "monthly":
+			summaries, err = tokenService.AggregateMonthly(startTime, endTime)
+		default:
+			summaries, err = tokenService.AdminDailyStats(startTime, endTime)
+		}
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "query failed"})
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"data": summaries})
+		c.JSON(http.StatusOK, gin.H{"data": summaries, "granularity": granularity})
 	}
 }
 
