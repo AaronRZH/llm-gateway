@@ -1,4 +1,4 @@
-const { createApp, ref, reactive, watch, onMounted, onUnmounted, nextTick } = Vue;
+const { createApp, ref, reactive, computed, watch, onMounted, onUnmounted, nextTick } = Vue;
 
 function getAuthHeaders() {
   const stored = localStorage.getItem("admin_token");
@@ -95,7 +95,7 @@ const app = createApp({
     const usageGranularity = ref("daily");
     const selectedUsageKey = ref("");
     const usageStatsData = ref([]);
-        const apiKeys = ref([]);
+    const apiKeys = ref([]);
     const newKeyName = ref("");
     const newKeyValue = ref("");
     const newModelName = ref("");
@@ -108,7 +108,7 @@ const app = createApp({
     const realModelEditIndex = ref(-1);
     const realModelForm = reactive({ provider: "", model: "", weight: 1, tier: "", cost: 0, timeout: 3000 });
     const providerNames = computed(() => { const keys = Object.keys(providersConfig); return keys.length ? keys : ["seneenova", "seneenova_me", "deepseek_openai", "deepseek_anthropic", "openai", "anthropic", "xiaomi_tp", "glm", "nvidia"]; });
-        const providersConfig = reactive({});
+    const providersConfig = reactive({});
     const showAddProviderModal = ref(false);
     const providerEditName = ref("");
     const providerForm = reactive({ name: "", base_url: "", api_key: "", protocol: "openai", timeout: 3000 });
