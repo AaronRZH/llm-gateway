@@ -199,6 +199,11 @@ func (p *Provider) buildRequest(ctx context.Context, method string, url string, 
 
 	if stream {
 		reqBody["stream"] = true
+		// OpenAI 流式默认不返回 usage，需显式开启；Anthropic 流式默认自带 usage，无需设置
+		// buildRequest 只用于 OpenAI 格式请求体，故此处安全注入
+		reqBody["stream_options"] = map[string]interface{}{
+			"include_usage": true,
+		}
 	}
 
 	jsonBody, err := json.Marshal(reqBody)
