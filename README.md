@@ -18,8 +18,8 @@
 ```mermaid
 flowchart TB
     subgraph Clients
-        OpenAI_SDK[OpenAI SDK<br/>(Chat Completions)]
-        Anthropic_SDK[Anthropic SDK<br/>(/messages)]
+        OpenAI_SDK[OpenAI SDK]
+        Anthropic_SDK[Anthropic SDK]
     end
 
     subgraph Gateway[LLM Gateway]
@@ -30,17 +30,17 @@ flowchart TB
     end
 
     subgraph Backends[后端 LLM 服务]
-        OpenAI_Chat[OpenAI (Chat)]
+        OpenAI_Chat[OpenAI]
         Anthropic_API[Anthropic API]
-        DeepSeek[DeepSeek (OpenAI)]
-        ShangTang[商汤 (OpenAI)]
-        XiaoMi[小米 Turbo (OAI)]
+        DeepSeek[DeepSeek]
+        ShangTang[商汤]
+        XiaoMi[小米]
     end
 
     subgraph Storage[存储层]
-        PostgreSQL[(PostgreSQL<br/>主存储)]
-        FileStorage[(文件存储<br/>降级方案)]
-        Redis[(Redis<br/>API Key / 缓存)]
+        PostgreSQL[(PostgreSQL)]
+        FileStorage[(文件存储)]
+        Redis[(Redis)]
     end
 
     OpenAI_SDK -->|OpenAI 格式| GatewayCore
@@ -48,9 +48,9 @@ flowchart TB
 
     GatewayCore -->|OpenAI 格式| OpenAI_Chat
     GatewayCore -->|Anthropic 格式| Anthropic_API
-    GatewayCore -->|OpenAI 格式| DeepSeek
-    GatewayCore -->|OpenAI 格式| ShangTang
-    GatewayCore -->|OpenAI 格式| XiaoMi
+    GatewayCore -->|OpenAI/Anthropic 格式| DeepSeek
+    GatewayCore -->|OpenAI/Anthropic 格式| ShangTang
+    GatewayCore -->|OpenAI/Anthropic 格式| XiaoMi
 
     Admin --> PostgreSQL
     Admin --> Redis
