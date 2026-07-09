@@ -4,7 +4,7 @@
 
 ## 核心特性
 
-- **多 Provider 路由** — 支持 OpenAI / Anthropic / DeepSeek / 商汤日日新 / 小米 Turbo / GLM / NVIDIA 等多个上游，按 priority / round_robin / latency_optimized / cost_optimized 策略自动选路
+- **多 Provider 路由** — 支持 OpenAI / Anthropic / DeepSeek / 商汤日日新 / 小米 等多个上游，按 priority / round_robin / latency_optimized / cost_optimized 策略自动选路
 - **协议转换** — 客户端使用 OpenAI 格式，自动转换为 Anthropic 格式发往上游，反之亦然（非流式 + SSE 流式）
 - **模型 Tier 分级** — 虚拟模型名支持 `premium / standard / economy` 分级，路由时自动按级匹配和降级 fallback
 - **Token 估算 & 用量持久化** — 基于 `tiktoken-go` 本地估算，同时获取上游真实用量，写入 PostgreSQL（支持文件降级）
@@ -16,35 +16,49 @@
 ## 架构概览
 
 ```
-┌──────────────┐     ┌──────────────┐     ┌─────────────────┐
-│              │     │              │     │  OpenAI (Chat)   │◄── OpenAI 格式
-│  OpenAI SDK  │────▶│              │────▶├─────────────────┤
-│  (Chat Com-  │     │  LLM Gateway │     │  Anthropic API   │◄── Anthropic 格式
-│   pletions)  │     │              │     ├─────────────────┤
-│              │     │   port 8080  │     │  DeepSeek (OpenAI)│
-├──────────────┤     │              │     ├─────────────────┤
-│              │     │              │     │  商汤 (OpenAI)    │
-│ Anthropic    │────▶│              │────▶├─────────────────┤
-│ SDK          │     │  管理后台     │     │  小米 Turbo (OAI)│
-│ (/messages)  │     │   /admin     │     ├─────────────────┤
-└──────────────┘     │              │     │  GLM / NVIDIA   │
-                     │  Web UI      │     └─────────────────┘
-                     └──────┬───────┘
-                            │
-                    ┌───────┴───────┐
-                    │               │
-                    ▼               ▼
-             ┌──────────┐   ┌──────────┐
-             │ PostgreSQL │   │  文件存储  │
-             │ (主存储)   │   │ (降级方案) │
-             └──────────┘   └──────────┘
-                            │
-                            ▼
-                     ┌──────────┐
-                     │  Redis   │
-                     │(API Key / │
-                     │ 缓存)     │
-                     └──────────┘
+flowchart TB
+    subgraph Clients
+        OpenAI_SDK[OpenAI SDK<br/>(Chat Completions)]
+        Anthropic_SDK[Anthropic SDK<br/>(/messages)]
+    end
+
+    subgraph Gateway[LLM Gateway]
+        direction TB
+        GatewayCore[路由 & 协议转换]
+        Admin[管理后台 /admin]
+        WebUI[Web UI]
+    end
+
+    subgraph Backends[后端 LLM 服务]
+        OpenAI_Chat[OpenAI (Chat)]
+        Anthropic_API[Anthropic API]
+        DeepSeek[DeepSeek (OpenAI)]
+        ShangTang[商汤 (OpenAI)]
+        XiaoMi[小米 Turbo (OAI)]
+    end
+
+    subgraph Storage[存储层]
+        PostgreSQL[(PostgreSQL<br/>主存储)]
+        FileStorage[(文件存储<br/>降级方案)]
+        Redis[(Redis<br/>API Key / 缓存)]
+    end
+
+    OpenAI_SDK -->|OpenAI 格式| GatewayCore
+    Anthropic_SDK -->|Anthropic 格式| GatewayCore
+
+    GatewayCore -->|OpenAI 格式| OpenAI_Chat
+    GatewayCore -->|Anthropic 格式| Anthropic_API
+    GatewayCore -->|OpenAI 格式| DeepSeek
+    GatewayCore -->|OpenAI 格式| ShangTang
+    GatewayCore -->|OpenAI 格式| XiaoMi
+
+    Admin --> PostgreSQL
+    Admin --> Redis
+    WebUI --> PostgreSQL
+
+    GatewayCore -.->|缓存读取| Redis
+    GatewayCore -.->|降级写入| FileStorage
+    GatewayCore -->|持久化| PostgreSQL
 ```
 
 ### 请求生命周期
