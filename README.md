@@ -53,7 +53,6 @@ flowchart TB
 
     Admin --> PostgreSQL
     Admin --> Redis
-    WebUI --> PostgreSQL
 
     GatewayCore -.->|缓存读取| Redis
     GatewayCore -.->|降级写入| FileStorage
