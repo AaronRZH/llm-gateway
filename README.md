@@ -15,7 +15,7 @@
 
 ## 架构概览
 
-```
+```mermaid
 flowchart TB
     subgraph Clients
         OpenAI_SDK[OpenAI SDK<br/>(Chat Completions)]
