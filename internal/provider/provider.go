@@ -415,9 +415,10 @@ func (p *Provider) SendDirect(
 		return nil, err
 	}
 
-	// 上游返回错误状态码时，不直接 return，而是将 response 传给调用方处理
-	// 这样调用方可以读取 body 并转发给客户端，而不是丢失错误详情
-	return resp, nil
+	// 上游返回错误状态码时，将 response body 封装到 UpstreamHTTPError 中返回。
+	// 这样断路器可以统计失败次数，同时调用方（protocol.Resolve / handler）
+	// 能从 UpstreamHTTPError 中提取 body 并转发给客户端，而不是丢失错误详情。
+	return p.checkHTTPResponse(resp)
 }
 
 // ==================== 公开 Converter 方法（供 handler 调用） ====================

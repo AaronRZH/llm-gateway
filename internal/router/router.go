@@ -136,6 +136,9 @@ func (s *Service) SelectCandidates(ctx context.Context, virtualModel string, est
 
 	chain = s.getOrderedChain(strategy, chain)
 
+	// 过滤禁用的 real_model
+	chain = s.filterDisabled(chain)
+
 	// 按 virtualModel 的 tier 过滤 fallback chain
 	targetTier := s.resolveModelTier(virtualModel)
 	if targetTier != "" {
@@ -166,6 +169,17 @@ func (s *Service) resolveModelTier(virtualModel string) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.modelTiers[virtualModel]
+}
+
+// filterDisabled 过滤掉被禁用的 real_model 条目
+func (s *Service) filterDisabled(chain []config.FallbackItem) []config.FallbackItem {
+	var filtered []config.FallbackItem
+	for _, item := range chain {
+		if !item.Disabled {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered
 }
 
 // filterByTier 按 tier 过滤 fallback chain

@@ -138,11 +138,14 @@ func handleChatCompletion(
 			if upstream == nil {
 				if lastErr != nil {
 					log.Error().Err(lastErr).Msg("all upstream models failed for stream")
-					c.JSON(http.StatusServiceUnavailable, gin.H{"error": lastErr.Error()})
+					if ue, ok := lastErr.(*provider.UpstreamHTTPError); ok {
+						c.Data(ue.StatusCode, "application/json", ue.Body)
+						return
+					}
 				} else {
 					log.Error().Msg("all upstream models failed for stream")
-					c.JSON(http.StatusServiceUnavailable, gin.H{"error": "all upstream models failed"})
 				}
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "all upstream models failed"})
 				return
 			}
 
@@ -281,11 +284,16 @@ func handleChatCompletion(
 
 			if lastErr != nil {
 				log.Error().Err(lastErr).Msg("all upstream models failed for non-stream")
-				c.JSON(http.StatusServiceUnavailable, gin.H{"error": lastErr.Error()})
+				if ue, ok := lastErr.(*provider.UpstreamHTTPError); ok {
+					// SendDirect 路径（Case 4: Anthropic→Anthropic）的 4xx 透传：
+					// 客户端应该收到上游的原始状态码和 body，而不是泛化 503
+					c.Data(ue.StatusCode, "application/json", ue.Body)
+					return
+				}
 			} else {
 				log.Error().Msg("all upstream models failed for non-stream")
-				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "all upstream models failed"})
 			}
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "all upstream models failed"})
 			return
 		}
 	}
@@ -601,11 +609,14 @@ func handleAnthropicMessages(
 		if protocolResult == nil {
 			if lastErr != nil {
 				log.Error().Err(lastErr).Msg("all upstream models failed for anthropic /messages")
-				c.JSON(http.StatusServiceUnavailable, gin.H{"error": lastErr.Error()})
+				if ue, ok := lastErr.(*provider.UpstreamHTTPError); ok {
+					c.Data(ue.StatusCode, "application/json", ue.Body)
+					return
+				}
 			} else {
 				log.Error().Msg("all upstream models failed for anthropic /messages")
-				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "all upstream models failed"})
 			}
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "all upstream models failed"})
 			return
 		}
 
@@ -1674,6 +1685,7 @@ func handleAdminAddRealModel(cfg *config.Config, routerSvc *router.Service) gin.
 			Tier     string  `json:"tier"`
 			Cost     float64 `json:"cost"`
 			Timeout  string  `json:"timeout"`
+			Disabled bool    `json:"disabled"`
 		}
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body: " + err.Error()})
@@ -1697,6 +1709,7 @@ func handleAdminAddRealModel(cfg *config.Config, routerSvc *router.Service) gin.
 			Tier:     req.Tier,
 			Cost:     req.Cost,
 			Timeout:  timeout,
+			Disabled: req.Disabled,
 		}
 		cfg.RealModels.Models = append(cfg.RealModels.Models, item)
 		if err := cfg.AppendRealModel(item); err != nil {
@@ -1725,6 +1738,7 @@ func handleAdminUpdateRealModel(cfg *config.Config, routerSvc *router.Service) g
 			Tier     string  `json:"tier"`
 			Cost     float64 `json:"cost"`
 			Timeout  string  `json:"timeout"`
+			Disabled bool    `json:"disabled"`
 		}
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body: " + err.Error()})
@@ -1748,6 +1762,7 @@ func handleAdminUpdateRealModel(cfg *config.Config, routerSvc *router.Service) g
 			Tier:     req.Tier,
 			Cost:     req.Cost,
 			Timeout:  timeout,
+			Disabled: req.Disabled,
 		}
 		cfg.RealModels.Models[idx] = item
 		if err := cfg.UpdateRealModel(idx, item); err != nil {

@@ -42,7 +42,7 @@ func Resolve(req Request) (*Result, error) {
 
 	// handleProviderErr: treat 429 as non-breaker (backoff), 4xx/5xx as breaker errors
 	// UpstreamHTTPError 429 → return Result (nil error), breaker does not count
-	// UpstreamHTTPError 5xx/4xx → return nil + error, breaker counts
+	// UpstreamHTTPError 4xx/5xx → return nil + error, breaker counts
 	// Non-UpstreamHTTPError → return nil + error, breaker counts
 	handleProviderErr := func(err error) (*Result, error) {
 		if err == nil {

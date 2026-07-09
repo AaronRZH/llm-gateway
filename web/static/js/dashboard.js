@@ -106,7 +106,7 @@ const app = createApp({
     const appConfig = reactive({ name: "", version: "", env: "", port: 8080 });
     const showAddRealModelModal = ref(false);
     const realModelEditIndex = ref(-1);
-    const realModelForm = reactive({ provider: "", model: "", weight: 1, tier: "", cost: 0, timeout: 3000 });
+    const realModelForm = reactive({ provider: "", model: "", weight: 1, tier: "", cost: 0, timeout: 3000, disabled: false });
     const providerNames = computed(() => { const keys = Object.keys(providersConfig); return keys.length ? keys : ["seneenova", "seneenova_me", "deepseek_openai", "deepseek_anthropic", "openai", "anthropic", "xiaomi_tp", "glm", "nvidia"]; });
     const providersConfig = reactive({});
     const showAddProviderModal = ref(false);
@@ -270,6 +270,7 @@ const app = createApp({
       realModelForm.tier = m.tier || "";
       realModelForm.cost = m.cost || 0;
       realModelForm.timeout = m.timeout ? Math.floor(m.timeout / 1000) : 3000;
+      realModelForm.disabled = !!m.disabled;
       showAddRealModelModal.value = true;
     }
 
@@ -282,6 +283,7 @@ const app = createApp({
       realModelForm.tier = "";
       realModelForm.cost = 0;
       realModelForm.timeout = 3000;
+      realModelForm.disabled = false;
     }
 
     async function saveRealModel() {
@@ -296,6 +298,7 @@ const app = createApp({
         tier: realModelForm.tier || "",
         cost: realModelForm.cost || 0,
         timeout: (realModelForm.timeout || 3000) + "s",
+        disabled: realModelForm.disabled,
       };
 
       let url, method, successStatus;

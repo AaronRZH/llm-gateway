@@ -90,6 +90,7 @@ type FallbackItem struct {
 	Retry    int           `json:"retry" mapstructure:"retry" yaml:"retry"`
 	Cost     float64       `json:"cost" mapstructure:"cost" yaml:"cost"`
 	Tier     string        `json:"tier" mapstructure:"tier" yaml:"tier"`
+	Disabled bool          `json:"disabled" mapstructure:"disabled" yaml:"disabled"`
 }
 
 type CircuitBreakerConfig struct {

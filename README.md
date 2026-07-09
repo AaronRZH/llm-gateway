@@ -26,7 +26,6 @@ flowchart TB
         direction TB
         GatewayCore[路由 & 协议转换]
         Admin[管理后台 /admin]
-        WebUI[Web UI]
     end
 
     subgraph Backends[后端 LLM 服务]
@@ -241,6 +240,13 @@ real_models:
       timeout: 300s
       cost: 0.03
       tier: "economy"
+    - provider: "openai"
+      model: "gpt-4-turbo"
+      weight: 1
+      timeout: 300s
+      cost: 1.0
+      tier: "premium"
+      disabled: true   # 设为 true 后路由时跳过此条目，保留配置不删除
 ```
 
 #### 路由策略
@@ -262,6 +268,12 @@ gpt-4 (premium)  →  {anthropic/claude-sonnet-4-20250514 (premium),
 deepseek (economy) →  {seneenova/deepseek-v4-flash (economy),
                        xiaomi/mimo-v2.5-pro (standard)}  ← 也可以包含无 tier 通用候选
 ```
+
+#### 禁用模型
+
+通过 `disabled: true` 禁用某个 real_model 条目，该条目会被路由完全跳过（不参与任何路由策略），但配置保留在 YAML 中不被删除。适用于需要临时下线某个上游、又希望快速恢复的场景。
+
+在管理后台的 real_models 列表中可以看到每个条目的「状态」列（启用 / 禁用），编辑时勾选「禁用」复选框即可切换。
 
 ### 熔断器
 
@@ -423,7 +435,7 @@ CREATE TABLE usage_records (
 
 - **Provider 管理** — 新增/编辑/删除上游 Provider，实时生效
 - **API Key 管理** — 新增/删除访问密钥，同步至 Redis
-- **模型配置管理** — 管理虚拟模型和 real_model 列表，切换路由策略
+- **模型配置管理** — 管理虚拟模型和 real_model 列表，切换路由策略，支持按条目禁用/启用
 - **用量监控** — 按 API Key / 模型 / 时间粒度查询 Token 用量
 - **熔断器状态** — 实时查看各 Provider 熔断器状态
 
