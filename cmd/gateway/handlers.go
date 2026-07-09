@@ -1402,14 +1402,14 @@ func handleAdminProvidersConfig(cfg *config.Config) gin.HandlerFunc {
 		type safeProvider struct {
 			BaseURL  string `json:"base_url"`
 			Protocol string `json:"protocol"`
-			Timeout  string `json:"timeout"`
+			Timeout  int    `json:"timeout"` // 秒
 		}
 		providers := make(map[string]safeProvider)
 		for name, p := range cfg.Providers {
 			providers[name] = safeProvider{
 				BaseURL:  p.BaseURL,
 				Protocol: p.Protocol,
-				Timeout:  p.Timeout.String(),
+				Timeout:  int(p.Timeout.Seconds()),
 			}
 		}
 		c.JSON(http.StatusOK, gin.H{"data": providers})
@@ -1424,7 +1424,7 @@ func handleAdminAddProvider(cfg *config.Config, providerMgr *provider.Manager) g
 			BaseURL  string `json:"base_url"`
 			APIKey   string `json:"api_key"`
 			Protocol string `json:"protocol"`
-			Timeout  string `json:"timeout"`
+			Timeout  int    `json:"timeout"` // 秒
 		}
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body: " + err.Error()})
@@ -1441,8 +1441,8 @@ func handleAdminAddProvider(cfg *config.Config, providerMgr *provider.Manager) g
 		if req.Protocol == "" {
 			req.Protocol = "openai"
 		}
-		timeout, err := time.ParseDuration(req.Timeout)
-		if err != nil || timeout <= 0 {
+		timeout := time.Duration(req.Timeout) * time.Second
+		if timeout <= 0 {
 			timeout = 3000 * time.Second
 		}
 
@@ -1492,7 +1492,7 @@ func handleAdminUpdateProvider(cfg *config.Config, providerMgr *provider.Manager
 			BaseURL  string `json:"base_url"`
 			APIKey   string `json:"api_key"`
 			Protocol string `json:"protocol"`
-			Timeout  string `json:"timeout"`
+			Timeout  int    `json:"timeout"` // 秒
 		}
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body: " + err.Error()})
@@ -1515,11 +1515,8 @@ func handleAdminUpdateProvider(cfg *config.Config, providerMgr *provider.Manager
 			}
 			p.APIKey = "${" + envKey + "}"
 		}
-		if req.Timeout != "" {
-			timeout, err := time.ParseDuration(req.Timeout)
-			if err == nil && timeout > 0 {
-				p.Timeout = timeout
-			}
+		if req.Timeout > 0 {
+			p.Timeout = time.Duration(req.Timeout) * time.Second
 		}
 		cfg.Providers[name] = p
 		if err := cfg.SaveProvider(name, cfg.Providers[name]); err != nil {

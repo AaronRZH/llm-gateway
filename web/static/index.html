@@ -398,7 +398,7 @@
                 <td><code>{{ name }}</code></td>
                 <td><code class="url-wrap">{{ p.base_url }}</code></td>
                 <td><span class="protocol-badge">{{ p.protocol }}</span></td>
-                <td>{{ p.timeout }}</td>
+                <td>{{ p.timeout ? p.timeout + "s" : "—" }}</td>
                 <td>
                   <button class="btn btn-sm" style="background:#238636;color:#fff;border:none;padding:2px 10px;border-radius:4px;cursor:pointer;margin-right:4px;" @click="editProvider(name)">编辑</button>
                   <button class="btn btn-danger btn-sm" @click="deleteProvider(name)">删除</button>

@@ -269,7 +269,8 @@ const app = createApp({
       realModelForm.weight = m.weight || 1;
       realModelForm.tier = m.tier || "";
       realModelForm.cost = m.cost || 0;
-      realModelForm.timeout = m.timeout ? Math.floor(m.timeout / 1000) : 3000;
+      // Backend 的 time.Duration 在 JSON 里以纳秒为单位序列化，需要 ÷ 1e9 转为秒
+      realModelForm.timeout = m.timeout ? Math.floor(m.timeout / 1000000000) : 3000;
       realModelForm.disabled = !!m.disabled;
       showAddRealModelModal.value = true;
     }
@@ -347,7 +348,7 @@ const app = createApp({
       providerForm.base_url = p.base_url;
       providerForm.api_key = "";
       providerForm.protocol = p.protocol || "openai";
-      providerForm.timeout = parseTimeout(p.timeout) || 3000;
+      providerForm.timeout = (p.timeout != null && p.timeout > 0) ? p.timeout : 3000;
       showAddProviderModal.value = true;
     }
 
@@ -361,15 +362,6 @@ const app = createApp({
       providerForm.timeout = 3000;
     }
 
-    function parseTimeout(s) {
-      if (!s) return 3000;
-      const m = s.match(/^(\d+)s$/);
-      if (m) return parseInt(m[1]);
-      const m2 = s.match(/^(\d+)m0s$/);
-      if (m2) return parseInt(m2[1]) * 60;
-      return 3000;
-    }
-
     async function saveProvider() {
       if (!providerForm.name || !providerForm.base_url) {
         alert("请填写名称和 Base URL");
@@ -379,7 +371,7 @@ const app = createApp({
         base_url: providerForm.base_url,
         api_key: providerForm.api_key || "",
         protocol: providerForm.protocol,
-        timeout: (providerForm.timeout || 3000) + "s",
+        timeout: providerForm.timeout || 3000,
       };
       let url, method, successStatus;
       if (providerEditName.value) {
