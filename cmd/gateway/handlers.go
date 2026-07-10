@@ -65,7 +65,7 @@ func handleChatCompletion(
 		// 3. 路由选择 — 获取候选列表（支持 fallback 重试）
 		sel, err := routerSvc.SelectCandidates(c.Request.Context(), req.Model, inputTokens)
 		if err != nil {
-			log.Error().Err(err).Msg("router selection failed")
+			log.Error().Err(err).Str("model", req.Model).Str("tier", mapper.GetTier(req.Model)).Msg("router selection failed")
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no available model"})
 			return
 		}
@@ -499,7 +499,7 @@ func handleAnthropicMessages(
 		// 3. 路由选择 — 获取候选列表（支持 fallback 重试）
 		sel, err := routerSvc.SelectCandidates(c.Request.Context(), req.Model, inputTokens)
 		if err != nil {
-			log.Error().Err(err).Msg("anthropic router selection failed")
+			log.Error().Err(err).Str("model", req.Model).Str("tier", mapper.GetTier(req.Model)).Msg("anthropic router selection failed")
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no available model"})
 			return
 		}
