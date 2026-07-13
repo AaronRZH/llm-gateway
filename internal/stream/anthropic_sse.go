@@ -368,6 +368,9 @@ type OpenAIStreamConverter struct {
 	streamID string
 	created  int64
 
+	// doneWritten 标记 [DONE] 是否已发送，确保恰好发送一次
+	doneWritten bool
+
 	// wg 等待 convert goroutine 完成
 	wg sync.WaitGroup
 }
@@ -439,6 +442,14 @@ func (c *OpenAIStreamConverter) convert() {
 		switch eventType {
 		case "message_start":
 			c.state = oaiStateStarted
+			// Anthropic 的 input_tokens 在 message_start.message.usage 中，需在此提取
+			if msg, ok := event["message"].(map[string]interface{}); ok {
+				if u, ok := msg["usage"].(map[string]interface{}); ok {
+					if v, ok := u["input_tokens"].(float64); ok {
+						c.promptTokens = int(v)
+					}
+				}
+			}
 
 		case "content_block_start":
 			index, _ := event["index"].(float64)
@@ -507,10 +518,8 @@ func (c *OpenAIStreamConverter) convert() {
 			}
 
 			var outputTokens int
+			// output_tokens 在 message_delta.usage 中；input_tokens 已在 message_start 提取
 			if usage != nil {
-				if v, ok := usage["input_tokens"].(float64); ok {
-					c.promptTokens = int(v)
-				}
 				if v, ok := usage["output_tokens"].(float64); ok {
 					outputTokens = int(v)
 				}
@@ -525,15 +534,15 @@ func (c *OpenAIStreamConverter) convert() {
 			c.writeUsage(outputTokens)
 
 		case "message_stop":
-			if c.state != oaiStateDone {
+			if !c.doneWritten {
 				c.writeDone()
 			}
 			c.state = oaiStateDone
 		}
 	}
 
-	// 扫描结束，确保完成
-	if c.state != oaiStateDone {
+	// 扫描结束，确保发送 [DONE] 终止符（恰好一次）
+	if !c.doneWritten {
 		c.writeDone()
 	}
 }
@@ -582,6 +591,7 @@ func (c *OpenAIStreamConverter) writeUsage(outputTokens int) {
 
 // writeDone 写 [DONE] 标记
 func (c *OpenAIStreamConverter) writeDone() {
+	c.doneWritten = true
 	fmt.Fprintf(c.pw, "data: [DONE]\n\n")
 }
 
