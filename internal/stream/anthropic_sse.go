@@ -121,8 +121,13 @@ func (c *AnthropicSSEConverter) convert() {
 			continue
 		}
 
-		// 非 data: 行，忽略
+		// 非 data: 行
 		if !bytes.HasPrefix(line, []byte("data: ")) {
+			// SSE 注释行（如 OpenAI 保活 ": ping" / ": OPENAI-KEEP-ALIVE"）原样转发为保活，
+			// 避免长生成空闲期网关→Anthropic 客户端连接静默被代理超时断开。
+			if len(line) > 0 && line[0] == ':' {
+				fmt.Fprintf(c.pw, "%s\n\n", string(line))
+			}
 			continue
 		}
 
@@ -424,8 +429,13 @@ func (c *OpenAIStreamConverter) convert() {
 			continue
 		}
 
-		// 非 data: 行，忽略
+		// 非 data: 行
 		if !bytes.HasPrefix(line, []byte("data: ")) {
+			// SSE 注释行（如 OpenAI 保活 ": ping" / ": OPENAI-KEEP-ALIVE"）原样转发为保活，
+			// 避免长生成空闲期网关→Anthropic 客户端连接静默被代理超时断开。
+			if len(line) > 0 && line[0] == ':' {
+				fmt.Fprintf(c.pw, "%s\n\n", string(line))
+			}
 			continue
 		}
 
@@ -538,6 +548,12 @@ func (c *OpenAIStreamConverter) convert() {
 				c.writeDone()
 			}
 			c.state = oaiStateDone
+
+		case "ping":
+			// Anthropic 空闲保活事件。原样丢弃会导致跨协议长生成时空窗期
+			// 网关→客户端连接静默，被中间代理（如 nginx proxy_read_timeout）断开。
+			// 翻译为 OpenAI 客户端可识别的 SSE 注释保活。
+			c.writePing()
 		}
 	}
 
@@ -593,6 +609,11 @@ func (c *OpenAIStreamConverter) writeUsage(outputTokens int) {
 func (c *OpenAIStreamConverter) writeDone() {
 	c.doneWritten = true
 	fmt.Fprintf(c.pw, "data: [DONE]\n\n")
+}
+
+// writePing 写 SSE 注释保活，避免长生成空闲期客户端连接被代理超时断开
+func (c *OpenAIStreamConverter) writePing() {
+	fmt.Fprintf(c.pw, ": ping\n\n")
 }
 
 // writeSSE 将 event 以 SSE 格式写入 writer（AnthropicSSEConverter 用）
