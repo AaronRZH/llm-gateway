@@ -104,6 +104,8 @@ func (c *AnthropicSSEConverter) convert() {
 
 	scanner := bufio.NewScanner(c.upstream)
 	scanner.Split(bufio.ScanLines)
+	// 放大行缓冲：默认 64KB，超长 SSE 行（如超长 tool_call arguments）会触发 "token too long" 提前断流
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 
 	// 用于累积 tool_use 信息
 	var toolID string
@@ -408,6 +410,8 @@ func (c *OpenAIStreamConverter) convert() {
 
 	scanner := bufio.NewScanner(c.upstream)
 	scanner.Split(bufio.ScanLines)
+	// 放大行缓冲：默认 64KB，超长 SSE 行（如超长 tool_call arguments）会触发 "token too long" 提前断流
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 
 	for scanner.Scan() {
 		line := scanner.Bytes()

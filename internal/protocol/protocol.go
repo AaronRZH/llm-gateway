@@ -178,6 +178,7 @@ func Resolve(req Request) (*Result, error) {
 				toProviderMessages(req.ChatReq.Messages),
 				toProviderTools(req.ChatReq.Tools),
 				provider.ProtocolOpenAI,
+				req.ChatReq.MaxTokens,
 			)
 			if r, e := handleProviderErr(err); r != nil || e != nil {
 				return r, e
@@ -193,6 +194,7 @@ func Resolve(req Request) (*Result, error) {
 			toProviderMessages(req.ChatReq.Messages),
 			toProviderTools(req.ChatReq.Tools),
 			provider.ProtocolOpenAI,
+			req.ChatReq.MaxTokens,
 		)
 		if r, e := handleProviderErr(err); r != nil || e != nil {
 			return r, e

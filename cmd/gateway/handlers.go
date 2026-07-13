@@ -151,16 +151,16 @@ func handleChatCompletion(
 
 			defer upstream.Close()
 
-			c.Header("Content-Type", "text/event-stream")
-			c.Header("Cache-Control", "no-cache")
-			c.Header("Connection", "keep-alive")
+		c.Header("Content-Type", "text/event-stream")
+		c.Header("Cache-Control", "no-cache")
+		c.Header("Connection", "keep-alive")
 
-			result := streamHandler.RewriteAndForward(c.Writer, upstream, req.Model)
+		// 记录首字节延迟（用于 latency_optimized 策略），在流开始前记录，与另一 handler 口径一致
+		if targetProvider != "" {
+			routerSvc.RecordLatency(targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
+		}
 
-			// 记录延迟（用于 latency_optimized 策略）
-			if targetProvider != "" {
-				routerSvc.RecordLatency(targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
-			}
+		result := streamHandler.RewriteAndForward(c.Writer, upstream, req.Model)
 
 			// 5. 流式：根据累计内容估算输出 token，异步记录用量
 			estimatedOutput := tokenService.EstimateOutput(result.AccumulatedContent, req.Model)

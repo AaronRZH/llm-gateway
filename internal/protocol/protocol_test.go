@@ -16,8 +16,8 @@ type providerBehavior interface {
 	GetProtocol() provider.ClientProtocol
 	Chat(ctx context.Context, model string, messages []provider.Message, tools []provider.Tool) (body []byte, err error)
 	StreamChat(ctx context.Context, model string, messages []provider.Message, tools []provider.Tool) (streamBody string, err error)
-	ChatWithProtocol(ctx context.Context, model string, messages []provider.Message, tools []provider.Tool, clientProtocol provider.ClientProtocol) (body []byte, err error)
-	StreamChatWithProtocol(ctx context.Context, model string, messages []provider.Message, tools []provider.Tool, clientProtocol provider.ClientProtocol) (streamBody string, err error)
+	ChatWithProtocol(ctx context.Context, model string, messages []provider.Message, tools []provider.Tool, clientProtocol provider.ClientProtocol, maxTokens int) (body []byte, err error)
+	StreamChatWithProtocol(ctx context.Context, model string, messages []provider.Message, tools []provider.Tool, clientProtocol provider.ClientProtocol, maxTokens int) (streamBody string, err error)
 	SendDirect(ctx context.Context, model string, messages []map[string]interface{}, system interface{}, extraParams map[string]interface{}, stream bool) (body []byte, err error)
 	ConvertAnthropicMessagesToOpenAI(messages []map[string]interface{}, system interface{}, tools []map[string]interface{}) ([]provider.Message, []provider.Tool)
 	ConvertOpenAIToAnthropicResponse(body []byte, virtualModel string, inputTokens int) ([]byte, error)
@@ -55,7 +55,7 @@ func (mockProvider) StreamChat(_ context.Context, _ string, _ []provider.Message
 	return "", nil
 }
 
-func (m *mockProvider) ChatWithProtocol(_ context.Context, _ string, _ []provider.Message, _ []provider.Tool, _ provider.ClientProtocol) ([]byte, error) {
+func (m *mockProvider) ChatWithProtocol(_ context.Context, _ string, _ []provider.Message, _ []provider.Tool, _ provider.ClientProtocol, _ int) ([]byte, error) {
 	m.calls = append(m.calls, "ChatWithProtocol")
 	if m.chatBody != nil {
 		return m.chatBody, nil
@@ -63,7 +63,7 @@ func (m *mockProvider) ChatWithProtocol(_ context.Context, _ string, _ []provide
 	return []byte(`{}`), nil
 }
 
-func (mockProvider) StreamChatWithProtocol(_ context.Context, _ string, _ []provider.Message, _ []provider.Tool, _ provider.ClientProtocol) (string, error) {
+func (mockProvider) StreamChatWithProtocol(_ context.Context, _ string, _ []provider.Message, _ []provider.Tool, _ provider.ClientProtocol, _ int) (string, error) {
 	return "", nil
 }
 

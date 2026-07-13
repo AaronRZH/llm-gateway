@@ -65,6 +65,8 @@ func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadClose
 
 	scanner := bufio.NewScanner(upstream)
 	scanner.Split(bufio.ScanLines)
+	// 放大行缓冲：默认 64KB，超长 SSE 行（如超长 tool_call arguments）会触发 "token too long" 提前断流
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 
 	for scanner.Scan() {
 		line := scanner.Bytes()

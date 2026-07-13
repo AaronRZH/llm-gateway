@@ -7,9 +7,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"llm-gateway/internal/config"
 )
+
+// defaultResponseHeaderTimeout 首字节超时：超过该时间未收到上游响应头即判定失败，
+// 触发 fallback，避免被"连上但不返回"的慢 provider 长时间阻塞。
+const defaultResponseHeaderTimeout = 15 * time.Second
 
 // UpstreamHTTPError 表示上游返回非 2xx HTTP 状态码的错误。
 type UpstreamHTTPError struct {
@@ -104,8 +109,19 @@ func newBaseProvider(cfg config.ProviderConfig) (string, string, ClientProtocol,
 	if cfg.Protocol == "anthropic" {
 		proto = ProtocolAnthropic
 	}
+	transport := &http.Transport{
+		MaxIdleConns:        200,
+		MaxIdleConnsPerHost: 100,
+		MaxConnsPerHost:     100,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+		// 首字节超时：超过该时间未收到响应头即失败并触发 fallback，避免长时间阻塞
+		ResponseHeaderTimeout: defaultResponseHeaderTimeout,
+	}
+
 	return cfg.BaseURL, cfg.APIKey, proto, &http.Client{
-		Timeout: cfg.Timeout,
+		Timeout:   cfg.Timeout,
+		Transport: transport,
 	}
 }
 
@@ -234,11 +250,14 @@ func (p *Provider) buildRequest(ctx context.Context, method string, url string, 
 }
 
 // buildAnthropicRequest 构建 HTTP 请求（Anthropic 格式 body）
-func (p *Provider) buildAnthropicRequest(ctx context.Context, url string, model string, messages []map[string]interface{}, tools []map[string]interface{}, system interface{}, extraParams map[string]interface{}, stream bool) (*http.Request, error) {
+func (p *Provider) buildAnthropicRequest(ctx context.Context, url string, model string, messages []map[string]interface{}, tools []map[string]interface{}, system interface{}, extraParams map[string]interface{}, stream bool, maxTokens int) (*http.Request, error) {
+	if maxTokens <= 0 {
+		maxTokens = 4096
+	}
 	reqBody := map[string]interface{}{
 		"model":      model,
 		"messages":   messages,
-		"max_tokens": 4096,
+		"max_tokens": maxTokens,
 	}
 
 	if system != nil {
@@ -310,30 +329,30 @@ func (p *Provider) StreamChat(ctx context.Context, model string, messages []Mess
 }
 
 // ChatWithProtocol 带协议信息的 Chat
-func (p *Provider) ChatWithProtocol(ctx context.Context, model string, messages []Message, tools []Tool, clientProtocol ClientProtocol) (*http.Response, error) {
+func (p *Provider) ChatWithProtocol(ctx context.Context, model string, messages []Message, tools []Tool, clientProtocol ClientProtocol, maxTokens int) (*http.Response, error) {
 	if p.protocol == ProtocolAnthropic && clientProtocol == ProtocolOpenAI {
 		// 需要将 OpenAI 消息转换为 Anthropic 格式后发送
 		anthropicMsgs := p.getConverter().ConvertMessagesToAnthropic(messages)
 		convertedTools := p.getConverter().ConvertTools(tools)
-		return p.doSendAnthropic(ctx, model, anthropicMsgs, convertedTools)
+		return p.doSendAnthropic(ctx, model, anthropicMsgs, convertedTools, maxTokens)
 	}
 	return p.Chat(ctx, model, messages, tools)
 }
 
 // StreamChatWithProtocol 带协议信息的 StreamChat
-func (p *Provider) StreamChatWithProtocol(ctx context.Context, model string, messages []Message, tools []Tool, clientProtocol ClientProtocol) (io.ReadCloser, error) {
+func (p *Provider) StreamChatWithProtocol(ctx context.Context, model string, messages []Message, tools []Tool, clientProtocol ClientProtocol, maxTokens int) (io.ReadCloser, error) {
 	if p.protocol == ProtocolAnthropic && clientProtocol == ProtocolOpenAI {
 		// 需要将 OpenAI 消息转换为 Anthropic 格式后发送
 		anthropicMsgs := p.getConverter().ConvertMessagesToAnthropic(messages)
 		convertedTools := p.getConverter().ConvertTools(tools)
-		return p.doSendAnthropicStream(ctx, model, anthropicMsgs, convertedTools)
+		return p.doSendAnthropicStream(ctx, model, anthropicMsgs, convertedTools, maxTokens)
 	}
 	return p.StreamChat(ctx, model, messages, tools)
 }
 
 // doSendAnthropic 发送 Anthropic 格式消息（使用 OpenAI 格式请求体 + Anthropic 头）
-func (p *Provider) doSendAnthropic(ctx context.Context, model string, messages []map[string]interface{}, tools []map[string]interface{}) (*http.Response, error) {
-	req, err := p.buildAnthropicRequest(ctx, p.fullURL(""), model, messages, tools, nil, nil, false)
+func (p *Provider) doSendAnthropic(ctx context.Context, model string, messages []map[string]interface{}, tools []map[string]interface{}, maxTokens int) (*http.Response, error) {
+	req, err := p.buildAnthropicRequest(ctx, p.fullURL(""), model, messages, tools, nil, nil, false, maxTokens)
 	if err != nil {
 		return nil, err
 	}
@@ -350,8 +369,8 @@ func (p *Provider) doSendAnthropic(ctx context.Context, model string, messages [
 }
 
 // doSendAnthropicStream 发送 Anthropic 格式消息（流式）
-func (p *Provider) doSendAnthropicStream(ctx context.Context, model string, messages []map[string]interface{}, tools []map[string]interface{}) (io.ReadCloser, error) {
-	req, err := p.buildAnthropicRequest(ctx, p.fullURL(""), model, messages, tools, nil, nil, true)
+func (p *Provider) doSendAnthropicStream(ctx context.Context, model string, messages []map[string]interface{}, tools []map[string]interface{}, maxTokens int) (io.ReadCloser, error) {
+	req, err := p.buildAnthropicRequest(ctx, p.fullURL(""), model, messages, tools, nil, nil, true, maxTokens)
 	if err != nil {
 		return nil, err
 	}
@@ -410,7 +429,7 @@ func (p *Provider) SendDirect(
 		normalizedMessages[i] = normalized
 	}
 
-	req, err := p.buildAnthropicRequest(ctx, p.fullURL(""), model, normalizedMessages, nil, system, extraParams, stream)
+	req, err := p.buildAnthropicRequest(ctx, p.fullURL(""), model, normalizedMessages, nil, system, extraParams, stream, 0)
 	if err != nil {
 		return nil, err
 	}
