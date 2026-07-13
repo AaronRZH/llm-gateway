@@ -322,40 +322,50 @@ func extractToolCalls(payload []byte, result *StreamResult) {
 	}
 }
 
-// rewriteModelField 重写 JSON 中的 model 字段
+// rewriteModelField 重写 JSON 中的 model 字段（精确匹配 "model" 键，避免误中 "model_id" 等）
+//
+// 采用纯字节扫描，不做 json.Unmarshal，零解析开销。仅当 "model" 闭合引号后紧跟
+// （允许空白）':' 时才视为真正的 model 键，从而与 "model_id"/"model_name" 等区分开。
 func (h *Handler) rewriteModelField(payload []byte, virtualModel string) []byte {
-	// 快速路径：如果 payload 不包含 "model"，直接返回
-	if !bytes.Contains(payload, []byte(`"model"`)) {
-		return payload
+	key := []byte(`"model"`)
+	searchFrom := 0
+	for {
+		idx := bytes.Index(payload[searchFrom:], key)
+		if idx == -1 {
+			return payload
+		}
+		abs := searchFrom + idx
+
+		// 跳过 "model" 闭合引号后的空白，必须紧跟 ':' 才是真正的 model 键；
+		// 否则为 "model_id"/"model_name" 等，继续向后查找。
+		rest := payload[abs+len(key):]
+		i := 0
+		for i < len(rest) && (rest[i] == ' ' || rest[i] == '\t' || rest[i] == '\n' || rest[i] == '\r') {
+			i++
+		}
+		if i >= len(rest) || rest[i] != ':' {
+			searchFrom = abs + len(key)
+			continue
+		}
+
+		// 找到 model 值（下一个 "..." 字符串）的位置
+		valueStart := bytes.IndexByte(payload[abs+len(key):], '"')
+		if valueStart == -1 {
+			return payload
+		}
+		valueStart += abs + len(key) + 1
+
+		valueEnd := bytes.IndexByte(payload[valueStart:], '"')
+		if valueEnd == -1 {
+			return payload
+		}
+		valueEnd += valueStart
+
+		// 替换 model 值
+		result := make([]byte, 0, len(payload)-valueEnd+valueStart+len(virtualModel)+2)
+		result = append(result, payload[:valueStart]...)
+		result = append(result, virtualModel...)
+		result = append(result, payload[valueEnd:]...)
+		return result
 	}
-
-	// 使用简单替换（生产环境建议用 json 解析）
-	// 匹配 "model":"real-name" 替换为 "model":"virtual-name"
-
-	// 找到 "model" 后面的值
-	idx := bytes.Index(payload, []byte(`"model"`))
-	if idx == -1 {
-		return payload
-	}
-
-	// 找到 model 值的位置
-	valueStart := bytes.IndexByte(payload[idx+7:], '"')
-	if valueStart == -1 {
-		return payload
-	}
-	valueStart += idx + 7 + 1
-
-	valueEnd := bytes.IndexByte(payload[valueStart:], '"')
-	if valueEnd == -1 {
-		return payload
-	}
-	valueEnd += valueStart
-
-	// 替换 model 值
-	result := make([]byte, 0, len(payload)-valueEnd+valueStart+len(virtualModel)+2)
-	result = append(result, payload[:valueStart]...)
-	result = append(result, virtualModel...)
-	result = append(result, payload[valueEnd:]...)
-
-	return result
 }
