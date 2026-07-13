@@ -6,6 +6,11 @@ app:
   read_timeout: 60s
   write_timeout: 120s
   idle_timeout: 600s
+# 调试开关：默认全部关闭，避免生产环境暴露诊断端点
+# pprof_enabled 为 true 时，会在 127.0.0.1:<pprof_port> 暴露 /debug/pprof（仅本机可访问）
+debug:
+  pprof_enabled: false
+  pprof_port: 6060
 log:
   level: "info" # debug | info | warn | error
   format: "json" # json | console

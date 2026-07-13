@@ -1,6 +1,10 @@
 app:
   env: "prod"
   port: 8080
+# 调试开关：生产环境保持关闭，避免暴露 /debug/pprof
+debug:
+  pprof_enabled: false
+  pprof_port: 6060
 
 log:
   level: "warn"

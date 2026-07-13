@@ -14,6 +14,7 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	_ "net/http/pprof"
 
 	"llm-gateway/internal/auth"
 	"llm-gateway/internal/config"
@@ -157,6 +158,21 @@ func main() {
 	r.GET("/admin", func(c *gin.Context) {
 		c.File("web/static/index.html")
 	})
+
+	// 启动 pprof 调试端口（默认关闭，仅绑定 127.0.0.1，避免生产暴露）
+	if cfg.Debug.PprofEnabled {
+		pprofPort := cfg.Debug.PprofPort
+		if pprofPort == 0 {
+			pprofPort = 6060
+		}
+		go func() {
+			addr := fmt.Sprintf("127.0.0.1:%d", pprofPort)
+			log.Info().Str("addr", addr).Msg("pprof debug server enabled")
+			if err := http.ListenAndServe(addr, nil); err != nil && err != http.ErrServerClosed {
+				log.Error().Err(err).Msg("pprof debug server failed")
+			}
+		}()
+	}
 
 	// 启动 HTTP 服务
 	srv := &http.Server{

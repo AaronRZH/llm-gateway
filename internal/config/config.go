@@ -29,6 +29,7 @@ type Config struct {
 	Admin          AdminConfig               `mapstructure:"admin" yaml:"admin"`
 	APIKeys        []APIKeyConfig            `mapstructure:"api_keys" yaml:"api_keys"`
 	AuthWhitelist  []string                  `mapstructure:"auth_whitelist" yaml:"auth_whitelist"`
+	Debug          DebugConfig               `mapstructure:"debug" yaml:"debug"`
 
 	filePath string `mapstructure:"-" yaml:"-"` // 配置文件路径
 }
@@ -41,6 +42,14 @@ type AppConfig struct {
 	ReadTimeout  time.Duration `mapstructure:"read_timeout" yaml:"read_timeout"`
 	WriteTimeout time.Duration `mapstructure:"write_timeout" yaml:"write_timeout"`
 	IdleTimeout  time.Duration `mapstructure:"idle_timeout" yaml:"idle_timeout"`
+}
+
+// DebugConfig 调试相关开关，默认全部关闭，避免生产环境暴露诊断端点
+type DebugConfig struct {
+	// PprofEnabled 是否启用 pprof 调试端口（/debug/pprof）
+	PprofEnabled bool `mapstructure:"pprof_enabled" yaml:"pprof_enabled"`
+	// PprofPort pprof 监听端口，默认 6060；仅绑定 127.0.0.1，仅本机可访问
+	PprofPort int `mapstructure:"pprof_port" yaml:"pprof_port"`
 }
 
 type LogConfig struct {
