@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"time"
@@ -63,10 +64,13 @@ type FunctionChunk struct {
 	Arguments string
 }
 
-// RewriteAndForward 重写并转发 SSE 流，返回累计的响应内容。
+// RewriteAndForward 重写并转发 SSE 流，返回累计的响应内容与错误。
 // openAIClient 指示下游客户端协议：异常结束（上游 stall / 单行超长）时补发对应的终止符，
 // 避免客户端一直等待。OpenAI 客户端补发 [DONE]；Anthropic 客户端补发 message_stop。
-func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadCloser, virtualModel string, openAIClient bool) *StreamResult {
+//
+// 返回错误仅用于"上游侧异常结束"（空闲超时触发 / 单行超长 / 其它非 EOF 错误），供上层回报熔断；
+// 客户端主动断开（context.Canceled）或正常 EOF 返回 nil，不惩罚上游。
+func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadCloser, virtualModel string, openAIClient bool) (*StreamResult, error) {
 	upstream = NewIdleTimeoutReader(upstream, h.idleTimeout)
 	defer upstream.Close()
 
@@ -74,7 +78,7 @@ func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadClose
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		log.Error().Msg("response writer does not support flushing")
-		return result
+		return result, nil
 	}
 
 	scanner := bufio.NewScanner(upstream)
@@ -142,9 +146,11 @@ func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadClose
 			w.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
 		}
 		flusher.Flush()
+		// 上游侧异常（非客户端断开）：返回错误供上层回报熔断，避免坏上游不被熔断
+		return result, fmt.Errorf("stream ended abnormally: %w", err)
 	}
 
-	return result
+	return result, nil
 }
 
 // extractUsage 从 SSE chunk 提取真实 token 用量

@@ -160,7 +160,11 @@ func handleChatCompletion(
 			routerSvc.RecordLatency(targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
 		}
 
-		result := streamHandler.RewriteAndForward(c.Writer, upstream, req.Model, true)
+		result, streamErr := streamHandler.RewriteAndForward(c.Writer, upstream, req.Model, true)
+		// 流异常结束（上游 stall / 超长）回报熔断，避免坏上游不被熔断；客户端断开不惩罚上游
+		if streamErr != nil && target.Breaker != nil {
+			target.Breaker.Execute(func() (interface{}, error) { return nil, streamErr })
+		}
 
 			// 5. 流式：根据累计内容估算输出 token，异步记录用量
 			estimatedOutput := tokenService.EstimateOutput(result.AccumulatedContent, req.Model)
@@ -651,7 +655,11 @@ func handleAnthropicMessages(
 				routerSvc.RecordLatency(targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
 			}
 
-			result := streamHandler.RewriteAndForward(c.Writer, protocolResult.StreamBody, req.Model, false)
+			result, streamErr := streamHandler.RewriteAndForward(c.Writer, protocolResult.StreamBody, req.Model, false)
+			// 流异常结束（上游 stall / 超长）回报熔断，避免坏上游不被熔断；客户端断开不惩罚上游
+			if streamErr != nil && target.Breaker != nil {
+				target.Breaker.Execute(func() (interface{}, error) { return nil, streamErr })
+			}
 
 			// 估算输出 token（含 tool_calls）
 			estimatedOutput := tokenService.EstimateOutput(result.AccumulatedContent, req.Model)
