@@ -30,8 +30,16 @@ type Config struct {
 	APIKeys        []APIKeyConfig            `mapstructure:"api_keys" yaml:"api_keys"`
 	AuthWhitelist  []string                  `mapstructure:"auth_whitelist" yaml:"auth_whitelist"`
 	Debug          DebugConfig               `mapstructure:"debug" yaml:"debug"`
+	Stream         StreamConfig              `mapstructure:"stream" yaml:"stream"`
 
 	filePath string `mapstructure:"-" yaml:"-"` // 配置文件路径
+}
+
+// StreamConfig 流式转发相关配置
+type StreamConfig struct {
+	// IdleTimeout 上游读取空闲超时：超过该时间未收到任何数据，判定上游 stall 并终止流，
+	// 避免客户端看到流"中途卡住"。默认 120s。
+	IdleTimeout time.Duration `mapstructure:"idle_timeout" yaml:"idle_timeout"`
 }
 
 type AppConfig struct {
@@ -162,6 +170,7 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("app::read_timeout", 60*time.Second)
 	v.SetDefault("app::write_timeout", 120*time.Second)
 	v.SetDefault("app::idle_timeout", 120*time.Second)
+	v.SetDefault("stream::idle_timeout", 120*time.Second)
 	v.SetDefault("log::level", "info")
 	v.SetDefault("redis::addr", "localhost:6379")
 	v.SetDefault("postgres::host", "localhost")

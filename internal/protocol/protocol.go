@@ -185,7 +185,7 @@ func Resolve(req Request) (*Result, error) {
 			}
 			return &Result{
 				StatusCode: http.StatusOK,
-				StreamBody: stream.NewOpenAIStreamConverter(body, req.VirtualModel),
+				StreamBody: stream.NewOpenAIStreamConverter(body, req.VirtualModel, req.StreamHandler.IdleTimeout()),
 			}, nil
 		}
 		// 非流式：ChatWithProtocol 转换格式
@@ -226,7 +226,7 @@ func Resolve(req Request) (*Result, error) {
 		}
 		return &Result{
 			StatusCode: http.StatusOK,
-			StreamBody: stream.NewAnthropicSSEConverter(body, req.VirtualModel),
+			StreamBody: stream.NewAnthropicSSEConverter(body, req.VirtualModel, req.StreamHandler.IdleTimeout()),
 		}, nil
 	}
 

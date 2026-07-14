@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
@@ -14,11 +15,21 @@ import (
 
 // Handler SSE 流处理
 type Handler struct {
+	// idleTimeout 上游读取空闲超时：超过该时间未收到数据，判定上游 stall 并终止流，避免客户端看到流"中途卡住"（<=0 表示不启用）
+	idleTimeout time.Duration
 }
 
-// New 创建流处理器
-func New() *Handler {
-	return &Handler{}
+// New 创建流处理器，idleTimeout 为上游读取空闲超时（<=0 表示不启用）
+func New(idleTimeout time.Duration) *Handler {
+	return &Handler{idleTimeout: idleTimeout}
+}
+
+// IdleTimeout 返回配置的上游读取空闲超时
+func (h *Handler) IdleTimeout() time.Duration {
+	if h == nil {
+		return 0
+	}
+	return h.idleTimeout
 }
 
 // StreamResult 流式处理结果
@@ -52,8 +63,11 @@ type FunctionChunk struct {
 	Arguments string
 }
 
-// RewriteAndForward 重写并转发 SSE 流，返回累计的响应内容
-func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadCloser, virtualModel string) *StreamResult {
+// RewriteAndForward 重写并转发 SSE 流，返回累计的响应内容。
+// openAIClient 指示下游客户端协议：异常结束（上游 stall / 单行超长）时补发对应的终止符，
+// 避免客户端一直等待。OpenAI 客户端补发 [DONE]；Anthropic 客户端补发 message_stop。
+func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadCloser, virtualModel string, openAIClient bool) *StreamResult {
+	upstream = NewIdleTimeoutReader(upstream, h.idleTimeout)
 	defer upstream.Close()
 
 	result := &StreamResult{}
@@ -120,7 +134,14 @@ func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadClose
 	}
 
 	if err := scanner.Err(); err != nil && err != io.EOF && err != context.Canceled {
-		log.Error().Err(err).Msg("stream scan error")
+		log.Warn().Err(err).Msg("stream scan ended abnormally (upstream stall or line too long), sending terminator")
+		// 异常结束：补发终止符，避免客户端一直等待（context.Canceled 表示客户端已断开，无需补发）
+		if openAIClient {
+			w.Write([]byte("data: [DONE]\n\n"))
+		} else {
+			w.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
+		}
+		flusher.Flush()
 	}
 
 	return result

@@ -3,6 +3,7 @@ package stream
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/rs/zerolog/log"
 )
 
 // OpenAIStreamEvent OpenAI SSE chunk 的解析结构
@@ -55,6 +57,9 @@ type AnthropicSSEConverter struct {
 	// upstream 上游 SSE reader
 	upstream io.ReadCloser
 
+	// idleTimeout 上游读取空闲超时
+	idleTimeout time.Duration
+
 	// 状态
 	state       AnthropicSSEConverterState
 	model       string // 虚拟模型名
@@ -63,19 +68,23 @@ type AnthropicSSEConverter struct {
 	completionTokens int // from upstream usage
 	usageDone   bool
 
+	// ew 写错误检测器，用于客户端断开后及时退出转换循环
+	ew *errWriter
+
 	// wg 等待 convert goroutine 完成
 	wg sync.WaitGroup
 }
 
-// NewAnthropicSSEConverter 创建转换器
-func NewAnthropicSSEConverter(upstream io.ReadCloser, virtualModel string) *AnthropicSSEConverter {
+// NewAnthropicSSEConverter 创建转换器，idleTimeout 为上游读取空闲超时（<=0 表示不启用）
+func NewAnthropicSSEConverter(upstream io.ReadCloser, virtualModel string, idleTimeout time.Duration) *AnthropicSSEConverter {
 	pr, pw := io.Pipe()
 	c := &AnthropicSSEConverter{
-		pr:       pr,
-		pw:       pw,
-		upstream: upstream,
-		state:    stateIdle,
-		model:    virtualModel,
+		pr:         pr,
+		pw:         pw,
+		upstream:   upstream,
+		idleTimeout: idleTimeout,
+		state:      stateIdle,
+		model:      virtualModel,
 	}
 
 	c.wg.Add(1)
@@ -102,6 +111,10 @@ func (c *AnthropicSSEConverter) convert() {
 	defer c.upstream.Close()
 	defer c.wg.Done()
 
+	// 套空闲超时：上游静默 stall 时主动关闭底层 reader，避免转换循环永久阻塞
+	c.upstream = NewIdleTimeoutReader(c.upstream, c.idleTimeout)
+	c.ew = &errWriter{w: c.pw}
+
 	scanner := bufio.NewScanner(c.upstream)
 	scanner.Split(bufio.ScanLines)
 	// 放大行缓冲：默认 64KB，超长 SSE 行（如超长 tool_call arguments）会触发 "token too long" 提前断流
@@ -114,6 +127,10 @@ func (c *AnthropicSSEConverter) convert() {
 	inTool := false
 
 	for scanner.Scan() {
+		// 客户端断开（写失败）后及时退出，避免无谓读取上游
+		if c.ew.err != nil {
+			break
+		}
 		line := scanner.Bytes()
 
 		// SSE 分隔符，忽略
@@ -126,7 +143,7 @@ func (c *AnthropicSSEConverter) convert() {
 			// SSE 注释行（如 OpenAI 保活 ": ping" / ": OPENAI-KEEP-ALIVE"）原样转发为保活，
 			// 避免长生成空闲期网关→Anthropic 客户端连接静默被代理超时断开。
 			if len(line) > 0 && line[0] == ':' {
-				fmt.Fprintf(c.pw, "%s\n\n", string(line))
+				fmt.Fprintf(c.ew, "%s\n\n", string(line))
 			}
 			continue
 		}
@@ -167,7 +184,7 @@ func (c *AnthropicSSEConverter) convert() {
 					"model":   c.model,
 				},
 			}
-			writeSSE(c.pw, msgStart)
+			writeSSE(c.ew, msgStart)
 		}
 
 		// === 处理 tool_calls ===
@@ -179,7 +196,7 @@ func (c *AnthropicSSEConverter) convert() {
 				if int(idx) == 0 && !inTool {
 					// 关闭 text content block（如果有）
 					if c.hasContent {
-						writeSSE(c.pw, map[string]interface{}{
+						writeSSE(c.ew, map[string]interface{}{
 							"type":  "content_block_stop",
 							"index": 0,
 						})
@@ -199,7 +216,7 @@ func (c *AnthropicSSEConverter) convert() {
 					inTool = true
 
 					c.state = stateTool
-					writeSSE(c.pw, map[string]interface{}{
+					writeSSE(c.ew, map[string]interface{}{
 						"type":  "content_block_start",
 						"index": 1,
 						"content_block": map[string]interface{}{
@@ -215,7 +232,7 @@ func (c *AnthropicSSEConverter) convert() {
 				if hasFn {
 					if args, ok := fnRaw["arguments"].(string); ok {
 						toolInputBuf.WriteString(args)
-						writeSSE(c.pw, map[string]interface{}{
+						writeSSE(c.ew, map[string]interface{}{
 							"type":  "content_block_delta",
 							"index": 1,
 							"delta": map[string]interface{}{
@@ -240,7 +257,7 @@ func (c *AnthropicSSEConverter) convert() {
 			if !c.hasContent {
 				c.hasContent = true
 				// content_block_start（text）
-				writeSSE(c.pw, map[string]interface{}{
+				writeSSE(c.ew, map[string]interface{}{
 					"type":  "content_block_start",
 					"index": 0,
 					"content_block": map[string]interface{}{
@@ -251,7 +268,7 @@ func (c *AnthropicSSEConverter) convert() {
 			}
 
 			// content_block_delta（text_delta）
-			writeSSE(c.pw, map[string]interface{}{
+			writeSSE(c.ew, map[string]interface{}{
 				"type":  "content_block_delta",
 				"index": 0,
 				"delta": map[string]interface{}{
@@ -274,7 +291,11 @@ func (c *AnthropicSSEConverter) convert() {
 		}
 	}
 
-	// 扫描结束，确保完成
+	if err := scanner.Err(); err != nil && err != io.EOF && err != context.Canceled {
+		log.Warn().Err(err).Msg("anthropic converter: upstream scan ended abnormally (stall or line too long)")
+	}
+
+	// 扫描结束，确保完成（异常结束时也会补发 message_delta + message_stop，避免客户端一直等待）
 	if c.state != stateDone {
 		c.finish(c.hasContent || inTool, inTool, toolID, toolName, toolInputBuf.String())
 	}
@@ -288,7 +309,7 @@ func (c *AnthropicSSEConverter) finish(hasOpenBlock bool, inTool bool, toolID, t
 
 	// 关闭 text content block
 	if hasOpenBlock && !inTool {
-		writeSSE(c.pw, map[string]interface{}{
+		writeSSE(c.ew, map[string]interface{}{
 			"type":  "content_block_stop",
 			"index": 0,
 		})
@@ -296,7 +317,7 @@ func (c *AnthropicSSEConverter) finish(hasOpenBlock bool, inTool bool, toolID, t
 
 	// 关闭 tool_use content block
 	if inTool {
-		writeSSE(c.pw, map[string]interface{}{
+		writeSSE(c.ew, map[string]interface{}{
 			"type":  "content_block_stop",
 			"index": 1,
 		})
@@ -309,7 +330,7 @@ func (c *AnthropicSSEConverter) finish(hasOpenBlock bool, inTool bool, toolID, t
 	if c.promptTokens > 0 {
 		usage["input_tokens"] = c.promptTokens
 	}
-	writeSSE(c.pw, map[string]interface{}{
+	writeSSE(c.ew, map[string]interface{}{
 		"type": "message_delta",
 		"delta": map[string]interface{}{
 			"stop_reason":   "end_turn",
@@ -319,7 +340,7 @@ func (c *AnthropicSSEConverter) finish(hasOpenBlock bool, inTool bool, toolID, t
 	})
 
 	// message_stop
-	writeSSE(c.pw, map[string]interface{}{
+	writeSSE(c.ew, map[string]interface{}{
 		"type": "message_stop",
 	})
 
@@ -329,7 +350,7 @@ func (c *AnthropicSSEConverter) finish(hasOpenBlock bool, inTool bool, toolID, t
 // finishTool 关闭 tool_use content block，不发送 message_delta/message_stop
 func (c *AnthropicSSEConverter) finishTool(inTool bool, toolID, toolName, toolInput string) {
 	if inTool {
-		writeSSE(c.pw, map[string]interface{}{
+		writeSSE(c.ew, map[string]interface{}{
 			"type":  "content_block_stop",
 			"index": 1,
 		})
@@ -358,6 +379,9 @@ type OpenAIStreamConverter struct {
 	// upstream 上游 SSE reader（来自 Anthropic 上游的 SSE 流）
 	upstream io.ReadCloser
 
+	// idleTimeout 上游读取空闲超时
+	idleTimeout time.Duration
+
 	// 状态
 	state        OpenAIStreamState
 	model        string // 虚拟模型名
@@ -376,22 +400,26 @@ type OpenAIStreamConverter struct {
 	// doneWritten 标记 [DONE] 是否已发送，确保恰好发送一次
 	doneWritten bool
 
+	// ew 写错误检测器，用于客户端断开后及时退出转换循环
+	ew *errWriter
+
 	// wg 等待 convert goroutine 完成
 	wg sync.WaitGroup
 }
 
-// NewOpenAIStreamConverter 创建 Anthropic→OpenAI SSE 转换器
-func NewOpenAIStreamConverter(upstream io.ReadCloser, virtualModel string) *OpenAIStreamConverter {
+// NewOpenAIStreamConverter 创建 Anthropic→OpenAI SSE 转换器，idleTimeout 为上游读取空闲超时（<=0 表示不启用）
+func NewOpenAIStreamConverter(upstream io.ReadCloser, virtualModel string, idleTimeout time.Duration) *OpenAIStreamConverter {
 	pr, pw := io.Pipe()
 	id := uuid.New().String()[:12]
 	c := &OpenAIStreamConverter{
-		pr:       pr,
-		pw:       pw,
-		upstream: upstream,
-		state:    oaiStateIdle,
-		model:    virtualModel,
-		streamID: id,
-		created:  time.Now().Unix(),
+		pr:         pr,
+		pw:         pw,
+		upstream:   upstream,
+		idleTimeout: idleTimeout,
+		state:      oaiStateIdle,
+		model:      virtualModel,
+		streamID:   id,
+		created:    time.Now().Unix(),
 	}
 
 	c.wg.Add(1)
@@ -416,12 +444,20 @@ func (c *OpenAIStreamConverter) convert() {
 	defer c.upstream.Close()
 	defer c.wg.Done()
 
+	// 套空闲超时：上游静默 stall 时主动关闭底层 reader，避免转换循环永久阻塞
+	c.upstream = NewIdleTimeoutReader(c.upstream, c.idleTimeout)
+	c.ew = &errWriter{w: c.pw}
+
 	scanner := bufio.NewScanner(c.upstream)
 	scanner.Split(bufio.ScanLines)
 	// 放大行缓冲：默认 64KB，超长 SSE 行（如超长 tool_call arguments）会触发 "token too long" 提前断流
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 
 	for scanner.Scan() {
+		// 客户端断开（写失败）后及时退出，避免无谓读取上游
+		if c.ew.err != nil {
+			break
+		}
 		line := scanner.Bytes()
 
 		// SSE 分隔符，忽略
@@ -557,6 +593,10 @@ func (c *OpenAIStreamConverter) convert() {
 		}
 	}
 
+	if err := scanner.Err(); err != nil && err != io.EOF && err != context.Canceled {
+		log.Warn().Err(err).Msg("openai converter: upstream scan ended abnormally (stall or line too long)")
+	}
+
 	// 扫描结束，确保发送 [DONE] 终止符（恰好一次）
 	if !c.doneWritten {
 		c.writeDone()
@@ -608,16 +648,16 @@ func (c *OpenAIStreamConverter) writeUsage(outputTokens int) {
 // writeDone 写 [DONE] 标记
 func (c *OpenAIStreamConverter) writeDone() {
 	c.doneWritten = true
-	fmt.Fprintf(c.pw, "data: [DONE]\n\n")
+	fmt.Fprintf(c.ew, "data: [DONE]\n\n")
 }
 
 // writePing 写 SSE 注释保活，避免长生成空闲期客户端连接被代理超时断开
 func (c *OpenAIStreamConverter) writePing() {
-	fmt.Fprintf(c.pw, ": ping\n\n")
+	fmt.Fprintf(c.ew, ": ping\n\n")
 }
 
 // writeSSE 将 event 以 SSE 格式写入 writer（AnthropicSSEConverter 用）
-func writeSSE(w *io.PipeWriter, event map[string]interface{}) {
+func writeSSE(w io.Writer, event map[string]interface{}) {
 	data, err := json.Marshal(event)
 	if err != nil {
 		return
@@ -628,7 +668,7 @@ func writeSSE(w *io.PipeWriter, event map[string]interface{}) {
 // writeChunkPlain 将 JSON 主体以 OpenAI SSE 格式写入
 func (c *OpenAIStreamConverter) writeChunkPlain(jsonBody string) {
 	chunk := `{"id":"msg_` + c.streamID + `","object":"chat.completion.chunk","created":` + fmt.Sprintf("%d", c.created) + `,"model":"` + c.model + `","choices":[{"index":0,` + jsonBody + `}]}`
-	fmt.Fprintf(c.pw, "data: %s\n\n", chunk)
+	fmt.Fprintf(c.ew, "data: %s\n\n", chunk)
 }
 
 // escapeJSON 转义 JSON 值中的特殊字符（用于内嵌在 JSON 字符串中）

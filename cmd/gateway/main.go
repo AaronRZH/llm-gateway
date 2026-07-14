@@ -69,7 +69,7 @@ func main() {
 	tokenService := token.New(cfg.Token)
 	providerManager := provider.NewManager(cfg.Providers)
 	routerService := router.New(cfg.RealModels, providerManager, tokenService, cfg.CircuitBreaker, modelTiers)
-	streamHandler := stream.New()
+	streamHandler := stream.New(cfg.Stream.IdleTimeout)
 
 	// 初始化 Redis 客户端
 	redisClient := redisutil.New(redisutil.Config{

@@ -6,6 +6,9 @@ debug:
   pprof_enabled: false
   pprof_port: 6060
 
+# 流式转发配置
+stream:
+  idle_timeout: 120s # 上游读取空闲超时：超过该时间未收到数据判定上游 stall 并终止流，避免客户端看到流"中途卡住"
 log:
   level: "warn"
 

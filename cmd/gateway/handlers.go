@@ -160,7 +160,7 @@ func handleChatCompletion(
 			routerSvc.RecordLatency(targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
 		}
 
-		result := streamHandler.RewriteAndForward(c.Writer, upstream, req.Model)
+		result := streamHandler.RewriteAndForward(c.Writer, upstream, req.Model, true)
 
 			// 5. 流式：根据累计内容估算输出 token，异步记录用量
 			estimatedOutput := tokenService.EstimateOutput(result.AccumulatedContent, req.Model)
@@ -651,7 +651,7 @@ func handleAnthropicMessages(
 				routerSvc.RecordLatency(targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
 			}
 
-			result := streamHandler.RewriteAndForward(c.Writer, protocolResult.StreamBody, req.Model)
+			result := streamHandler.RewriteAndForward(c.Writer, protocolResult.StreamBody, req.Model, false)
 
 			// 估算输出 token（含 tool_calls）
 			estimatedOutput := tokenService.EstimateOutput(result.AccumulatedContent, req.Model)
