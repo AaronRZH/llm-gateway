@@ -79,7 +79,9 @@ func NewManager(cfg map[string]config.ProviderConfig) *Manager {
 	}
 
 	for name, pcfg := range cfg {
-		m.providers[name] = NewProvider(pcfg)
+		p := NewProvider(pcfg)
+		p.SetName(name)
+		m.providers[name] = p
 	}
 
 	return m
@@ -93,7 +95,9 @@ func (m *Manager) Get(name string) (Provider, bool) {
 
 // UpdateProvider 更新或新增 Provider 配置（运行时生效）
 func (m *Manager) UpdateProvider(name string, cfg config.ProviderConfig) {
-	m.providers[name] = NewProvider(cfg)
+	p := NewProvider(cfg)
+	p.SetName(name)
+	m.providers[name] = p
 }
 
 // DeleteProvider 删除 Provider（运行时生效）

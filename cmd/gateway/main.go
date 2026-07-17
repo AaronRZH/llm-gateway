@@ -22,11 +22,11 @@ import (
 	"llm-gateway/internal/mapper"
 	"llm-gateway/internal/middleware"
 	"llm-gateway/internal/provider"
-	redisutil "llm-gateway/pkg/redis"
 	"llm-gateway/internal/router"
 	"llm-gateway/internal/storage"
 	"llm-gateway/internal/stream"
 	"llm-gateway/internal/token"
+	redisutil "llm-gateway/pkg/redis"
 )
 
 func main() {
@@ -125,12 +125,12 @@ func main() {
 	r.GET("/admin/calibration", handleAdminCalibration(tokenService))
 	r.GET("/admin/breakers", handleAdminBreakers(routerService))
 	r.GET("/admin/usage/by-real-model", handleAdminUsageByRealModel(tokenService))
-		r.GET("/admin/usage/by-api-key", handleAdminUsageByAPIKey(authService, tokenService))
+	r.GET("/admin/usage/by-api-key", handleAdminUsageByAPIKey(authService, tokenService))
 
 	// 管理后台 API（扩展管理功能，需 AdminAuth 中间件）
 	adminAPI := r.Group("/admin")
-		// 管理后台登录（不需要 AdminAuth 中间件）
-		r.POST("/admin/login", handleAdminLogin(cfg))
+	// 管理后台登录（不需要 AdminAuth 中间件）
+	r.POST("/admin/login", handleAdminLogin(cfg))
 	adminAPI.Use(middleware.AdminAuth(cfg))
 	{
 		adminAPI.GET("/api-keys", handleAdminAPIKeys(authService))
@@ -240,8 +240,8 @@ func buildSeedKeys(apiKeys []config.APIKeyConfig) map[string]*auth.KeyInfo {
 	seedKeys := make(map[string]*auth.KeyInfo, len(apiKeys))
 	for _, k := range apiKeys {
 		seedKeys[k.Key] = &auth.KeyInfo{
-			Key:   k.Key,
-			Name:  k.Name,
+			Key:  k.Key,
+			Name: k.Name,
 		}
 	}
 	return seedKeys

@@ -300,6 +300,12 @@ code { font-family: "SF Mono", "Fira Code", monospace; font-size: 13px; }
 .btn-danger { color: var(--danger); border-color: var(--danger); }
 .btn-danger:hover { background: #f8514911; }
 .btn-sm { padding: 4px 10px; font-size: 12px; }
+/* 路由配置状态切换按钮 */
+.btn-toggle { padding: 4px 14px; font-size: 12px; border-radius: 12px; cursor: pointer; border: 1px solid transparent; transition: all 0.15s; font-weight: 600; }
+.btn-toggle.btn-on { background: #3fb95022; color: #3fb950; border-color: #3fb95066; }
+.btn-toggle.btn-on:hover { background: #3fb95033; }
+.btn-toggle.btn-off { background: #f8514922; color: #f85149; border-color: #f8514966; }
+.btn-toggle.btn-off:hover { background: #f8514933; }
 
 /* ============ Modal ============ */
 .modal-overlay {

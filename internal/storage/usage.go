@@ -57,7 +57,7 @@ type UsageStorage interface {
 	AggregateMonthly(startTime, endTime string) ([]UsageSummary, error)
 	AggregateByRealModel(startTime, endTime string) ([]UsageSummary, error)
 	AggregateByAPIKey(apiKey, granularity, startTime, endTime string) ([]UsageSummary, error)
-		SumTokensByAPIKey(apiKey, model, startTime, endTime string) (inputTokens, outputTokens, totalTokens, requestCount int, err error)
+	SumTokensByAPIKey(apiKey, model, startTime, endTime string) (inputTokens, outputTokens, totalTokens, requestCount int, err error)
 	SumTokensByTimeRange(startTime, endTime string) (inputTokens, outputTokens, totalTokens, requestCount int, err error)
 	AdminTotalStats(startTime, endTime string) (map[string]int64, error)
 	AdminDailyStats(startTime, endTime string) ([]UsageSummary, error)

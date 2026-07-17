@@ -276,7 +276,32 @@ func Resolve(req Request) (*Result, error) {
 func toProviderMessages(msgs []Message) []provider.Message {
 	out := make([]provider.Message, len(msgs))
 	for i, m := range msgs {
-		out[i] = provider.Message{Role: m.Role, Content: m.Content}
+		out[i] = provider.Message{
+			Role:       m.Role,
+			Content:    m.Content,
+			ToolCalls:  ConvertToolCalls(m.ToolCalls),
+			ToolCallID: m.ToolCallID,
+		}
+	}
+	return out
+}
+
+// ConvertToolCalls 将网关内部的 ToolCall 列表转为 provider 使用的 map 结构（OpenAI 格式），
+// 确保 tool_calls 的 id/type/function 原样转发给上游，避免出现 invalid tool_call_id。
+func ConvertToolCalls(tcs []ToolCall) []map[string]interface{} {
+	if len(tcs) == 0 {
+		return nil
+	}
+	out := make([]map[string]interface{}, len(tcs))
+	for i, tc := range tcs {
+		out[i] = map[string]interface{}{
+			"id":   tc.ID,
+			"type": tc.Type,
+			"function": map[string]interface{}{
+				"name":      tc.Function.Name,
+				"arguments": tc.Function.Arguments,
+			},
+		}
 	}
 	return out
 }

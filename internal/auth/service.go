@@ -32,8 +32,8 @@ type cacheEntry struct {
 // Service API Key 验证服务
 type Service struct {
 	rdb      *redis.Client
-	seedKeys map[string]*KeyInfo      // 从配置加载的初始 Key
-	cache    map[string]*cacheEntry   // 本地 LRU 缓存
+	seedKeys map[string]*KeyInfo    // 从配置加载的初始 Key
+	cache    map[string]*cacheEntry // 本地 LRU 缓存
 	mu       sync.RWMutex
 }
 

@@ -37,19 +37,19 @@ func (s *Service) SetStorage(st storage.UsageStorage) {
 
 // UsageRecord 用量记录（包含估算值和上游返回的真实值）
 type UsageRecord struct {
-	RequestID           string
-	Model               string
-	VirtualModel        string
-	EstimatedInput      int // 本地 tiktoken 估算输入
-	EstimatedOutput     int // 本地 tiktoken 估算输出
-	EstimatedToolCalls  int // 本地 tiktoken 估算 tool_calls 输出 token
-	RealInput           int // 上游 API 返回的 prompt_tokens
-	RealOutput          int // 上游 API 返回的 completion_tokens
-	RealTotal           int // 上游 API 返回的 total_tokens
-	Provider            string
-	ToolCalls           int // tool call 次数
-	APIKey              string // 请求使用的 API Key
-	Timestamp           int64
+	RequestID          string
+	Model              string
+	VirtualModel       string
+	EstimatedInput     int // 本地 tiktoken 估算输入
+	EstimatedOutput    int // 本地 tiktoken 估算输出
+	EstimatedToolCalls int // 本地 tiktoken 估算 tool_calls 输出 token
+	RealInput          int // 上游 API 返回的 prompt_tokens
+	RealOutput         int // 上游 API 返回的 completion_tokens
+	RealTotal          int // 上游 API 返回的 total_tokens
+	Provider           string
+	ToolCalls          int    // tool call 次数
+	APIKey             string // 请求使用的 API Key
+	Timestamp          int64
 }
 
 // New 创建 Token 服务
@@ -133,7 +133,7 @@ func (s *Service) EstimateToolCallsOutput(toolCalls []map[string]interface{}, mo
 				if args, ok := fnMap["arguments"]; ok {
 					argsStr := ""
 					switch v := args.(type) {
- 					case string:
+					case string:
 						argsStr = v
 					default:
 						bytes, _ := json.Marshal(v)
@@ -157,19 +157,19 @@ func (s *Service) RecordUsage(requestID, model, virtualModel, provider string,
 	realInput, realOutput, realTotal int, toolCalls int, apiKey string) {
 
 	record := UsageRecord{
-		RequestID:         requestID,
-		Model:             model,
-		VirtualModel:      virtualModel,
-		EstimatedInput:    estimatedInput,
-		EstimatedOutput:   estimatedOutput,
+		RequestID:          requestID,
+		Model:              model,
+		VirtualModel:       virtualModel,
+		EstimatedInput:     estimatedInput,
+		EstimatedOutput:    estimatedOutput,
 		EstimatedToolCalls: estimatedToolCalls,
-		RealInput:         realInput,
-		RealOutput:        realOutput,
-		RealTotal:         realTotal,
-		Provider:          provider,
-		ToolCalls:         toolCalls,
-		APIKey:            apiKey,
-		Timestamp:         time.Now().Unix(),
+		RealInput:          realInput,
+		RealOutput:         realOutput,
+		RealTotal:          realTotal,
+		Provider:           provider,
+		ToolCalls:          toolCalls,
+		APIKey:             apiKey,
+		Timestamp:          time.Now().Unix(),
 	}
 
 	select {
@@ -420,9 +420,9 @@ func (s *Service) CalibrationInfo() map[string]any {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return map[string]any{
-		"calibrated":       s.calibrated,
-		"total_estimated":  s.totalEstimates,
-		"total_real":       s.totalReal,
+		"calibrated":      s.calibrated,
+		"total_estimated": s.totalEstimates,
+		"total_real":      s.totalReal,
 		"calibration_ratio": func() float64 {
 			if !s.calibrated || s.totalReal == 0 {
 				return 1.0
@@ -431,4 +431,3 @@ func (s *Service) CalibrationInfo() map[string]any {
 		}(),
 	}
 }
-

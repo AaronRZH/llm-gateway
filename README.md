@@ -223,12 +223,14 @@ real_models:
   models:
     - provider: "anthropic"
       model: "claude-sonnet-4-20250514"
+      priority: 10        # 优先级，数值越小越优先；相同数值保持配置顺序
       weight: 70
       timeout: 300s
       cost: 3.0
       tier: "premium"
     - provider: "openai"
       model: "gpt-5"
+      priority: 20
       weight: 50
       timeout: 300s
       cost: 2.5
@@ -252,7 +254,7 @@ real_models:
 
 | 策略 | 说明 |
 |---|---|
-| `priority` | 按配置顺序依次尝试（默认） |
+| `priority` | 按显式 `priority` 字段升序尝试（数值越小越优先），相同 `priority` 保持配置顺序；未设置 `priority` 时退化为按配置顺序（默认） |
 | `round_robin` | 加权轮询，按 weight 分发 |
 | `latency_optimized` | 选择历史延迟最低的 Provider |
 | `cost_optimized` | 选择成本最低的 Provider |

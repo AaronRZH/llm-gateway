@@ -11,9 +11,9 @@ import (
 
 // Service 模型名 allowlist 服务
 type Service struct {
-	mu       sync.RWMutex
-	models   map[string]bool       // allowlist
-	modelTiers map[string]string   // name -> tier
+	mu         sync.RWMutex
+	models     map[string]bool   // allowlist
+	modelTiers map[string]string // name -> tier
 }
 
 // New 创建 allowlist 服务，接受 ModelEntry 列表

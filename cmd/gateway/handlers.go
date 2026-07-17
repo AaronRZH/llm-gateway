@@ -74,11 +74,12 @@ func handleChatCompletion(
 			// 流式响应 — 遍历候选直到连接成功
 			var upstream io.ReadCloser
 			var targetProvider string
+			var target *router.Target
 			var upstreamModel string
 			var start time.Time
 
 			var lastErr error
-			for target := sel.Next(); target != nil; target = sel.Next() {
+			for target = sel.Next(); target != nil; target = sel.Next() {
 				upstreamModel = target.Model
 				targetProvider = target.ProviderName
 
@@ -118,11 +119,15 @@ func handleChatCompletion(
 						log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
 						continue
 					}
-					if lastErr == nil {
-						lastErr = resolveErr
-					}
+				if lastErr == nil {
+					lastErr = resolveErr
+				}
+				if ue, ok := resolveErr.(*provider.UpstreamHTTPError); ok {
+					log.Error().Err(resolveErr).Str("provider", targetProvider).Str("body", string(ue.Body)).Msg("stream connect failed, trying next")
+				} else {
 					log.Error().Err(resolveErr).Str("provider", targetProvider).Msg("stream connect failed, trying next")
-					continue
+				}
+				continue
 				}
 				// 429 退避：不触发熔断，退避后继续 fallback 尝试下一个候选
 				if res.StatusCode == 429 {
@@ -137,11 +142,12 @@ func handleChatCompletion(
 
 			if upstream == nil {
 				if lastErr != nil {
-					log.Error().Err(lastErr).Msg("all upstream models failed for stream")
 					if ue, ok := lastErr.(*provider.UpstreamHTTPError); ok {
+						log.Error().Err(lastErr).Str("provider", ue.Provider).Str("body", string(ue.Body)).Msg("all upstream models failed for stream")
 						c.Data(ue.StatusCode, "application/json", ue.Body)
 						return
 					}
+					log.Error().Err(lastErr).Msg("all upstream models failed for stream")
 				} else {
 					log.Error().Msg("all upstream models failed for stream")
 				}
@@ -151,20 +157,20 @@ func handleChatCompletion(
 
 			defer upstream.Close()
 
-		c.Header("Content-Type", "text/event-stream")
-		c.Header("Cache-Control", "no-cache")
-		c.Header("Connection", "keep-alive")
+			c.Header("Content-Type", "text/event-stream")
+			c.Header("Cache-Control", "no-cache")
+			c.Header("Connection", "keep-alive")
 
-		// 记录首字节延迟（用于 latency_optimized 策略），在流开始前记录，与另一 handler 口径一致
-		if targetProvider != "" {
-			routerSvc.RecordLatency(targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
-		}
+			// 记录首字节延迟（用于 latency_optimized 策略），在流开始前记录，与另一 handler 口径一致
+			if targetProvider != "" {
+				routerSvc.RecordLatency(targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
+			}
 
-		result, streamErr := streamHandler.RewriteAndForward(c.Writer, upstream, req.Model, true)
-		// 流异常结束（上游 stall / 超长）回报熔断，避免坏上游不被熔断；客户端断开不惩罚上游
-		if streamErr != nil && target.Breaker != nil {
-			target.Breaker.Execute(func() (interface{}, error) { return nil, streamErr })
-		}
+			result, streamErr := streamHandler.RewriteAndForward(c.Writer, upstream, req.Model, true)
+			// 流异常结束（上游 stall / 超长）回报熔断，避免坏上游不被熔断；客户端断开不惩罚上游
+			if streamErr != nil && target.Breaker != nil {
+				target.Breaker.Execute(func() (interface{}, error) { return nil, streamErr })
+			}
 
 			// 5. 流式：根据累计内容估算输出 token，异步记录用量
 			estimatedOutput := tokenService.EstimateOutput(result.AccumulatedContent, req.Model)
@@ -196,7 +202,7 @@ func handleChatCompletion(
 			go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
 				inputTokens, estimatedOutput, estimatedToolCallsTokens, effInput, effOutput, effTotal, len(toolCalls), apiKey)
 
-			} else {
+		} else {
 			// 非流式响应 — 遍历候选直到请求成功
 			var targetProvider string
 			var upstreamModel string
@@ -243,11 +249,15 @@ func handleChatCompletion(
 						log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
 						continue
 					}
-					if lastErr == nil {
-						lastErr = resolveErr
-					}
+				if lastErr == nil {
+					lastErr = resolveErr
+				}
+				if ue, ok := resolveErr.(*provider.UpstreamHTTPError); ok {
+					log.Error().Err(resolveErr).Str("provider", targetProvider).Str("body", string(ue.Body)).Msg("upstream request failed, trying next")
+				} else {
 					log.Error().Err(resolveErr).Str("provider", targetProvider).Msg("upstream request failed, trying next")
-					continue
+				}
+				continue
 				}
 				// 429 退避：不触发熔断，退避后继续 fallback 尝试下一个候选
 				if res.StatusCode == 429 {
@@ -287,13 +297,14 @@ func handleChatCompletion(
 			}
 
 			if lastErr != nil {
-				log.Error().Err(lastErr).Msg("all upstream models failed for non-stream")
 				if ue, ok := lastErr.(*provider.UpstreamHTTPError); ok {
+					log.Error().Err(lastErr).Str("provider", ue.Provider).Str("body", string(ue.Body)).Msg("all upstream models failed for non-stream")
 					// SendDirect 路径（Case 4: Anthropic→Anthropic）的 4xx 透传：
 					// 客户端应该收到上游的原始状态码和 body，而不是泛化 503
 					c.Data(ue.StatusCode, "application/json", ue.Body)
 					return
 				}
+				log.Error().Err(lastErr).Msg("all upstream models failed for non-stream")
 			} else {
 				log.Error().Msg("all upstream models failed for non-stream")
 			}
@@ -515,10 +526,11 @@ func handleAnthropicMessages(
 		// 4. 遍历候选，带断路器保护和 fallback 重试
 		var protocolResult *protocol.Result
 		var targetProvider string
+		var target *router.Target
 		var upstreamModel string
 		var start time.Time
 		var lastErr error
-		for target := sel.Next(); target != nil; target = sel.Next() {
+		for target = sel.Next(); target != nil; target = sel.Next() {
 			upstreamModel = target.Model
 			targetProvider = target.ProviderName
 
@@ -593,11 +605,15 @@ func handleAnthropicMessages(
 					log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
 					continue
 				}
-				if lastErr == nil {
-					lastErr = resolveErr
-				}
+			if lastErr == nil {
+				lastErr = resolveErr
+			}
+			if ue, ok := resolveErr.(*provider.UpstreamHTTPError); ok {
+				log.Error().Err(resolveErr).Str("provider", targetProvider).Str("body", string(ue.Body)).Msg("anthropic upstream request failed, trying next")
+			} else {
 				log.Error().Err(resolveErr).Str("provider", targetProvider).Msg("anthropic upstream request failed, trying next")
-				continue
+			}
+			continue
 			}
 			// 429 退避：不触发熔断，退避后继续 fallback 尝试下一个候选
 			if res.StatusCode == 429 {
@@ -612,11 +628,12 @@ func handleAnthropicMessages(
 
 		if protocolResult == nil {
 			if lastErr != nil {
-				log.Error().Err(lastErr).Msg("all upstream models failed for anthropic /messages")
 				if ue, ok := lastErr.(*provider.UpstreamHTTPError); ok {
+					log.Error().Err(lastErr).Str("provider", ue.Provider).Str("body", string(ue.Body)).Msg("all upstream models failed for anthropic /messages")
 					c.Data(ue.StatusCode, "application/json", ue.Body)
 					return
 				}
+				log.Error().Err(lastErr).Msg("all upstream models failed for anthropic /messages")
 			} else {
 				log.Error().Msg("all upstream models failed for anthropic /messages")
 			}
@@ -715,7 +732,12 @@ func handleAnthropicMessages(
 func toProviderMessages(msgs []protocol.Message) []provider.Message {
 	out := make([]provider.Message, len(msgs))
 	for i, m := range msgs {
-		out[i] = provider.Message{Role: m.Role, Content: m.Content}
+		out[i] = provider.Message{
+			Role:       m.Role,
+			Content:    m.Content,
+			ToolCalls:  protocol.ConvertToolCalls(m.ToolCalls),
+			ToolCallID: m.ToolCallID,
+		}
 	}
 	return out
 }
@@ -1292,11 +1314,11 @@ func handleAdminAPIKeyUsage(authService *auth.Service, tokenService *token.Servi
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{
-			"key":            key,
-			"input_tokens":   inputTokens,
-			"output_tokens":  outputTokens,
-			"total_tokens":   totalTokens,
-			"request_count":  requestCount,
+			"key":           key,
+			"input_tokens":  inputTokens,
+			"output_tokens": outputTokens,
+			"total_tokens":  totalTokens,
+			"request_count": requestCount,
 		})
 	}
 }
@@ -1322,7 +1344,8 @@ func providerNameToEnvKey(name string) string {
 // resolveEnvKey 从现有 config 的 api_key 字段提取 env key 名称，
 // 如果不存在则从 provider name 推导。
 // 例如 "${SENSENOVA_AUTH_TOKEN}" → "SENSENOVA_AUTH_TOKEN"
-//     "" (新 provider) → providerNameToEnvKey(name)
+//
+//	"" (新 provider) → providerNameToEnvKey(name)
 func resolveEnvKey(apiKeyRef string, providerName string) string {
 	if strings.HasPrefix(apiKeyRef, "${") && strings.HasSuffix(apiKeyRef, "}") {
 		return apiKeyRef[2 : len(apiKeyRef)-1]
@@ -1622,7 +1645,7 @@ func handleAdminAddModel(mapperService *mapper.Service, routerSvc *router.Servic
 			c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 			return
 		}
-	if ok := mapperService.AddModel(req.Name, req.Tier); !ok {
+		if ok := mapperService.AddModel(req.Name, req.Tier); !ok {
 			c.JSON(http.StatusConflict, gin.H{"error": "model already exists"})
 			return
 		}
@@ -1686,6 +1709,7 @@ func handleAdminAddRealModel(cfg *config.Config, routerSvc *router.Service) gin.
 		var req struct {
 			Provider string  `json:"provider"`
 			Model    string  `json:"model"`
+			Priority int     `json:"priority"`
 			Weight   int     `json:"weight"`
 			Tier     string  `json:"tier"`
 			Cost     float64 `json:"cost"`
@@ -1710,6 +1734,7 @@ func handleAdminAddRealModel(cfg *config.Config, routerSvc *router.Service) gin.
 		item := config.FallbackItem{
 			Provider: req.Provider,
 			Model:    req.Model,
+			Priority: req.Priority,
 			Weight:   req.Weight,
 			Tier:     req.Tier,
 			Cost:     req.Cost,
@@ -1739,6 +1764,7 @@ func handleAdminUpdateRealModel(cfg *config.Config, routerSvc *router.Service) g
 		var req struct {
 			Provider string  `json:"provider"`
 			Model    string  `json:"model"`
+			Priority int     `json:"priority"`
 			Weight   int     `json:"weight"`
 			Tier     string  `json:"tier"`
 			Cost     float64 `json:"cost"`
@@ -1763,6 +1789,7 @@ func handleAdminUpdateRealModel(cfg *config.Config, routerSvc *router.Service) g
 		item := config.FallbackItem{
 			Provider: req.Provider,
 			Model:    req.Model,
+			Priority: req.Priority,
 			Weight:   req.Weight,
 			Tier:     req.Tier,
 			Cost:     req.Cost,
@@ -1880,9 +1907,9 @@ func handleAdminLogin(cfg *config.Config) gin.HandlerFunc {
 		}
 
 		c.JSON(http.StatusOK, gin.H{
-			"token":       token,
-			"expires_in":  exp,
-			"token_type":  "Bearer",
+			"token":      token,
+			"expires_in": exp,
+			"token_type": "Bearer",
 		})
 	}
 }

@@ -106,7 +106,7 @@ const app = createApp({
     const appConfig = reactive({ name: "", version: "", env: "", port: 8080 });
     const showAddRealModelModal = ref(false);
     const realModelEditIndex = ref(-1);
-    const realModelForm = reactive({ provider: "", model: "", weight: 1, tier: "", cost: 0, timeout: 3000, disabled: false });
+    const realModelForm = reactive({ provider: "", model: "", priority: 0, weight: 1, tier: "", cost: 0, timeout: 3000, disabled: false });
     const providerNames = computed(() => { const keys = Object.keys(providersConfig); return keys.length ? keys : ["seneenova", "seneenova_me", "deepseek_openai", "deepseek_anthropic", "openai", "anthropic", "xiaomi_tp", "glm", "nvidia"]; });
     const providersConfig = reactive({});
     const showAddProviderModal = ref(false);
@@ -267,6 +267,7 @@ const app = createApp({
       realModelForm.provider = m.provider;
       realModelForm.model = m.model;
       realModelForm.weight = m.weight || 1;
+      realModelForm.priority = m.priority || 0;
       realModelForm.tier = m.tier || "";
       realModelForm.cost = m.cost || 0;
       // Backend 的 time.Duration 在 JSON 里以纳秒为单位序列化，需要 ÷ 1e9 转为秒
@@ -281,6 +282,7 @@ const app = createApp({
       realModelForm.provider = "";
       realModelForm.model = "";
       realModelForm.weight = 1;
+      realModelForm.priority = 0;
       realModelForm.tier = "";
       realModelForm.cost = 0;
       realModelForm.timeout = 3000;
@@ -295,6 +297,7 @@ const app = createApp({
       const body = {
         provider: realModelForm.provider,
         model: realModelForm.model,
+        priority: realModelForm.priority || 0,
         weight: realModelForm.weight || 1,
         tier: realModelForm.tier || "",
         cost: realModelForm.cost || 0,
@@ -324,6 +327,32 @@ const app = createApp({
       } else {
         const err = await res.json().catch(() => ({}));
         alert("操作失败: " + (err.error || res.statusText));
+      }
+    }
+
+    async function toggleRealModel(index) {
+      const m = realModelConfig.models[index];
+      if (!m) return;
+      const body = {
+        provider: m.provider,
+        model: m.model,
+        priority: m.priority || 0,
+        weight: m.weight || 1,
+        tier: m.tier || "",
+        cost: m.cost || 0,
+        timeout: (m.timeout ? Math.floor(m.timeout / 1000000000) : 3000) + "s",
+        disabled: !m.disabled,
+      };
+      const res = await fetch("/admin/real-models/" + index, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+        body: JSON.stringify(body),
+      });
+      if (res.status === 200) {
+        await loadConfig();
+      } else {
+        const err = await res.json().catch(() => ({}));
+        alert("切换状态失败: " + (err.error || res.statusText));
       }
     }
 
@@ -457,7 +486,7 @@ const app = createApp({
       switchView, refreshAll: () => nextTick(loadOverview),
       loadUsageStats, addKey, deleteKey, addModel, deleteModel, updateStrategy,
       showAddRealModelModal, realModelEditIndex, realModelForm, providerNames,
-      editRealModel, closeRealModelModal, saveRealModel, deleteRealModel,
+      editRealModel, closeRealModelModal, saveRealModel, deleteRealModel, toggleRealModel,
       providersConfig, showAddProviderModal, providerEditName, providerForm,
       editProvider, closeProviderModal, saveProvider, deleteProvider,
       maskKey, copyKey, formatDate, formatNumber,

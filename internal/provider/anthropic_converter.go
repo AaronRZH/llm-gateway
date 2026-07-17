@@ -13,13 +13,13 @@ import (
 
 // AnthropicRequest 网关接收的完整 Anthropic 请求体
 type AnthropicRequest struct {
-	Model         string                 `json:"model"`
+	Model         string                   `json:"model"`
 	Messages      []map[string]interface{} `json:"messages"`
-	System        interface{}            `json:"system,omitempty"`
-	MaxTokens     int                    `json:"max_tokens"`
-	Temperature   float64                `json:"temperature,omitempty"`
-	TopP          float64                `json:"top_p,omitempty"`
-	StopSequences []string               `json:"stop_sequences,omitempty"`
+	System        interface{}              `json:"system,omitempty"`
+	MaxTokens     int                      `json:"max_tokens"`
+	Temperature   float64                  `json:"temperature,omitempty"`
+	TopP          float64                  `json:"top_p,omitempty"`
+	StopSequences []string                 `json:"stop_sequences,omitempty"`
 	Tools         []map[string]interface{} `json:"tools,omitempty"`
 	ToolChoice    map[string]interface{}   `json:"tool_choice,omitempty"`
 }
@@ -197,8 +197,8 @@ func (c *AnthropicConverter) ConvertTools(tools []Tool) []map[string]interface{}
 // ConvertRequest 将完整的 Anthropic 请求转换为后端请求体（OpenAI 格式）
 func (c *AnthropicConverter) ConvertRequest(req *AnthropicRequest) (map[string]interface{}, error) {
 	body := map[string]interface{}{
-		"model":    req.Model,
-		"messages": c.ConvertMessagesToOpenAI(req.Messages, req.System),
+		"model":      req.Model,
+		"messages":   c.ConvertMessagesToOpenAI(req.Messages, req.System),
 		"max_tokens": 4096,
 	}
 

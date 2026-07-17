@@ -21,8 +21,8 @@ type OpenAIStreamEvent struct {
 	Object  string `json:"object"`
 	Model   string `json:"model"`
 	Choices []struct {
-		Index        int `json:"index"`
-		Delta        struct {
+		Index int `json:"index"`
+		Delta struct {
 			Role      string                   `json:"role,omitempty"`
 			Content   string                   `json:"content,omitempty"`
 			ToolCalls []map[string]interface{} `json:"tool_calls,omitempty"`
@@ -41,10 +41,10 @@ type AnthropicSSEConverterState int
 
 const (
 	stateIdle      AnthropicSSEConverterState = iota // 等待开始
-	stateStarted                                      // message_start 已发送
-	stateStreaming                                    // 正在接收 content delta
-	stateTool                                         // 正在接收 tool_use delta
-	stateDone                                         // 已结束
+	stateStarted                                     // message_start 已发送
+	stateStreaming                                   // 正在接收 content delta
+	stateTool                                        // 正在接收 tool_use delta
+	stateDone                                        // 已结束
 )
 
 // AnthropicSSEConverter 将 OpenAI SSE 流实时转换为 Anthropic SSE 流
@@ -61,12 +61,12 @@ type AnthropicSSEConverter struct {
 	idleTimeout time.Duration
 
 	// 状态
-	state       AnthropicSSEConverterState
-	model       string // 虚拟模型名
-	hasContent  bool   // 是否已发送 content_block_start
-	promptTokens int
+	state            AnthropicSSEConverterState
+	model            string // 虚拟模型名
+	hasContent       bool   // 是否已发送 content_block_start
+	promptTokens     int
 	completionTokens int // from upstream usage
-	usageDone   bool
+	usageDone        bool
 
 	// ew 写错误检测器，用于客户端断开后及时退出转换循环
 	ew *errWriter
@@ -79,12 +79,12 @@ type AnthropicSSEConverter struct {
 func NewAnthropicSSEConverter(upstream io.ReadCloser, virtualModel string, idleTimeout time.Duration) *AnthropicSSEConverter {
 	pr, pw := io.Pipe()
 	c := &AnthropicSSEConverter{
-		pr:         pr,
-		pw:         pw,
-		upstream:   upstream,
+		pr:          pr,
+		pw:          pw,
+		upstream:    upstream,
 		idleTimeout: idleTimeout,
-		state:      stateIdle,
-		model:      virtualModel,
+		state:       stateIdle,
+		model:       virtualModel,
 	}
 
 	c.wg.Add(1)
@@ -236,7 +236,7 @@ func (c *AnthropicSSEConverter) convert() {
 							"type":  "content_block_delta",
 							"index": 1,
 							"delta": map[string]interface{}{
-								"type":        "input_json_delta",
+								"type":         "input_json_delta",
 								"partial_json": args,
 							},
 						})
@@ -365,9 +365,9 @@ type OpenAIStreamState int
 const (
 	oaiStateIdle      OpenAIStreamState = iota // 等待开始
 	oaiStateStarted                            // message_start 已处理
-	oaiStateStreaming                            // 正在处理 text content delta
-	oaiStateTool                                 // 正在处理 tool_use delta
-	oaiStateDone                                 // 已结束
+	oaiStateStreaming                          // 正在处理 text content delta
+	oaiStateTool                               // 正在处理 tool_use delta
+	oaiStateDone                               // 已结束
 )
 
 // OpenAIStreamConverter 将 Anthropic SSE 流实时转换为 OpenAI SSE 流
@@ -388,9 +388,9 @@ type OpenAIStreamConverter struct {
 	promptTokens int
 
 	// tool_use 累积
-	inTool   bool
-	toolID   string
-	toolName string
+	inTool    bool
+	toolID    string
+	toolName  string
 	toolInput strings.Builder
 
 	// id 和 created 用于全链路一致性
@@ -412,14 +412,14 @@ func NewOpenAIStreamConverter(upstream io.ReadCloser, virtualModel string, idleT
 	pr, pw := io.Pipe()
 	id := uuid.New().String()[:12]
 	c := &OpenAIStreamConverter{
-		pr:         pr,
-		pw:         pw,
-		upstream:   upstream,
+		pr:          pr,
+		pw:          pw,
+		upstream:    upstream,
 		idleTimeout: idleTimeout,
-		state:      oaiStateIdle,
-		model:      virtualModel,
-		streamID:   id,
-		created:    time.Now().Unix(),
+		state:       oaiStateIdle,
+		model:       virtualModel,
+		streamID:    id,
+		created:     time.Now().Unix(),
 	}
 
 	c.wg.Add(1)

@@ -29,9 +29,9 @@ func TestSelectCandidatesNoRace(t *testing.T) {
 	cfg := config.RealModelsConfig{
 		Strategy: "priority",
 		Models: []config.FallbackItem{
-            {Provider: "p1", Model: "m1", Weight: 1},
-            {Provider: "p2", Model: "m2", Weight: 1},
-        },
+			{Provider: "p1", Model: "m1", Weight: 1},
+			{Provider: "p2", Model: "m2", Weight: 1},
+		},
 	}
 
 	service := New(cfg, pm, nil, cbCfg, map[string]string{})
@@ -49,19 +49,19 @@ func TestSelectCandidatesNoRace(t *testing.T) {
 		defer wg.Done()
 		for i := 0; i < 200; i++ {
 			service.AddRealModel(config.FallbackItem{
-                Provider: "p3",
-                Model:    "m3",
-                Weight:   1,
-            })
+				Provider: "p3",
+				Model:    "m3",
+				Weight:   1,
+			})
 			n := len(service.realModelsCfg.Models)
 			if n > 2 {
-                service.DeleteRealModel(n - 1)
-            }
+				service.DeleteRealModel(n - 1)
+			}
 			service.UpdateRealModel(0, config.FallbackItem{
-                Provider: "p1",
-                Model:    "m1",
-                Weight:   2,
-            })
+				Provider: "p1",
+				Model:    "m1",
+				Weight:   2,
+			})
 		}
 	}()
 
@@ -72,8 +72,8 @@ func TestSelectCandidatesNoRace(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 200; i++ {
-                _, _ = service.SelectCandidates(ctx, "vm1", 0)
-            }
+				_, _ = service.SelectCandidates(ctx, "vm1", 0)
+			}
 		}()
 	}
 

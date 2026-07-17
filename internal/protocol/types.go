@@ -13,14 +13,15 @@ type ChatCompletionRequest struct {
 
 // Message 消息
 type Message struct {
-	Role      string     `json:"role"`
-	Content   string     `json:"content"`
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	Role       string     `json:"role"`
+	Content    string     `json:"content"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
 }
 
 // Tool 工具定义
 type Tool struct {
-	Type     string `json:"type"`
+	Type     string   `json:"type"`
 	Function ToolFunc `json:"function"`
 }
 
@@ -39,9 +40,9 @@ type ToolCallFunc struct {
 
 // ToolCall 工具调用（响应格式）
 type ToolCall struct {
-	ID       string        `json:"id"`
-	Type     string        `json:"type"`
-	Function ToolCallFunc  `json:"function"`
+	ID       string       `json:"id"`
+	Type     string       `json:"type"`
+	Function ToolCallFunc `json:"function"`
 }
 
 // ChatCompletionResponse OpenAI 兼容响应格式

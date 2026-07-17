@@ -102,6 +102,7 @@ type RealModelsConfig struct {
 type FallbackItem struct {
 	Provider string        `json:"provider" mapstructure:"provider" yaml:"provider"`
 	Model    string        `json:"model" mapstructure:"model" yaml:"model"`
+	Priority int           `json:"priority" mapstructure:"priority" yaml:"priority"`
 	Weight   int           `json:"weight" mapstructure:"weight" yaml:"weight"`
 	Timeout  time.Duration `json:"timeout" mapstructure:"timeout" yaml:"timeout"`
 	Retry    int           `json:"retry" mapstructure:"retry" yaml:"retry"`

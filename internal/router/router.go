@@ -201,6 +201,8 @@ func (s *Service) getOrderedChain(strategy string, chain []config.FallbackItem) 
 	}
 
 	switch strategy {
+	case "priority":
+		return s.priorityOrder(chain)
 	case "round_robin":
 		return s.roundRobinOrder(chain)
 	case "latency_optimized":
@@ -210,6 +212,18 @@ func (s *Service) getOrderedChain(strategy string, chain []config.FallbackItem) 
 	default:
 		return chain
 	}
+}
+
+// priorityOrder 按显式优先级升序排序（数值越小优先级越高，优先被尝试），
+// 优先级相同时保持稳定（保留配置/原有顺序）。未设置 Priority（0）的项按配置顺序参与排序，
+// 因此全 0 时退化为原有的“按配置顺序依次尝试”行为，向后兼容。
+func (s *Service) priorityOrder(chain []config.FallbackItem) []config.FallbackItem {
+	sorted := make([]config.FallbackItem, len(chain))
+	copy(sorted, chain)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		return sorted[i].Priority < sorted[j].Priority
+	})
+	return sorted
 }
 
 // roundRobinOrder 返回加权轮询排序后的 chain
