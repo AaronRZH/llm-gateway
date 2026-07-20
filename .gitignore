@@ -40,5 +40,5 @@ tmp/
 
 data/
 plans/
-# 编译产物
-gateway
+# 编译产物（锚定到仓库根目录，避免误忽略 cmd/gateway 源码目录）
+/gateway
