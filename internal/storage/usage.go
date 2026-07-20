@@ -458,7 +458,10 @@ func (s *RedisStorage) Persist(record UsageRecord) error {
 	pipe.LTrim(s.ctx, "usage:recent:"+record.APIKey, 0, 9999)
 	pipe.LPush(s.ctx, "usage:recent:all", data)
 	pipe.LTrim(s.ctx, "usage:recent:all", 0, 99999)
-	_, _ = pipe.Exec(s.ctx)
+	if _, err := pipe.Exec(s.ctx); err != nil {
+		// 写入失败不再静默吞掉，否则用量记录会无声丢失
+		log.Error().Err(err).Str("api_key", record.APIKey).Msg("redis persist usage failed")
+	}
 	return nil
 }
 

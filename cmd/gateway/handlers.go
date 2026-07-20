@@ -34,12 +34,24 @@ func handleChatCompletion(
 	routerSvc *router.Service,
 	streamHandler *stream.Handler,
 	tokenService *token.Service,
+	requestTimeout time.Duration,
 ) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		reqID := uuid.New().String()
 		log := log.With().Str("request_id", reqID).Logger()
 		apiKeyVal, _ := c.Get("api_key")
 		apiKey, _ := apiKeyVal.(string)
+
+		// 整体请求预算：所有 fallback 候选共享的总超时，避免 N×上游超时长时间堆积。
+		// 仅在 requestTimeout > 0 时启用；为 0 则沿用各 Provider 自身 Timeout。
+		reqCtx := c.Request.Context()
+		var cancelBudget context.CancelFunc
+		if requestTimeout > 0 {
+			reqCtx, cancelBudget = context.WithTimeout(reqCtx, requestTimeout)
+		}
+		if cancelBudget != nil {
+			defer cancelBudget()
+		}
 
 		var req protocol.ChatCompletionRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
@@ -63,9 +75,12 @@ func handleChatCompletion(
 		log.Debug().Int("input_tokens", inputTokens).Msg("token estimated")
 
 		// 3. 路由选择 — 获取候选列表（支持 fallback 重试）
-		sel, err := routerSvc.SelectCandidates(c.Request.Context(), req.Model, inputTokens)
+		sel, err := routerSvc.SelectCandidates(reqCtx, req.Model, inputTokens)
 		if err != nil {
 			log.Error().Err(err).Str("model", req.Model).Str("tier", mapper.GetTier(req.Model)).Msg("router selection failed")
+			// 记录失败请求（仅估算输入），计入请求次数，避免 dashboard 漏算
+			go tokenService.RecordUsageNow(reqID, "", req.Model, "",
+				inputTokens, 0, 0, 0, 0, 0, 0, apiKey)
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no available model"})
 			return
 		}
@@ -96,7 +111,7 @@ func handleChatCompletion(
 							UpstreamTarget: target,
 							ChatReq:        &req,
 							IsStream:       true,
-							Ctx:            c.Request.Context(),
+							Ctx:            reqCtx,
 							VirtualModel:   req.Model,
 						})
 					})
@@ -110,7 +125,7 @@ func handleChatCompletion(
 						UpstreamTarget: target,
 						ChatReq:        &req,
 						IsStream:       true,
-						Ctx:            c.Request.Context(),
+						Ctx:            reqCtx,
 						VirtualModel:   req.Model,
 					})
 				}
@@ -119,24 +134,28 @@ func handleChatCompletion(
 						log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
 						continue
 					}
-				if lastErr == nil {
-					lastErr = resolveErr
-				}
-				if ue, ok := resolveErr.(*provider.UpstreamHTTPError); ok {
-					log.Error().Err(resolveErr).Str("provider", targetProvider).Str("body", string(ue.Body)).Msg("stream connect failed, trying next")
-				} else {
-					log.Error().Err(resolveErr).Str("provider", targetProvider).Msg("stream connect failed, trying next")
-				}
-				continue
+					if lastErr == nil {
+						lastErr = resolveErr
+					}
+					if ue, ok := resolveErr.(*provider.UpstreamHTTPError); ok {
+						log.Error().Err(resolveErr).Str("provider", targetProvider).Str("body", string(ue.Body)).Msg("stream connect failed, trying next")
+					} else {
+						log.Error().Err(resolveErr).Str("provider", targetProvider).Msg("stream connect failed, trying next")
+					}
+					continue
 				}
 				// 429 退避：不触发熔断，退避后继续 fallback 尝试下一个候选
 				if res.StatusCode == 429 {
 					backoff := parseRetryAfter(res.Body, 5*time.Second)
 					log.Warn().Dur("backoff", backoff).Str("provider", targetProvider).Msg("rate limited (429), backing off")
-					sleepWithContext(c.Request.Context(), backoff)
+					sleepWithContext(reqCtx, backoff)
 					continue
 				}
 				upstream = res.StreamBody
+				// 流式连接已成功，释放整体预算，避免长连接被预算超时掐断
+				if cancelBudget != nil {
+					cancelBudget()
+				}
 				break
 			}
 
@@ -151,7 +170,10 @@ func handleChatCompletion(
 				} else {
 					log.Error().Msg("all upstream models failed for stream")
 				}
-				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "all upstream models failed"})
+				// 记录失败请求（仅估算输入），计入请求次数，避免 dashboard 漏算
+				go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
+					inputTokens, 0, 0, 0, 0, 0, 0, apiKey)
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": upstreamFailedMessage(lastErr)})
 				return
 			}
 
@@ -226,7 +248,7 @@ func handleChatCompletion(
 							UpstreamTarget: target,
 							ChatReq:        &req,
 							IsStream:       false,
-							Ctx:            c.Request.Context(),
+							Ctx:            reqCtx,
 							VirtualModel:   req.Model,
 						})
 					})
@@ -240,7 +262,7 @@ func handleChatCompletion(
 						UpstreamTarget: target,
 						ChatReq:        &req,
 						IsStream:       false,
-						Ctx:            c.Request.Context(),
+						Ctx:            reqCtx,
 						VirtualModel:   req.Model,
 					})
 				}
@@ -249,21 +271,21 @@ func handleChatCompletion(
 						log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
 						continue
 					}
-				if lastErr == nil {
-					lastErr = resolveErr
-				}
-				if ue, ok := resolveErr.(*provider.UpstreamHTTPError); ok {
-					log.Error().Err(resolveErr).Str("provider", targetProvider).Str("body", string(ue.Body)).Msg("upstream request failed, trying next")
-				} else {
-					log.Error().Err(resolveErr).Str("provider", targetProvider).Msg("upstream request failed, trying next")
-				}
-				continue
+					if lastErr == nil {
+						lastErr = resolveErr
+					}
+					if ue, ok := resolveErr.(*provider.UpstreamHTTPError); ok {
+						log.Error().Err(resolveErr).Str("provider", targetProvider).Str("body", string(ue.Body)).Msg("upstream request failed, trying next")
+					} else {
+						log.Error().Err(resolveErr).Str("provider", targetProvider).Msg("upstream request failed, trying next")
+					}
+					continue
 				}
 				// 429 退避：不触发熔断，退避后继续 fallback 尝试下一个候选
 				if res.StatusCode == 429 {
 					backoff := parseRetryAfter(res.Body, 5*time.Second)
 					log.Warn().Dur("backoff", backoff).Str("provider", targetProvider).Msg("rate limited (429), backing off")
-					sleepWithContext(c.Request.Context(), backoff)
+					sleepWithContext(reqCtx, backoff)
 					continue
 				}
 				// Body 已在 protocol.Resolve 中读取并转换，直接使用
@@ -308,7 +330,10 @@ func handleChatCompletion(
 			} else {
 				log.Error().Msg("all upstream models failed for non-stream")
 			}
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "all upstream models failed"})
+			// 记录失败请求（仅估算输入），计入请求次数，避免 dashboard 漏算
+			go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
+				inputTokens, 0, 0, 0, 0, 0, 0, apiKey)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": upstreamFailedMessage(lastErr)})
 			return
 		}
 	}
@@ -476,6 +501,7 @@ func handleAnthropicMessages(
 	routerSvc *router.Service,
 	streamHandler *stream.Handler,
 	tokenService *token.Service,
+	requestTimeout time.Duration,
 ) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// /count_tokens 由独立的 handleCountTokens 处理，跳过此 handler 避免消费 body
@@ -489,6 +515,16 @@ func handleAnthropicMessages(
 		apiKeyVal, _ := c.Get("api_key")
 		apiKey, _ := apiKeyVal.(string)
 		log.Info().Msg("anthropic /messages request")
+
+		// 整体请求预算：所有 fallback 候选共享的总超时。
+		reqCtx := c.Request.Context()
+		var cancelBudget context.CancelFunc
+		if requestTimeout > 0 {
+			reqCtx, cancelBudget = context.WithTimeout(reqCtx, requestTimeout)
+		}
+		if cancelBudget != nil {
+			defer cancelBudget()
+		}
 
 		var req protocol.AnthropicRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
@@ -512,9 +548,12 @@ func handleAnthropicMessages(
 		log.Debug().Int("input_tokens", inputTokens).Msg("anthropic token estimated")
 
 		// 3. 路由选择 — 获取候选列表（支持 fallback 重试）
-		sel, err := routerSvc.SelectCandidates(c.Request.Context(), req.Model, inputTokens)
+		sel, err := routerSvc.SelectCandidates(reqCtx, req.Model, inputTokens)
 		if err != nil {
 			log.Error().Err(err).Str("model", req.Model).Str("tier", mapper.GetTier(req.Model)).Msg("anthropic router selection failed")
+			// 记录失败请求（仅估算输入），计入请求次数，避免 dashboard 漏算
+			go tokenService.RecordUsageNow(reqID, "", req.Model, "",
+				inputTokens, 0, 0, 0, 0, 0, 0, apiKey)
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no available model"})
 			return
 		}
@@ -559,8 +598,7 @@ func handleAnthropicMessages(
 				extraParams["tool_choice"] = req.ToolChoice
 			}
 
-			// 使用 target 的超时时间设置 context deadline
-			reqCtx := c.Request.Context()
+			// 使用 target 的超时时间设置 context deadline（基于整体预算 reqCtx 派生）
 			var cancel context.CancelFunc
 			if target.Timeout > 0 {
 				reqCtx, cancel = context.WithTimeout(reqCtx, target.Timeout)
@@ -605,24 +643,28 @@ func handleAnthropicMessages(
 					log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
 					continue
 				}
-			if lastErr == nil {
-				lastErr = resolveErr
-			}
-			if ue, ok := resolveErr.(*provider.UpstreamHTTPError); ok {
-				log.Error().Err(resolveErr).Str("provider", targetProvider).Str("body", string(ue.Body)).Msg("anthropic upstream request failed, trying next")
-			} else {
-				log.Error().Err(resolveErr).Str("provider", targetProvider).Msg("anthropic upstream request failed, trying next")
-			}
-			continue
+				if lastErr == nil {
+					lastErr = resolveErr
+				}
+				if ue, ok := resolveErr.(*provider.UpstreamHTTPError); ok {
+					log.Error().Err(resolveErr).Str("provider", targetProvider).Str("body", string(ue.Body)).Msg("anthropic upstream request failed, trying next")
+				} else {
+					log.Error().Err(resolveErr).Str("provider", targetProvider).Msg("anthropic upstream request failed, trying next")
+				}
+				continue
 			}
 			// 429 退避：不触发熔断，退避后继续 fallback 尝试下一个候选
 			if res.StatusCode == 429 {
 				backoff := parseRetryAfter(res.Body, 5*time.Second)
 				log.Warn().Dur("backoff", backoff).Str("provider", targetProvider).Msg("rate limited (429), backing off")
-				sleepWithContext(c.Request.Context(), backoff)
+				sleepWithContext(reqCtx, backoff)
 				continue
 			}
 			protocolResult = res
+			// 流式连接已成功，释放整体预算，避免长连接被预算超时掐断
+			if cancelBudget != nil {
+				cancelBudget()
+			}
 			break
 		}
 
@@ -637,7 +679,10 @@ func handleAnthropicMessages(
 			} else {
 				log.Error().Msg("all upstream models failed for anthropic /messages")
 			}
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "all upstream models failed"})
+			// 记录失败请求（仅估算输入），计入请求次数，避免 dashboard 漏算
+			go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
+				inputTokens, 0, 0, 0, 0, 0, 0, apiKey)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": upstreamFailedMessage(lastErr)})
 			return
 		}
 
@@ -1157,6 +1202,16 @@ func sleepWithContext(ctx context.Context, d time.Duration) {
 	case <-ctx.Done():
 		return
 	}
+}
+
+// upstreamFailedMessage 构造「全部上游失败」的客户端错误文案。
+// 若 lastErr 非 nil，则追加其具体原因（如 timeout awaiting response headers），
+// 便于客户端定位超时 / 连接失败的根因；否则返回泛化文案。
+func upstreamFailedMessage(lastErr error) string {
+	if lastErr != nil {
+		return "all upstream models failed: " + lastErr.Error()
+	}
+	return "all upstream models failed"
 }
 
 // handleAdminCalibration 管理端校准信息

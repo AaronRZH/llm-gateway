@@ -353,30 +353,13 @@ func (s *Service) syncWorker() {
 			s.calibrated = true
 			s.mu.Unlock()
 		} else {
-			// 仅估算值（流式场景或上游未返回 usage）
+			// 仅估算值（流式场景 / 上游未返回 usage / 失败请求）
 			logEvent.
 				Int("estimated_total", record.EstimatedInput+record.EstimatedOutput).
 				Msg("usage recorded (estimated only)")
-			// 持久化到存储层（如果已配置）
-			if s.storage != nil {
-				stoRec := storage.UsageRecord{
-					RequestID:    record.RequestID,
-					VirtualModel: record.VirtualModel,
-					RealModel:    record.Model,
-					Provider:     record.Provider,
-					InputTokens:  record.RealInput,
-					OutputTokens: record.RealOutput,
-					TotalTokens:  record.RealTotal,
-					EstInput:     record.EstimatedInput,
-					EstOutput:    record.EstimatedOutput,
-					APIKey:       record.APIKey,
-					CreatedAt:    time.Unix(record.Timestamp, 0),
-				}
-				if err := s.storage.Persist(stoRec); err != nil {
-					log.Error().Err(err).Str("request_id", record.RequestID).Msg("storage persist failed")
-				}
-			}
 		}
+		// 注意：持久化由 RecordUsageNow 同步完成，此处不再 Persist，
+		// 否则会与 RecordUsageNow 的写入重复（Redis 下 request_count 翻倍）。
 	}
 }
 
