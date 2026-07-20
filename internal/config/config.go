@@ -50,6 +50,10 @@ type AppConfig struct {
 	ReadTimeout  time.Duration `mapstructure:"read_timeout" yaml:"read_timeout"`
 	WriteTimeout time.Duration `mapstructure:"write_timeout" yaml:"write_timeout"`
 	IdleTimeout  time.Duration `mapstructure:"idle_timeout" yaml:"idle_timeout"`
+	// RequestTimeout 整体请求预算：单个客户端请求（含全部 fallback 候选）的总超时。
+	// 超过该时间仍有候选未成功，则终止并向上游返回错误，避免 N×上游超时长时间堆积。
+	// 设为 0 表示不限制（沿用各 Provider 自身的 Timeout / 服务器 WriteTimeout）。
+	RequestTimeout time.Duration `mapstructure:"request_timeout" yaml:"request_timeout"`
 }
 
 // DebugConfig 调试相关开关，默认全部关闭，避免生产环境暴露诊断端点
@@ -130,6 +134,9 @@ type ProviderConfig struct {
 	APIKey   string        `mapstructure:"api_key" yaml:"api_key"`
 	Timeout  time.Duration `mapstructure:"timeout" yaml:"timeout"`
 	Protocol string        `mapstructure:"protocol" yaml:"protocol"`
+	// ResponseHeaderTimeout 首字节（响应头）超时：超过该时间未收到上游响应头即判定失败，
+	// 触发 fallback。默认 15s；设为 0 时使用全局默认 defaultResponseHeaderTimeout。
+	ResponseHeaderTimeout time.Duration `mapstructure:"response_header_timeout" yaml:"response_header_timeout"`
 }
 
 type TokenConfig struct {
@@ -171,6 +178,7 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("app::read_timeout", 60*time.Second)
 	v.SetDefault("app::write_timeout", 120*time.Second)
 	v.SetDefault("app::idle_timeout", 120*time.Second)
+	v.SetDefault("app::request_timeout", 0*time.Second)
 	v.SetDefault("stream::idle_timeout", 120*time.Second)
 	v.SetDefault("log::level", "info")
 	v.SetDefault("redis::addr", "localhost:6379")

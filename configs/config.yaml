@@ -6,6 +6,10 @@ app:
   read_timeout: 60s
   write_timeout: 120s
   idle_timeout: 600s
+  # 整体请求预算：单个客户端请求（含全部 fallback 候选）的总超时。
+  # 超过该时间仍有候选未成功，则终止并向上游返回错误，避免 N×上游超时长时间堆积。
+  # 设为 0 表示不限制（沿用各 Provider 自身的 timeout / 服务器 write_timeout）。
+  request_timeout: 120s
 # 调试开关：默认全部关闭，避免生产环境暴露诊断端点
 # pprof_enabled 为 true 时，会在 127.0.0.1:<pprof_port> 暴露 /debug/pprof（仅本机可访问）
 debug:
@@ -50,6 +54,8 @@ models:
 # Provider 配置（API Keys 建议通过环境变量注入）
 # provider name 仅作路由标识，不影响行为
 # protocol 字段：声明上游使用的协议类型（"openai" | "anthropic"），默认为 "openai"
+# 可选字段 response_header_timeout：首字节（响应头）超时，超过该时间未收到上游响应头即失败并触发 fallback。
+#   默认 15s；设为 0 时使用全局默认。可按上游网络情况调大（如慢速上游设 30s）。
 providers:
   openai:
     base_url: "https://api.openai.com/v1"

@@ -174,6 +174,10 @@ open http://localhost:8080/admin
 app:
   env: "dev"          # dev | prod
   port: 8080
+  # 整体请求预算：单个请求（含全部 fallback 候选）的总超时。
+  # 超过该时间仍有候选未成功则终止并返回错误，避免 N×上游超时长时间堆积。
+  # 设为 0 表示不限制（沿用各 Provider 的 timeout / 服务器 write_timeout）。
+  request_timeout: 120s
 
 log:
   level: "debug"      # debug | info | warn | error
@@ -195,6 +199,9 @@ providers:
     base_url: "https://api.anthropic.com/v1"
     api_key: "${ANTHROPIC_API_KEY}"
     timeout: 300s
+    # 首字节（响应头）超时：超过该时间未收到上游响应头即失败并触发 fallback。
+    # 默认 15s；设为 0 使用全局默认。可按上游网络情况调大（如慢速上游设 30s）。
+    response_header_timeout: 15s
     protocol: "anthropic"
   deepseek_openai:
     base_url: "https://api.deepseek.com"

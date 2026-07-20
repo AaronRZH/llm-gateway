@@ -113,6 +113,12 @@ func newBaseProvider(cfg config.ProviderConfig) (string, string, ClientProtocol,
 	if cfg.Protocol == "anthropic" {
 		proto = ProtocolAnthropic
 	}
+	// 首字节超时：超过该时间未收到响应头即失败并触发 fallback，避免长时间阻塞。
+	// 优先使用 Provider 配置的 response_header_timeout，未配置则沿用全局默认。
+	headerTimeout := defaultResponseHeaderTimeout
+	if cfg.ResponseHeaderTimeout > 0 {
+		headerTimeout = cfg.ResponseHeaderTimeout
+	}
 	transport := &http.Transport{
 		MaxIdleConns:        200,
 		MaxIdleConnsPerHost: 100,
@@ -120,7 +126,7 @@ func newBaseProvider(cfg config.ProviderConfig) (string, string, ClientProtocol,
 		IdleConnTimeout:     90 * time.Second,
 		TLSHandshakeTimeout: 10 * time.Second,
 		// 首字节超时：超过该时间未收到响应头即失败并触发 fallback，避免长时间阻塞
-		ResponseHeaderTimeout: defaultResponseHeaderTimeout,
+		ResponseHeaderTimeout: headerTimeout,
 	}
 
 	return cfg.BaseURL, cfg.APIKey, proto, &http.Client{

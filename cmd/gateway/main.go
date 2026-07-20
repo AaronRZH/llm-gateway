@@ -109,9 +109,9 @@ func main() {
 	// API 路由
 	api := r.Group("/v1")
 	{
-		api.POST("/chat/completions", handleChatCompletion(mapperService, routerService, streamHandler, tokenService))
+		api.POST("/chat/completions", handleChatCompletion(mapperService, routerService, streamHandler, tokenService, cfg.App.RequestTimeout))
 		api.POST("/completions", handleCompletion(mapperService, routerService, streamHandler, tokenService))
-		api.POST("/messages", handleAnthropicMessages(mapperService, routerService, streamHandler, tokenService))
+		api.POST("/messages", handleAnthropicMessages(mapperService, routerService, streamHandler, tokenService, cfg.App.RequestTimeout))
 		api.POST("/messages/count_tokens", handleCountTokens(mapperService, routerService, providerManager))
 		api.GET("/models", handleListModels(mapperService))
 	}
