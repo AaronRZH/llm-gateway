@@ -66,6 +66,9 @@ providers:
     base_url: https://token.sensenova.cn/v1
     api_key: ${SENSENOVA_API_KEY}
     timeout: 50m0s
+    # 首字节（响应头）超时：sensenova 首字节较慢，默认 15s 过紧会频繁触发 fallback，
+    # 这里单独放宽到 120s；如仍偶发可继续调大。
+    response_header_timeout: 120s
     protocol: openai
   anthropic:
     base_url: "https://api.anthropic.com/v1"
