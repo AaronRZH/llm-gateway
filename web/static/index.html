@@ -325,6 +325,11 @@
               <label>超时 (秒)</label>
               <input v-model.number="providerForm.timeout" type="number" min="1" placeholder="3000" class="form-input">
             </div>
+            <div class="form-group" style="display:inline-block;width:48%;margin-right:4%;">
+              <label>首字节超时 (秒)</label>
+              <input v-model.number="providerForm.response_header_timeout" type="number" min="0" placeholder="15 (默认)" class="form-input">
+            </div>
+            <p class="form-hint" style="margin:0 0 8px;color:var(--text-secondary);font-size:12px;">首字节超时：超过该时间未收到上游响应头即判定失败并触发 fallback。留空或 0 表示使用全局默认 15s。</p>
             <div class="form-actions">
               <button type="button" class="btn" @click="closeProviderModal">取消</button>
               <button type="submit" class="btn btn-primary">{{ providerEditName ? '保存' : '创建' }}</button>
@@ -395,7 +400,7 @@
           <h3 class="card-title">Provider 配置 ({{ Object.keys(providersConfig).length }}) <button class="btn btn-primary btn-sm" @click="showAddProviderModal = true" style="vertical-align: middle; margin-left: 12px;">+ 添加</button></h3>
           <table class="table">
             <thead>
-              <tr><th>名称</th><th>Base URL</th><th>协议</th><th>超时</th><th>操作</th></tr>
+              <tr><th>名称</th><th>Base URL</th><th>协议</th><th>超时</th><th>首字节超时</th><th>操作</th></tr>
             </thead>
             <tbody>
               <tr v-for="(p, name) in providersConfig" :key="name">
@@ -403,13 +408,14 @@
                 <td><code class="url-wrap">{{ p.base_url }}</code></td>
                 <td><span class="protocol-badge">{{ p.protocol }}</span></td>
                 <td>{{ p.timeout ? p.timeout + "s" : "—" }}</td>
+                <td>{{ p.response_header_timeout ? p.response_header_timeout + "s" : "—" }}</td>
                 <td>
                   <button class="btn btn-sm" style="background:#238636;color:#fff;border:none;padding:2px 10px;border-radius:4px;cursor:pointer;margin-right:4px;" @click="editProvider(name)">编辑</button>
                   <button class="btn btn-danger btn-sm" @click="deleteProvider(name)">删除</button>
                 </td>
               </tr>
               <tr v-if="Object.keys(providersConfig).length === 0">
-                <td colspan="5" class="text-center text-muted">暂无 Provider 配置</td>
+                <td colspan="6" class="text-center text-muted">暂无 Provider 配置</td>
               </tr>
             </tbody>
           </table>

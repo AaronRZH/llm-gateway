@@ -1512,16 +1512,18 @@ func updateEnvFileRemove(key string) {
 func handleAdminProvidersConfig(cfg *config.Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		type safeProvider struct {
-			BaseURL  string `json:"base_url"`
-			Protocol string `json:"protocol"`
-			Timeout  int    `json:"timeout"` // 秒
+			BaseURL               string `json:"base_url"`
+			Protocol              string `json:"protocol"`
+			Timeout               int    `json:"timeout"`                 // 秒
+			ResponseHeaderTimeout int    `json:"response_header_timeout"` // 秒，0 表示用全局默认
 		}
 		providers := make(map[string]safeProvider)
 		for name, p := range cfg.Providers {
 			providers[name] = safeProvider{
-				BaseURL:  p.BaseURL,
-				Protocol: p.Protocol,
-				Timeout:  int(p.Timeout.Seconds()),
+				BaseURL:               p.BaseURL,
+				Protocol:              p.Protocol,
+				Timeout:               int(p.Timeout.Seconds()),
+				ResponseHeaderTimeout: int(p.ResponseHeaderTimeout.Seconds()),
 			}
 		}
 		c.JSON(http.StatusOK, gin.H{"data": providers})
@@ -1532,11 +1534,12 @@ func handleAdminProvidersConfig(cfg *config.Config) gin.HandlerFunc {
 func handleAdminAddProvider(cfg *config.Config, providerMgr *provider.Manager) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req struct {
-			Name     string `json:"name"`
-			BaseURL  string `json:"base_url"`
-			APIKey   string `json:"api_key"`
-			Protocol string `json:"protocol"`
-			Timeout  int    `json:"timeout"` // 秒
+			Name                  string `json:"name"`
+			BaseURL               string `json:"base_url"`
+			APIKey                string `json:"api_key"`
+			Protocol              string `json:"protocol"`
+			Timeout               int    `json:"timeout"`                 // 秒
+			ResponseHeaderTimeout int    `json:"response_header_timeout"` // 秒，0 表示用全局默认
 		}
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body: " + err.Error()})
@@ -1557,6 +1560,7 @@ func handleAdminAddProvider(cfg *config.Config, providerMgr *provider.Manager) g
 		if timeout <= 0 {
 			timeout = 3000 * time.Second
 		}
+		responseHeaderTimeout := time.Duration(req.ResponseHeaderTimeout) * time.Second
 
 		// 处理 API Key：存环境变量引用到 config.yaml，实际值写到 .env
 		apiKeyRef := req.APIKey
@@ -1569,10 +1573,11 @@ func handleAdminAddProvider(cfg *config.Config, providerMgr *provider.Manager) g
 		}
 
 		cfg.Providers[req.Name] = config.ProviderConfig{
-			BaseURL:  req.BaseURL,
-			APIKey:   apiKeyRef,
-			Protocol: req.Protocol,
-			Timeout:  timeout,
+			BaseURL:               req.BaseURL,
+			APIKey:                apiKeyRef,
+			Protocol:              req.Protocol,
+			Timeout:               timeout,
+			ResponseHeaderTimeout: responseHeaderTimeout,
 		}
 		if err := cfg.SaveProvider(req.Name, cfg.Providers[req.Name]); err != nil {
 			log.Error().Err(err).Msg("failed to save config after adding provider")
@@ -1582,10 +1587,11 @@ func handleAdminAddProvider(cfg *config.Config, providerMgr *provider.Manager) g
 
 		// 立即生效：用实际 API Key 更新运行时的 Provider
 		providerMgr.UpdateProvider(req.Name, config.ProviderConfig{
-			BaseURL:  req.BaseURL,
-			APIKey:   req.APIKey,
-			Protocol: req.Protocol,
-			Timeout:  timeout,
+			BaseURL:               req.BaseURL,
+			APIKey:                req.APIKey,
+			Protocol:              req.Protocol,
+			Timeout:               timeout,
+			ResponseHeaderTimeout: responseHeaderTimeout,
 		})
 
 		c.JSON(http.StatusCreated, gin.H{"message": "provider added"})
@@ -1601,10 +1607,11 @@ func handleAdminUpdateProvider(cfg *config.Config, providerMgr *provider.Manager
 			return
 		}
 		var req struct {
-			BaseURL  string `json:"base_url"`
-			APIKey   string `json:"api_key"`
-			Protocol string `json:"protocol"`
-			Timeout  int    `json:"timeout"` // 秒
+			BaseURL               string `json:"base_url"`
+			APIKey                string `json:"api_key"`
+			Protocol              string `json:"protocol"`
+			Timeout               int    `json:"timeout"`                 // 秒
+			ResponseHeaderTimeout int    `json:"response_header_timeout"` // 秒，0 表示用全局默认
 		}
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body: " + err.Error()})
@@ -1630,6 +1637,9 @@ func handleAdminUpdateProvider(cfg *config.Config, providerMgr *provider.Manager
 		if req.Timeout > 0 {
 			p.Timeout = time.Duration(req.Timeout) * time.Second
 		}
+		if req.ResponseHeaderTimeout > 0 {
+			p.ResponseHeaderTimeout = time.Duration(req.ResponseHeaderTimeout) * time.Second
+		}
 		cfg.Providers[name] = p
 		if err := cfg.SaveProvider(name, cfg.Providers[name]); err != nil {
 			log.Error().Err(err).Msg("failed to save config after updating provider")
@@ -1639,10 +1649,11 @@ func handleAdminUpdateProvider(cfg *config.Config, providerMgr *provider.Manager
 
 		// 立即生效：更新运行时的 Provider
 		providerMgr.UpdateProvider(name, config.ProviderConfig{
-			BaseURL:  p.BaseURL,
-			APIKey:   actualKey,
-			Protocol: p.Protocol,
-			Timeout:  p.Timeout,
+			BaseURL:               p.BaseURL,
+			APIKey:                actualKey,
+			Protocol:              p.Protocol,
+			Timeout:               p.Timeout,
+			ResponseHeaderTimeout: p.ResponseHeaderTimeout,
 		})
 		if actualKey == "" {
 			// 没有新 API Key，从环境变量取回实际值

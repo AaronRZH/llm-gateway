@@ -111,7 +111,7 @@ const app = createApp({
     const providersConfig = reactive({});
     const showAddProviderModal = ref(false);
     const providerEditName = ref("");
-    const providerForm = reactive({ name: "", base_url: "", api_key: "", protocol: "openai", timeout: 3000 });
+    const providerForm = reactive({ name: "", base_url: "", api_key: "", protocol: "openai", timeout: 3000, response_header_timeout: 0 });
 
     const navItems = [
       { id: "overview", icon: "📊", label: "概览" },
@@ -378,6 +378,7 @@ const app = createApp({
       providerForm.api_key = "";
       providerForm.protocol = p.protocol || "openai";
       providerForm.timeout = (p.timeout != null && p.timeout > 0) ? p.timeout : 3000;
+      providerForm.response_header_timeout = (p.response_header_timeout != null && p.response_header_timeout > 0) ? p.response_header_timeout : 0;
       showAddProviderModal.value = true;
     }
 
@@ -389,6 +390,7 @@ const app = createApp({
       providerForm.api_key = "";
       providerForm.protocol = "openai";
       providerForm.timeout = 3000;
+      providerForm.response_header_timeout = 0;
     }
 
     async function saveProvider() {
@@ -401,6 +403,7 @@ const app = createApp({
         api_key: providerForm.api_key || "",
         protocol: providerForm.protocol,
         timeout: providerForm.timeout || 3000,
+        response_header_timeout: providerForm.response_header_timeout || 0,
       };
       let url, method, successStatus;
       if (providerEditName.value) {
