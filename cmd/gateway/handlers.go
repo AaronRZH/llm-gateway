@@ -1648,24 +1648,30 @@ func handleAdminUpdateProvider(cfg *config.Config, providerMgr *provider.Manager
 		}
 
 		// 立即生效：更新运行时的 Provider
+		// 解析运行时实际使用的 API Key：
+		//   - 提交了新的 api_key 时直接用该值；
+		//   - 否则从现有引用（如 ${SENSENOVA_API_KEY}）解析出实际值，避免把运行时 key 清空导致 401。
+		// 注意：providerMgr.Get 返回的是值拷贝，不能靠 SetAPIKey 改副本，必须把有效 key 直接传入 UpdateProvider。
+		runtimeKey := actualKey
+		if runtimeKey == "" {
+			ref := p.APIKey
+			if strings.HasPrefix(ref, "$") && strings.HasSuffix(ref, "}") {
+				if envVal := os.Getenv(ref[2 : len(ref)-1]); envVal != "" {
+					runtimeKey = envVal
+				} else {
+					runtimeKey = ref // 兜底：env 未加载时仍保留引用串
+				}
+			} else {
+				runtimeKey = ref
+			}
+		}
 		providerMgr.UpdateProvider(name, config.ProviderConfig{
 			BaseURL:               p.BaseURL,
-			APIKey:                actualKey,
+			APIKey:                runtimeKey,
 			Protocol:              p.Protocol,
 			Timeout:               p.Timeout,
 			ResponseHeaderTimeout: p.ResponseHeaderTimeout,
 		})
-		if actualKey == "" {
-			// 没有新 API Key，从环境变量取回实际值
-			ref := p.APIKey
-			if strings.HasPrefix(ref, "$") && strings.HasSuffix(ref, "}") {
-				if envVal := os.Getenv(ref[2 : len(ref)-1]); envVal != "" {
-					if prov, ok := providerMgr.Get(name); ok {
-						prov.SetAPIKey(envVal)
-					}
-				}
-			}
-		}
 
 		c.JSON(http.StatusOK, gin.H{"message": "provider updated"})
 	}
