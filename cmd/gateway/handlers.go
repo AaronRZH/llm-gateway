@@ -305,8 +305,21 @@ func handleChatCompletion(
 				// 解析 tool_calls
 				toolCalls := parseToolCalls(body, targetProvider)
 				_ = realTotal // 保留用于未来的扩展
+				// 上游未返回 usage 时回退到本地估算，避免 token 统计漏记（与流式路径保持一致）
+				effInput := realInput
+				if effInput == 0 {
+					effInput = inputTokens
+				}
+				effOutput := realOutput
+				if effOutput == 0 {
+					effOutput = len(body) / 4 // 粗略估算输出 token
+				}
+				effTotal := effInput + effOutput
+				if realTotal > 0 {
+					effTotal = realTotal
+				}
 				go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
-					inputTokens, 0, 0, realInput, realOutput, realTotal, len(toolCalls), apiKey)
+					inputTokens, 0, 0, effInput, effOutput, effTotal, len(toolCalls), apiKey)
 
 				// 重写响应中的 model 字段
 				body = mapper.RewriteResponse(body, req.Model)
@@ -766,8 +779,21 @@ func handleAnthropicMessages(
 			realInput, realOutput, realTotal := parseUsage(protocolResult.Body)
 			toolCalls := parseToolCalls(protocolResult.Body, targetProvider)
 			_ = realTotal
+			// 上游未返回 usage 时回退到本地估算，避免 token 统计漏记（与流式路径保持一致）
+			effInput := realInput
+			if effInput == 0 {
+				effInput = inputTokens
+			}
+			effOutput := realOutput
+			if effOutput == 0 {
+				effOutput = len(protocolResult.Body) / 4 // 粗略估算输出 token
+			}
+			effTotal := effInput + effOutput
+			if realTotal > 0 {
+				effTotal = realTotal
+			}
 			go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
-				inputTokens, 0, 0, realInput, realOutput, realTotal, len(toolCalls), apiKey)
+				inputTokens, 0, 0, effInput, effOutput, effTotal, len(toolCalls), apiKey)
 
 			c.Data(protocolResult.StatusCode, "application/json", protocolResult.Body)
 		}
