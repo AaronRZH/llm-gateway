@@ -113,10 +113,16 @@ func Resolve(req Request) (*Result, error) {
 		// Case 1: OpenAI → OpenAI
 		if req.ChatReq == nil {
 			// Anthropic 客户端 → OpenAI 上游（非标准情况），使用 Chat
+			params := provider.ChatParams{
+				Temperature: req.AnthropicReq.Temperature,
+				TopP:        req.AnthropicReq.TopP,
+				MaxTokens:   req.AnthropicReq.MaxTokens,
+				ToolChoice:  provider.ConvertAnthropicToolChoiceToOpenAI(req.AnthropicReq.ToolChoice),
+			}
 			messages := toProviderMessagesFromMap(req.AnthropicReq.Messages)
 			tools := toolsFromAnthropicRequest(req.AnthropicReq.Tools)
 			if req.IsStream {
-				body, err := req.UpstreamTarget.Provider.StreamChat(req.Ctx, req.UpstreamTarget.Model, messages, tools)
+				body, err := req.UpstreamTarget.Provider.StreamChat(req.Ctx, req.UpstreamTarget.Model, messages, tools, params)
 				if r, e := handleProviderErr(err); r != nil || e != nil {
 					return r, e
 				}
@@ -127,7 +133,7 @@ func Resolve(req Request) (*Result, error) {
 			}
 			messages = toProviderMessagesFromMap(req.AnthropicReq.Messages)
 			tools = toolsFromAnthropicRequest(req.AnthropicReq.Tools)
-			resp, err := req.UpstreamTarget.Provider.Chat(req.Ctx, req.UpstreamTarget.Model, messages, tools)
+			resp, err := req.UpstreamTarget.Provider.Chat(req.Ctx, req.UpstreamTarget.Model, messages, tools, params)
 			if r, e := handleProviderErr(err); r != nil || e != nil {
 				return r, e
 			}
@@ -139,11 +145,18 @@ func Resolve(req Request) (*Result, error) {
 			}, nil
 		}
 		// OpenAI 客户端 → OpenAI 上游
+		params := provider.ChatParams{
+			Temperature: req.ChatReq.Temperature,
+			TopP:        req.ChatReq.TopP,
+			MaxTokens:   req.ChatReq.MaxTokens,
+			ToolChoice:  req.ChatReq.ToolChoice,
+		}
 		if req.IsStream {
 			body, err := req.UpstreamTarget.Provider.StreamChat(
 				req.Ctx, req.UpstreamTarget.Model,
 				toProviderMessages(req.ChatReq.Messages),
 				toProviderTools(req.ChatReq.Tools),
+				params,
 			)
 			if r, e := handleProviderErr(err); r != nil || e != nil {
 				return r, e
@@ -157,6 +170,7 @@ func Resolve(req Request) (*Result, error) {
 			req.Ctx, req.UpstreamTarget.Model,
 			toProviderMessages(req.ChatReq.Messages),
 			toProviderTools(req.ChatReq.Tools),
+			params,
 		)
 		if r, e := handleProviderErr(err); r != nil || e != nil {
 			return r, e
@@ -172,13 +186,19 @@ func Resolve(req Request) (*Result, error) {
 	// clientProto != upstreamProto
 	if clientProto == provider.ProtocolOpenAI && upstreamProto == provider.ProtocolAnthropic {
 		// Case 2: OpenAI 客户端 → Anthropic 上游
+		params := provider.ChatParams{
+			Temperature: req.ChatReq.Temperature,
+			TopP:        req.ChatReq.TopP,
+			MaxTokens:   req.ChatReq.MaxTokens,
+			ToolChoice:  req.ChatReq.ToolChoice,
+		}
 		if req.IsStream {
 			body, err := req.UpstreamTarget.Provider.StreamChatWithProtocol(
 				req.Ctx, req.UpstreamTarget.Model,
 				toProviderMessages(req.ChatReq.Messages),
 				toProviderTools(req.ChatReq.Tools),
 				provider.ProtocolOpenAI,
-				req.ChatReq.MaxTokens,
+				params,
 			)
 			if r, e := handleProviderErr(err); r != nil || e != nil {
 				return r, e
@@ -194,7 +214,7 @@ func Resolve(req Request) (*Result, error) {
 			toProviderMessages(req.ChatReq.Messages),
 			toProviderTools(req.ChatReq.Tools),
 			provider.ProtocolOpenAI,
-			req.ChatReq.MaxTokens,
+			params,
 		)
 		if r, e := handleProviderErr(err); r != nil || e != nil {
 			return r, e
@@ -216,11 +236,17 @@ func Resolve(req Request) (*Result, error) {
 	}
 
 	// Case 3: Anthropic 客户端 → OpenAI 上游
+	params := provider.ChatParams{
+		Temperature: req.AnthropicReq.Temperature,
+		TopP:        req.AnthropicReq.TopP,
+		MaxTokens:   req.AnthropicReq.MaxTokens,
+		ToolChoice:  provider.ConvertAnthropicToolChoiceToOpenAI(req.AnthropicReq.ToolChoice),
+	}
 	if req.IsStream {
 		openAIMsgs, openAITools := req.UpstreamTarget.Provider.ConvertAnthropicMessagesToOpenAI(
 			req.AnthropicReq.Messages, req.AnthropicReq.System, req.AnthropicReq.Tools)
 		body, err := req.UpstreamTarget.Provider.StreamChat(
-			req.Ctx, req.UpstreamTarget.Model, openAIMsgs, openAITools)
+			req.Ctx, req.UpstreamTarget.Model, openAIMsgs, openAITools, params)
 		if r, e := handleProviderErr(err); r != nil || e != nil {
 			return r, e
 		}
@@ -242,7 +268,7 @@ func Resolve(req Request) (*Result, error) {
 		Msg("sending openai request to upstream")
 
 	resp, err := req.UpstreamTarget.Provider.Chat(
-		req.Ctx, req.UpstreamTarget.Model, openAIMsgs, openAITools)
+		req.Ctx, req.UpstreamTarget.Model, openAIMsgs, openAITools, params)
 	if r, e := handleProviderErr(err); r != nil || e != nil {
 		return r, e
 	}

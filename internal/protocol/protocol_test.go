@@ -525,7 +525,7 @@ func TestConvertMessagesToAnthropic(t *testing.T) {
 		{Role: "user", Content: "Hello"},
 		{Role: "assistant", Content: "Hi back"},
 	}
-	result := converter.ConvertMessagesToAnthropic(messages)
+	result, system := converter.ConvertMessagesToAnthropic(messages)
 
 	if len(result) != 2 {
 		t.Fatalf("expected 2 messages, got %d", len(result))
@@ -535,6 +535,91 @@ func TestConvertMessagesToAnthropic(t *testing.T) {
 	}
 	if result[0]["content"] == nil {
 		t.Error("expected content to be non-nil array")
+	}
+	if system != nil {
+		t.Errorf("expected nil system, got %v", system)
+	}
+}
+
+func TestConvertMessagesToAnthropic_WithToolCalls(t *testing.T) {
+	converter := provider.NewAnthropicConverter()
+	messages := []provider.Message{
+		{Role: "user", Content: "What's the weather in Beijing?"},
+		{
+			Role:    "assistant",
+			Content: "",
+			ToolCalls: []map[string]interface{}{
+				{
+					"id":   "call_1",
+					"type": "function",
+					"function": map[string]interface{}{
+						"name":      "get_weather",
+						"arguments": `{"location":"beijing"}`,
+					},
+				},
+			},
+		},
+		{Role: "tool", Content: "sunny, 25C", ToolCallID: "call_1"},
+	}
+
+	result, system := converter.ConvertMessagesToAnthropic(messages)
+	if len(result) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(result))
+	}
+
+	// 第 2 条（assistant）应含 tool_use block
+	asst, ok := result[1]["content"].([]map[string]interface{})
+	if !ok || len(asst) != 1 {
+		t.Fatalf("expected assistant content with 1 block, got %+v", result[1]["content"])
+	}
+	if asst[0]["type"] != "tool_use" {
+		t.Errorf("expected tool_use block, got %v", asst[0]["type"])
+	}
+	if asst[0]["name"] != "get_weather" {
+		t.Errorf("unexpected tool name: %v", asst[0]["name"])
+	}
+
+	// 第 3 条（role:tool）应转为 user + tool_result block
+	if result[2]["role"] != "user" {
+		t.Errorf("expected role user for tool result, got %v", result[2]["role"])
+	}
+	tr, ok := result[2]["content"].([]map[string]interface{})
+	if !ok || len(tr) != 1 || tr[0]["type"] != "tool_result" {
+		t.Fatalf("expected tool_result block, got %+v", result[2]["content"])
+	}
+	if tr[0]["tool_use_id"] != "call_1" {
+		t.Errorf("unexpected tool_use_id: %v", tr[0]["tool_use_id"])
+	}
+	if system != nil {
+		t.Errorf("expected nil system, got %v", system)
+	}
+}
+
+func TestConvertMessagesToAnthropic_WithSystem(t *testing.T) {
+	converter := provider.NewAnthropicConverter()
+	messages := []provider.Message{
+		{Role: "system", Content: "You are a helpful assistant."},
+		{Role: "user", Content: "Hello"},
+		{Role: "system", Content: "Be concise."},
+		{Role: "assistant", Content: "Hi!"},
+	}
+
+	result, system := converter.ConvertMessagesToAnthropic(messages)
+
+	// 两条 system 消息被抽走，不应再出现在 messages 中
+	if len(result) != 2 {
+		t.Fatalf("expected 2 messages (system removed), got %d", len(result))
+	}
+	for _, m := range result {
+		if m["role"] == "system" {
+			t.Errorf("system role must not appear in messages: %+v", m)
+		}
+	}
+
+	// system 应多条合并为单一字符串，作为 Anthropic 顶层参数
+	sysStr, ok := system.(string)
+	if !ok || sysStr != "You are a helpful assistant.\n\nBe concise." {
+		t.Errorf("expected merged system string, got %v", system)
 	}
 }
 

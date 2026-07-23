@@ -134,15 +134,79 @@ func (c *AnthropicConverter) ContentToBlocks(content interface{}) []map[string]i
 }
 
 // convertMessages 转换消息格式（OpenAI → Anthropic）
-func (c *AnthropicConverter) ConvertMessagesToAnthropic(messages []Message) []map[string]interface{} {
+// 除文本外，还处理 OpenAI 工具调用协议：
+//   - assistant 消息带 tool_calls → 追加 tool_use content blocks
+//   - role:"tool" 消息（工具结果）→ 转为 user 消息里的 tool_result content block
+func (c *AnthropicConverter) ConvertMessagesToAnthropic(messages []Message) ([]map[string]interface{}, interface{}) {
 	var result []map[string]interface{}
+	var systemParts []string
 	for _, msg := range messages {
-		result = append(result, map[string]interface{}{
-			"role":    msg.Role,
-			"content": c.ContentToBlocks(msg.Content),
-		})
+		switch msg.Role {
+		case "system":
+			// OpenAI system 角色 → Anthropic 顶层 system 参数（多条合并，避免 messages 里出现非法的 role:"system" 导致上游 400）
+			if msg.Content != "" {
+				systemParts = append(systemParts, msg.Content)
+			}
+			continue
+		case "assistant":
+			// 文本 content blocks
+			var content []map[string]interface{}
+			if msg.Content != "" {
+				content = c.ContentToBlocks(msg.Content)
+			}
+			// OpenAI tool_calls → Anthropic tool_use blocks
+			for _, tc := range msg.ToolCalls {
+				id, _ := tc["id"].(string)
+				fn, _ := tc["function"].(map[string]interface{})
+				name, _ := fn["name"].(string)
+				argsRaw, _ := fn["arguments"].(string)
+				var input map[string]interface{}
+				if argsRaw == "" {
+					input = map[string]interface{}{}
+				} else if err := json.Unmarshal([]byte(argsRaw), &input); err != nil {
+					// arguments 解析失败（非合法 JSON）时保留原始串，避免上游 400
+					input = map[string]interface{}{"raw": argsRaw}
+				}
+				content = append(content, map[string]interface{}{
+					"type":  "tool_use",
+					"id":    id,
+					"name":  name,
+					"input": input,
+				})
+			}
+			if content == nil {
+				// Anthropic 不允许 content 为空数组，至少给一个空文本块
+				content = []map[string]interface{}{{"type": "text", "text": ""}}
+			}
+			result = append(result, map[string]interface{}{
+				"role":    "assistant",
+				"content": content,
+			})
+		case "tool":
+			// OpenAI role:"tool" → Anthropic user 消息里的 tool_result block
+			result = append(result, map[string]interface{}{
+				"role": "user",
+				"content": []map[string]interface{}{
+					{
+						"type":        "tool_result",
+						"tool_use_id": msg.ToolCallID,
+						"content":     msg.Content,
+					},
+				},
+			})
+		default:
+			result = append(result, map[string]interface{}{
+				"role":    msg.Role,
+				"content": c.ContentToBlocks(msg.Content),
+			})
+		}
 	}
-	return result
+
+	var system interface{}
+	if len(systemParts) > 0 {
+		system = strings.Join(systemParts, "\n\n")
+	}
+	return result, system
 }
 
 // convertMessagesToOpenAI 将 Anthropic 消息列表（含 system）转为 OpenAI 消息列表

@@ -40,6 +40,71 @@ type ToolFunc struct {
 	Parameters  any    `json:"parameters,omitempty"`
 }
 
+// ChatParams OpenAI 标准生成参数（与请求体对齐，按需透传给上游）
+type ChatParams struct {
+	Temperature float64 `json:"temperature,omitempty"`
+	TopP        float64 `json:"top_p,omitempty"`
+	MaxTokens   int     `json:"max_tokens,omitempty"`
+	ToolChoice  any     `json:"tool_choice,omitempty"`
+}
+
+// ConvertAnthropicToolChoiceToOpenAI 将 Anthropic 格式的 tool_choice 转为 OpenAI 格式：
+//   - {"type":"auto"}      -> "auto"
+//   - {"type":"any"}       -> "required"
+//   - {"type":"tool",name} -> {"type":"function","function":{"name":...}}
+func ConvertAnthropicToolChoiceToOpenAI(tc map[string]interface{}) interface{} {
+	if tc == nil {
+		return nil
+	}
+	switch t, _ := tc["type"].(string); t {
+	case "auto":
+		return "auto"
+	case "any":
+		return "required"
+	case "tool":
+		if name, ok := tc["name"].(string); ok {
+			return map[string]interface{}{
+				"type":     "function",
+				"function": map[string]interface{}{"name": name},
+			}
+		}
+		return "required"
+	default:
+		return nil
+	}
+}
+
+// convertOpenAIToolChoiceToAnthropic 将 OpenAI 格式的 tool_choice 转为 Anthropic 格式：
+//   - "auto"     -> {"type":"auto"}
+//   - "none"     -> {"type":"none"}
+//   - "required" -> {"type":"any"}
+//   - {"type":"function","function":{"name":...}} -> {"type":"tool","name":...}
+func convertOpenAIToolChoiceToAnthropic(tc any) map[string]interface{} {
+	switch v := tc.(type) {
+	case string:
+		switch v {
+		case "auto":
+			return map[string]interface{}{"type": "auto"}
+		case "none":
+			return map[string]interface{}{"type": "none"}
+		case "required":
+			return map[string]interface{}{"type": "any"}
+		default:
+			return map[string]interface{}{"type": "auto"}
+		}
+	case map[string]interface{}:
+		if t, ok := v["type"].(string); ok && t == "function" {
+			if fn, ok := v["function"].(map[string]interface{}); ok {
+				if name, ok := fn["name"].(string); ok {
+					return map[string]interface{}{"type": "tool", "name": name}
+				}
+			}
+		}
+		return map[string]interface{}{"type": "auto"}
+	}
+	return nil
+}
+
 // ClientProtocol 客户端使用的协议类型
 type ClientProtocol string
 
@@ -213,7 +278,7 @@ func (p *Provider) checkHTTPResponse(resp *http.Response) (*http.Response, error
 // ==================== HTTP 发送方法 ====================
 
 // buildRequest 构建 HTTP 请求（OpenAI 格式 body）
-func (p *Provider) buildRequest(ctx context.Context, method string, url string, model string, messages []Message, tools []Tool, stream bool) (*http.Request, error) {
+func (p *Provider) buildRequest(ctx context.Context, method string, url string, model string, messages []Message, tools []Tool, params ChatParams, stream bool) (*http.Request, error) {
 	reqBody := map[string]interface{}{
 		"model":    model,
 		"messages": messages,
@@ -221,6 +286,21 @@ func (p *Provider) buildRequest(ctx context.Context, method string, url string, 
 
 	if len(tools) > 0 {
 		reqBody["tools"] = tools
+	}
+
+	// OpenAI 标准生成参数透传：仅在使用方显式设置时注入，避免覆盖上游默认值。
+	// 注意 temperature/top_p 为 0 在 OpenAI 语义中表示“未设置”，故以 >0 判定。
+	if params.Temperature > 0 {
+		reqBody["temperature"] = params.Temperature
+	}
+	if params.TopP > 0 {
+		reqBody["top_p"] = params.TopP
+	}
+	if params.MaxTokens > 0 {
+		reqBody["max_tokens"] = params.MaxTokens
+	}
+	if params.ToolChoice != nil {
+		reqBody["tool_choice"] = params.ToolChoice
 	}
 
 	if stream {
@@ -307,8 +387,8 @@ func (p *Provider) buildAnthropicRequest(ctx context.Context, url string, model 
 }
 
 // Chat 非流式请求 — 使用 OpenAI 格式发送
-func (p *Provider) Chat(ctx context.Context, model string, messages []Message, tools []Tool) (*http.Response, error) {
-	req, err := p.buildRequest(ctx, "POST", p.fullURL(""), model, messages, tools, false)
+func (p *Provider) Chat(ctx context.Context, model string, messages []Message, tools []Tool, params ChatParams) (*http.Response, error) {
+	req, err := p.buildRequest(ctx, "POST", p.fullURL(""), model, messages, tools, params, false)
 	if err != nil {
 		return nil, err
 	}
@@ -321,8 +401,8 @@ func (p *Provider) Chat(ctx context.Context, model string, messages []Message, t
 }
 
 // StreamChat 流式请求 — 使用 OpenAI 格式发送
-func (p *Provider) StreamChat(ctx context.Context, model string, messages []Message, tools []Tool) (io.ReadCloser, error) {
-	req, err := p.buildRequest(ctx, "POST", p.fullURL(""), model, messages, tools, true)
+func (p *Provider) StreamChat(ctx context.Context, model string, messages []Message, tools []Tool, params ChatParams) (io.ReadCloser, error) {
+	req, err := p.buildRequest(ctx, "POST", p.fullURL(""), model, messages, tools, params, true)
 	if err != nil {
 		return nil, err
 	}
@@ -339,30 +419,50 @@ func (p *Provider) StreamChat(ctx context.Context, model string, messages []Mess
 }
 
 // ChatWithProtocol 带协议信息的 Chat
-func (p *Provider) ChatWithProtocol(ctx context.Context, model string, messages []Message, tools []Tool, clientProtocol ClientProtocol, maxTokens int) (*http.Response, error) {
+func (p *Provider) ChatWithProtocol(ctx context.Context, model string, messages []Message, tools []Tool, clientProtocol ClientProtocol, params ChatParams) (*http.Response, error) {
 	if p.protocol == ProtocolAnthropic && clientProtocol == ProtocolOpenAI {
-		// 需要将 OpenAI 消息转换为 Anthropic 格式后发送
-		anthropicMsgs := p.getConverter().ConvertMessagesToAnthropic(messages)
+		// 需要将 OpenAI 消息转换为 Anthropic 格式后发送，并把 OpenAI 标准参数转为 Anthropic 格式
+		anthropicMsgs, system := p.getConverter().ConvertMessagesToAnthropic(messages)
 		convertedTools := p.getConverter().ConvertTools(tools)
-		return p.doSendAnthropic(ctx, model, anthropicMsgs, convertedTools, maxTokens)
+		extraParams := map[string]interface{}{}
+		if params.Temperature > 0 {
+			extraParams["temperature"] = params.Temperature
+		}
+		if params.TopP > 0 {
+			extraParams["top_p"] = params.TopP
+		}
+		if tc := convertOpenAIToolChoiceToAnthropic(params.ToolChoice); tc != nil {
+			extraParams["tool_choice"] = tc
+		}
+		return p.doSendAnthropic(ctx, model, anthropicMsgs, convertedTools, system, extraParams, false, params.MaxTokens)
 	}
-	return p.Chat(ctx, model, messages, tools)
+	return p.Chat(ctx, model, messages, tools, params)
 }
 
 // StreamChatWithProtocol 带协议信息的 StreamChat
-func (p *Provider) StreamChatWithProtocol(ctx context.Context, model string, messages []Message, tools []Tool, clientProtocol ClientProtocol, maxTokens int) (io.ReadCloser, error) {
+func (p *Provider) StreamChatWithProtocol(ctx context.Context, model string, messages []Message, tools []Tool, clientProtocol ClientProtocol, params ChatParams) (io.ReadCloser, error) {
 	if p.protocol == ProtocolAnthropic && clientProtocol == ProtocolOpenAI {
-		// 需要将 OpenAI 消息转换为 Anthropic 格式后发送
-		anthropicMsgs := p.getConverter().ConvertMessagesToAnthropic(messages)
+		// 需要将 OpenAI 消息转换为 Anthropic 格式后发送，并把 OpenAI 标准参数转为 Anthropic 格式
+		anthropicMsgs, system := p.getConverter().ConvertMessagesToAnthropic(messages)
 		convertedTools := p.getConverter().ConvertTools(tools)
-		return p.doSendAnthropicStream(ctx, model, anthropicMsgs, convertedTools, maxTokens)
+		extraParams := map[string]interface{}{}
+		if params.Temperature > 0 {
+			extraParams["temperature"] = params.Temperature
+		}
+		if params.TopP > 0 {
+			extraParams["top_p"] = params.TopP
+		}
+		if tc := convertOpenAIToolChoiceToAnthropic(params.ToolChoice); tc != nil {
+			extraParams["tool_choice"] = tc
+		}
+		return p.doSendAnthropicStream(ctx, model, anthropicMsgs, convertedTools, system, extraParams, true, params.MaxTokens)
 	}
-	return p.StreamChat(ctx, model, messages, tools)
+	return p.StreamChat(ctx, model, messages, tools, params)
 }
 
 // doSendAnthropic 发送 Anthropic 格式消息（使用 OpenAI 格式请求体 + Anthropic 头）
-func (p *Provider) doSendAnthropic(ctx context.Context, model string, messages []map[string]interface{}, tools []map[string]interface{}, maxTokens int) (*http.Response, error) {
-	req, err := p.buildAnthropicRequest(ctx, p.fullURL(""), model, messages, tools, nil, nil, false, maxTokens)
+func (p *Provider) doSendAnthropic(ctx context.Context, model string, messages []map[string]interface{}, tools []map[string]interface{}, system interface{}, extraParams map[string]interface{}, stream bool, maxTokens int) (*http.Response, error) {
+	req, err := p.buildAnthropicRequest(ctx, p.fullURL(""), model, messages, tools, system, extraParams, stream, maxTokens)
 	if err != nil {
 		return nil, err
 	}
@@ -379,8 +479,8 @@ func (p *Provider) doSendAnthropic(ctx context.Context, model string, messages [
 }
 
 // doSendAnthropicStream 发送 Anthropic 格式消息（流式）
-func (p *Provider) doSendAnthropicStream(ctx context.Context, model string, messages []map[string]interface{}, tools []map[string]interface{}, maxTokens int) (io.ReadCloser, error) {
-	req, err := p.buildAnthropicRequest(ctx, p.fullURL(""), model, messages, tools, nil, nil, true, maxTokens)
+func (p *Provider) doSendAnthropicStream(ctx context.Context, model string, messages []map[string]interface{}, tools []map[string]interface{}, system interface{}, extraParams map[string]interface{}, stream bool, maxTokens int) (io.ReadCloser, error) {
+	req, err := p.buildAnthropicRequest(ctx, p.fullURL(""), model, messages, tools, system, extraParams, stream, maxTokens)
 	if err != nil {
 		return nil, err
 	}
@@ -439,20 +539,10 @@ func (p *Provider) SendDirect(
 		normalizedMessages[i] = normalized
 	}
 
-	req, err := p.buildAnthropicRequest(ctx, p.fullURL(""), model, normalizedMessages, nil, system, extraParams, stream, 0)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := p.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-
 	// 上游返回错误状态码时，将 response body 封装到 UpstreamHTTPError 中返回。
 	// 这样断路器可以统计失败次数，同时调用方（protocol.Resolve / handler）
 	// 能从 UpstreamHTTPError 中提取 body 并转发给客户端，而不是丢失错误详情。
-	return p.checkHTTPResponse(resp)
+	return p.doSendAnthropic(ctx, model, normalizedMessages, nil, system, extraParams, stream, 0)
 }
 
 // ==================== 公开 Converter 方法（供 handler 调用） ====================
