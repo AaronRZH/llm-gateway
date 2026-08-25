@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+				"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -87,42 +88,35 @@ func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadClose
 	scanner.Split(bufio.ScanLines)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 
-	// 缓存所有上游行，直到流结束后统一决定转发策略。
-	// 原因：部分上游会把 tool_calls 以 XML 形式嵌在 content 里并跨多个
-	// SSE chunk 流出来（如 <invoke name=add_clarification>）。
-	// 若逐行透传，客户端会先收到一堆原始 XML，事后又收到我们转换出的
-	// tool_calls，两种形式并存会让下游 agent 困惑。所以先缓存，结束后：
-	//   - 无 XML tool calls       -> 原样回放所有行
-	//   - 有 XML tool calls 且 CleanContent 为空 -> 丢弃全部行，只发 tool_calls
-	//   - 有 XML tool calls 且 CleanContent 非空 -> 回放行 + 追加 tool_calls
-	type bufferedLine struct {
-		data     bool
-		line     []byte
-		payload  []byte
-		output   []byte
-	}
-	var buf []bufferedLine
+	// 逐行实时转发，保持低首字节延迟（TTFB）。
+	// 同时检测 XML 工具调用：一旦 content 中出现工具调用标签开头
+	// （如 <invoke name=），进入抑制模式——后续 content 行不再转发，
+	// 流结束后统一转换为结构化的 delta.tool_calls。
+	// 普通文本响应完全不受影响，逐行实时透传（与旧行为一致）。
+	xmlSuppressed := false
+	var suppressedOutput []byte
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
-		entry := bufferedLine{line: line}
 
 		if len(line) == 0 {
-			buf = append(buf, entry)
+			if xmlSuppressed {
+				suppressedOutput = append(suppressedOutput, '\n')
+			} else {
+				w.Write([]byte("\n"))
+				flusher.Flush()
+			}
 			continue
 		}
-		if bytes.HasPrefix(line, []byte(`data: `)) {
+		if bytes.HasPrefix(line, []byte("data: ")) {
 			payload := line[6:]
-			entry.data = true
-			entry.payload = payload
-			entry.output = append([]byte("data: "), h.rewriteModelField(payload, virtualModel)...)
-			entry.output = append(entry.output, byte(0x0a))
 
-			if bytes.Equal(payload, []byte(`[DONE]`)) {
-				buf = append(buf, entry)
+			if bytes.Equal(payload, []byte("[DONE]")) {
 				continue
 			}
-			result.AccumulatedContent += extractContent(payload)
+
+			content := extractContent(payload)
+			result.AccumulatedContent += content
 			extractToolCalls(payload, result)
 			if result.Usage == nil {
 				if usage := extractUsage(payload); usage != nil {
@@ -131,19 +125,45 @@ func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadClose
 			} else {
 				mergeUsage(result.Usage, extractUsage(payload))
 			}
-			buf = append(buf, entry)
+
+			rewritten := h.rewriteModelField(payload, virtualModel)
+
+			if xmlSuppressed {
+				suppressedOutput = append(suppressedOutput, []byte("data: ")...)
+				suppressedOutput = append(suppressedOutput, rewritten...)
+				suppressedOutput = append(suppressedOutput, '\n')
+				continue
+			}
+
+			if containsXMLToolCallStart(content) {
+				xmlSuppressed = true
+				suppressedOutput = append(suppressedOutput, []byte("data: ")...)
+				suppressedOutput = append(suppressedOutput, rewritten...)
+				suppressedOutput = append(suppressedOutput, '\n')
+				continue
+			}
+
+			w.Write([]byte("data: "))
+			w.Write(rewritten)
+			w.Write([]byte("\n"))
 		} else {
-			entry.output = append(line, byte(0x0a))
-			buf = append(buf, entry)
+			if xmlSuppressed {
+				suppressedOutput = append(suppressedOutput, line...)
+				suppressedOutput = append(suppressedOutput, '\n')
+			} else {
+				w.Write(line)
+				w.Write([]byte("\n"))
+			}
 		}
+		flusher.Flush()
 	}
 
 	if err := scanner.Err(); err != nil && err != io.EOF && err != context.Canceled {
 		log.Warn().Err(err).Msg("stream scan ended abnormally")
 		if openAIClient {
-			w.Write([]byte(`data: [DONE]\n\n`))
+			w.Write([]byte("data: [DONE]\n\n"))
 		} else {
-			w.Write([]byte(`event: message_stop\ndata: "type":"message_stop"}\n\n`))
+			w.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
 		}
 		flusher.Flush()
 		return result, fmt.Errorf("stream ended abnormally: %w", err)
@@ -169,58 +189,44 @@ func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadClose
 
 	if hasXMLToolCalls {
 		toolCallsSlice := h.ExtractToolCalls(result)
-
-		if len(result.AccumulatedContent) == 0 {
-			// 整段 content 都是 XML 工具调用，没有真正的对话文本。
-			// 丢弃全部 content 行，只发一个结构化的 tool_calls chunk。
-			if len(toolCallsSlice) > 0 {
-				if err := h.emitToolCallsChunk(w, flusher, toolCallsSlice); err != nil {
-					log.Warn().Err(err).Msg("failed to emit XML-derived tool_calls chunk")
-				}
-			}
-			if openAIClient {
-				w.Write([]byte(`data: [DONE]\n\n`))
-			} else {
-				w.Write([]byte(`event: message_stop\ndata: "type":"message_stop"}\n\n`))
-			}
-			flusher.Flush()
-			return result, nil
-		}
-
-		// content 中既有对话文本也有 XML tool calls：先回放全部上游行，再追加 tool_calls。
-		for _, entry := range buf {
-			if entry.data && bytes.Equal(entry.payload, []byte(`[DONE]`)) {
-				w.Write([]byte(`data: [DONE]\n\n`))
-			} else {
-				w.Write(entry.output)
-			}
-			flusher.Flush()
-		}
 		if len(toolCallsSlice) > 0 {
 			if err := h.emitToolCallsChunk(w, flusher, toolCallsSlice); err != nil {
 				log.Warn().Err(err).Msg("failed to emit XML-derived tool_calls chunk")
 			}
 		}
-		if openAIClient {
-			w.Write([]byte(`data: [DONE]\n\n`))
-		} else {
-			w.Write([]byte(`event: message_stop\ndata: "type":"message_stop"}\n\n`))
-		}
+	} else if xmlSuppressed {
+		// 误判（普通文本包含工具调用标签字样）：补发被抑制的内容，避免丢文本
+		w.Write(suppressedOutput)
 		flusher.Flush()
-		return result, nil
 	}
 
-	// 无 XML tool calls：原样回放所有上游行。
-	for _, entry := range buf {
-		if entry.data && bytes.Equal(entry.payload, []byte(`[DONE]`)) {
-			w.Write([]byte(`data: [DONE]\n\n`))
-		} else {
-			w.Write(entry.output)
-		}
-		flusher.Flush()
+	// 统一补发终止符（客户端依赖它结束流）。
+	if openAIClient {
+		w.Write([]byte("data: [DONE]\n\n"))
+	} else {
+		w.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
 	}
+	flusher.Flush()
 	return result, nil
 }
+
+// containsXMLToolCallStart 判断 content 是否包含 XML 工具调用标签开头。
+// 识别四种上游拼写：<function=, <tool_name=, <tool_call=, <invoke name=。
+func containsXMLToolCallStart(content string) bool {
+	patterns := []string{
+		"<function=",
+		"<tool_name=",
+		"<tool_call=",
+		"<invoke name=",
+	}
+	for _, p := range patterns {
+		if strings.Contains(content, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // extractUsage 从 SSE chunk 提取真实 token 用量
 // OpenAI 格式: {"choices":[...],"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150}}
 // Anthropic 格式: message_start 同时含 "input_tokens" 和 "output_tokens"，message_delta 同理
