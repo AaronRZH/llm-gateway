@@ -26,6 +26,7 @@ import (
 	"llm-gateway/internal/router"
 	"llm-gateway/internal/storage"
 	"llm-gateway/internal/stream"
+	"llm-gateway/internal/toolcall"
 	"llm-gateway/internal/token"
 )
 
@@ -303,7 +304,6 @@ func handleChatCompletion(
 				// 5. 解析上游返回的真实 usage，异步记录用量
 				realInput, realOutput, realTotal := parseUsage(body)
 				// 解析 tool_calls
-				toolCalls := parseToolCalls(body, targetProvider)
 				_ = realTotal // 保留用于未来的扩展
 				// 上游未返回 usage 时回退到本地估算，避免 token 统计漏记（与流式路径保持一致）
 				effInput := realInput
@@ -318,15 +318,15 @@ func handleChatCompletion(
 				if realTotal > 0 {
 					effTotal = realTotal
 				}
-				go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
-					inputTokens, 0, 0, effInput, effOutput, effTotal, len(toolCalls), apiKey)
 
 				// 重写响应中的 model 字段
 				body = mapper.RewriteResponse(body, req.Model)
 
 				// 6. 将 Anthropic tool_use 转换为 OpenAI tool_calls 格式
 				body = rewriteAnthropicToolCalls(body, targetProvider)
-
+				body = rewriteXMLToolCalls(body)
+				go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
+					inputTokens, 0, 0, effInput, effOutput, effTotal, toolCallsCount(body), apiKey)
 				c.Data(res.StatusCode, "application/json", body)
 				return
 			}
@@ -988,6 +988,84 @@ func toolsFromAnthropicRequest(reqTools []map[string]interface{}) []provider.Too
 	return out
 }
 
+
+
+// toolCallsCount returns the number of tool_calls in the first choice of an
+// OpenAI-shaped response. Used after rewriteAnthropicToolCalls +
+// rewriteXMLToolCalls so the usage accounting picks up XML-embedded tool
+// calls that were only just materialized.
+func toolCallsCount(body []byte) int {
+	var resp map[string]interface{}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return 0
+	}
+	choices, ok := resp["choices"].([]interface{})
+	if !ok || len(choices) == 0 {
+		return 0
+	}
+	choice0, ok := choices[0].(map[string]interface{})
+	if !ok {
+		return 0
+	}
+	msg, ok := choice0["message"].(map[string]interface{})
+	if !ok {
+		return 0
+	}
+	tcs, ok := msg["tool_calls"].([]interface{})
+	if !ok {
+		return 0
+	}
+	return len(tcs)
+}
+// rewriteXMLToolCalls handles the case where an OpenAI-compatible upstream
+// returns tool calls as raw XML tags embedded in choices[0].message.content
+// instead of a structured tool_calls array. It runs toolcall.Normalize on the
+// content and, if any tool calls were extracted, rewrites the response body to
+// move them into message.tool_calls while clearing the leftover text.
+// This is applied after rewriteAnthropicToolCalls, so it only touches bodies
+// that still have a choices array (i.e. OpenAI-shaped).
+func rewriteXMLToolCalls(body []byte) []byte {
+	var resp map[string]interface{}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return body
+	}
+	choices, ok := resp["choices"].([]interface{})
+	if !ok || len(choices) == 0 {
+		return body
+	}
+	choice0, ok := choices[0].(map[string]interface{})
+	if !ok {
+		return body
+	}
+	msg, ok := choice0["message"].(map[string]interface{})
+	if !ok {
+		return body
+	}
+	content, _ := msg["content"].(string)
+	if content == "" {
+		return body
+	}
+	result := toolcall.Normalize(content)
+	if len(result.ToolCalls) == 0 {
+		return body
+	}
+	// Move extracted tool calls into the message and clean the content.
+	msg["content"] = result.CleanContent
+	var existing []interface{}
+	if raw, ok := msg["tool_calls"].([]interface{}); ok {
+		existing = raw
+	}
+	for _, tc := range result.ToOpenAISlice() {
+		existing = append(existing, tc)
+	}
+	msg["tool_calls"] = existing
+	choice0["finish_reason"] = "tool_calls"
+	out, err := json.Marshal(resp)
+	if err != nil {
+		return body
+	}
+	return out
+}
 // parseToolCalls 从响应中解析 tool_calls
 func parseToolCalls(body []byte, providerName string) []protocol.ChatCompletionResponse {
 	var results []protocol.ChatCompletionResponse

@@ -12,6 +12,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
+
+	"llm-gateway/internal/toolcall"
 )
 
 // Handler SSE 流处理
@@ -150,6 +152,26 @@ func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadClose
 		return result, fmt.Errorf("stream ended abnormally: %w", err)
 	}
 
+	// 后置处理：部分上游会把 tool_calls 以原始 XML 标签嵌在 content 里
+	// （例如 DeepSeek Chat），而不是以结构化 tool_calls 返回。此时
+	// AccumulatedToolCalls 为空，但 AccumulatedContent 里含有 XML 形式的标签。
+	// 这里做一次 Normalize：提取出工具调用并进 AccumulatedToolCalls，把
+	// 残留文本写回 AccumulatedContent。
+	normalized := toolcall.Normalize(result.AccumulatedContent)
+	if len(normalized.ToolCalls) > 0 {
+		for _, tc := range normalized.ToolCalls {
+			result.AccumulatedToolCalls = append(result.AccumulatedToolCalls, ToolCallChunk{
+				Index: -1,
+				ID:    tc.ID,
+				Type:  tc.Type,
+				Function: FunctionChunk{
+					Name:      tc.Function["name"].(string),
+					Arguments: tc.Function["arguments"].(string),
+				},
+			})
+		}
+		result.AccumulatedContent = normalized.CleanContent
+	}
 	return result, nil
 }
 
