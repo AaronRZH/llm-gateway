@@ -22,89 +22,129 @@ type Result struct {
 	ToolCalls    []OpenAIToolCall
 }
 
-// openTagRe returns the compiled open-tag regexp. The tag spelling is
-// assembled at runtime to avoid raw XML literals in this file.
-func openTagRe() *regexp.Regexp {
-	return regexp.MustCompile(`<function=([a-zA-Z0-9_-]+)>`)
+// Supported open-tag families: their pattern and matching close tag.
+type tagFamily struct {
+	open  string
+	close string
+}
+
+var (
+	LT_SL = `</`
+	GT = `>`
+)
+
+var families = []tagFamily{
+	{open: `<function=([a-zA-Z0-9_.-]+)>`, close: `</function>`},
+	{open: `<tool_name=([a-zA-Z0-9_.-]+)>`, close: `</tool_name>`},
+	{open: `<tool_call=([a-zA-Z0-9_.-]+)>`, close: `</tool_call>`},
+	{open: `<invoke name=([a-zA-Z0-9_.-]+)>`, close: `</invoke>`},
+}
+
+// buildRe matches any supported open tag (no ^ anchor). Capture group 1 = name.
+func buildRe() *regexp.Regexp {
+	pattern := families[0].open
+	for _, f := range families[1:] {
+		pattern += "|" + f.open
+	}
+	return regexp.MustCompile(pattern)
+}
+
+// buildSiblingRe matches the start of any open tag (no capture).
+func buildSiblingRe() *regexp.Regexp {
+	parts := []string{
+		`<function=[a-zA-Z0-9_.-]+>`,
+		`<tool_name=[a-zA-Z0-9_.-]+>`,
+		`<tool_call=[a-zA-Z0-9_.-]+>`,
+		`<invoke name=[a-zA-Z0-9_.-]+>`,
+	}
+	return regexp.MustCompile(strings.Join(parts, "|"))
+}
+
+// paramRe matches `<parameter=KEY>VALUE</parameter`.
+func paramRe() *regexp.Regexp {
+	return regexp.MustCompile(`<parameter=([a-zA-Z0-9_.-]+)>([\s\S]*?)</parameter>`)
 }
 
 // Normalize scans text for embedded XML tool-call tags and converts each one
 // into an OpenAI-shaped tool call, stripping the matching XML from the text.
 //
-// Supported shape (function name must match [a-zA-Z0-9_-]+):
-//
-//	<function=foo>{"a":1}</function>
-//	<function=foo>{"a":1}
-//	<function=foo>
-//
-// The payload (text between the opening and closing tag, or until end-of-string)
-// is treated as the arguments JSON. If it does not parse as JSON, the raw string
-// is kept under a "raw" key so the call is not lost.
+// Supported open-tag spellings: <function=NAME>, <tool_name=NAME>, <tool_call=NAME>.
+// Supported payload shapes:
+//   1. Inline JSON: {"a":1}
+//   2. Nested parameters: <parameter=a>1</parameter>
+// Missing close tags are tolerated: the next sibling open tag terminates the block.
 func Normalize(text string) Result {
 	r := Result{}
 	if text == "" {
 		return r
 	}
-
-	re := openTagRe()
-	indices := re.FindAllStringSubmatchIndex(text, -1)
-	if len(indices) == 0 {
-		r.CleanContent = text
-		return r
-	}
-
+	re := buildRe()
+	sibRe := buildSiblingRe()
+	pRe := paramRe()
 	var cleanParts []string
 	pos := 0
-	for _, m := range indices {
-		// m[0],m[1] = full open tag; m[2],m[3] = captured name
-		cleanParts = append(cleanParts, text[pos:m[0]])
-		name := text[m[2]:m[3]]
-
-		// Payload = everything after '>' of the open tag until either:
-		//   - the matching closing tag </name> (if present),
-		//   - the next opening tag <function= (a following sibling call), or
-		//   - end-of-string.
-		afterOpen := m[1]
-		if afterOpen >= len(text) {
+	searchFrom := 0
+	for {
+		remaining := text[searchFrom:]
+		loc := re.FindStringIndex(remaining)
+		if loc == nil {
+			break
+		}
+		absStart := searchFrom + loc[0]
+		absEnd := searchFrom + loc[1]
+		openTag := remaining[loc[0]:loc[1]]
+		var name, closeTag string
+		for _, f := range families {
+			fr := regexp.MustCompile(f.open)
+			if m := fr.FindStringSubmatch(openTag); m != nil {
+				name = m[1]
+				closeTag = f.close
+				break
+			}
+		}
+		if name == "" {
+			searchFrom = absEnd
 			continue
 		}
-		closeTag := "</" + name + ">"
-		closeIdx := strings.Index(text[afterOpen:], closeTag)
-		nextSib := strings.Index(text[afterOpen:], "<function=")
+		cleanParts = append(cleanParts, text[pos:absStart])
+		rest := text[absEnd:]
+		closeIdx := strings.Index(rest, closeTag)
+		if closeIdx < 0 {
+			closeIdx = strings.Index(rest, LT_SL + name + GT)
+			closeTag = LT_SL + name + GT
+		}
+		sibIdx := -1
+		if sibLoc := sibRe.FindStringIndex(rest); sibLoc != nil {
+			sibIdx = sibLoc[0]
+		}
 		end := -1
 		chosen := -1
 		if closeIdx >= 0 && (end < 0 || closeIdx < end) {
 			end = closeIdx
 			chosen = 0
 		}
-		if nextSib >= 0 && (end < 0 || nextSib < end) {
-			end = nextSib
+		if sibIdx >= 0 && (end < 0 || sibIdx < end) {
+			end = sibIdx
 			chosen = 1
 		}
-
 		var payload string
 		if end >= 0 && chosen == 0 {
-			payload = text[afterOpen : afterOpen+end]
-			pos = afterOpen + end + len(closeTag)
+			payload = rest[:end]
+			pos = absEnd + end + len(closeTag)
 		} else if end >= 0 && chosen == 1 {
-			payload = text[afterOpen : afterOpen+end]
-			// pos stays; the sibling's own open tag is picked up next iteration
+			payload = rest[:end]
+			pos = absEnd
 		} else {
-			payload = text[afterOpen:]
+			payload = rest
 			pos = len(text)
 		}
-
+		searchFrom = pos
 		payload = strings.TrimSpace(payload)
 		if payload == "" {
 			continue
 		}
-
-		var args interface{}
-		if err := json.Unmarshal([]byte(payload), &args); err != nil {
-			args = map[string]interface{}{"raw": payload}
-		}
+		args := extractArgs(payload, pRe)
 		argsJSON, _ := json.Marshal(args)
-
 		r.ToolCalls = append(r.ToolCalls, OpenAIToolCall{
 			ID:   "call_" + uuid.New().String()[:8],
 			Type: "function",
@@ -115,13 +155,38 @@ func Normalize(text string) Result {
 		})
 	}
 	cleanParts = append(cleanParts, text[pos:])
-	r.CleanContent = strings.Join(cleanParts, "")
-	r.CleanContent = strings.TrimSpace(r.CleanContent)
+	r.CleanContent = strings.TrimSpace(strings.Join(cleanParts, ""))
 	return r
 }
 
-// ToOpenAISlice converts Result.ToolCalls to the generic []map format used by
-// the gateway's streaming accumulator and non-streaming body rewriter.
+// extractArgs turns a payload blob into a map[string]interface{} of arguments.
+func extractArgs(payload string, pRe *regexp.Regexp) map[string]interface{} {
+	params := pRe.FindAllStringSubmatch(payload, -1)
+	if len(params) > 0 {
+		out := make(map[string]interface{}, len(params))
+		for _, p := range params {
+			key := strings.TrimSpace(p[1])
+			val := p[2]
+			var parsed interface{}
+			if err := json.Unmarshal([]byte(val), &parsed); err == nil {
+				out[key] = parsed
+			} else {
+				out[key] = val
+			}
+		}
+		return out
+	}
+	var parsed interface{}
+	if err := json.Unmarshal([]byte(payload), &parsed); err == nil {
+		if m, ok := parsed.(map[string]interface{}); ok {
+			return m
+		}
+		return map[string]interface{}{"raw": parsed}
+	}
+	return map[string]interface{}{"raw": payload}
+}
+
+// ToOpenAISlice converts Result.ToolCalls to the generic []map format.
 func (r Result) ToOpenAISlice() []map[string]interface{} {
 	if len(r.ToolCalls) == 0 {
 		return nil
