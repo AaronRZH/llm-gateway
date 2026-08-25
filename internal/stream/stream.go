@@ -96,6 +96,12 @@ func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadClose
 	xmlSuppressed := false
 	var suppressedOutput []byte
 
+	// 滚动缓冲：保留最近 4KB content 用于跨 chunk 检测 XML 标签。
+	// 当上游把 <invoke name=add_clarification> 切成多个 SSE chunk
+	// （如 <invoke na + me=add_clarification>）时，单行检测会漏检。
+	// 用缓冲拼接最近内容后再检测，提高命中率。
+	var xmlDetectBuf []byte
+
 	for scanner.Scan() {
 		line := scanner.Bytes()
 
@@ -135,7 +141,13 @@ func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadClose
 				continue
 			}
 
-			if containsXMLToolCallStart(content) {
+			// 滚动缓冲：追加当前 content，保留最近 4KB
+			xmlDetectBuf = append(xmlDetectBuf, content...)
+			if len(xmlDetectBuf) > 4096 {
+				xmlDetectBuf = xmlDetectBuf[len(xmlDetectBuf)-4096:]
+			}
+
+			if containsXMLToolCallStart(string(xmlDetectBuf)) {
 				xmlSuppressed = true
 				suppressedOutput = append(suppressedOutput, []byte("data: ")...)
 				suppressedOutput = append(suppressedOutput, rewritten...)
@@ -163,7 +175,8 @@ func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadClose
 		if openAIClient {
 			w.Write([]byte("data: [DONE]\n\n"))
 		} else {
-			w.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
+			w.Write([]byte("event: message_stop\n"))
+			w.Write([]byte("data: {\"type\":\"message_stop\"}\n\n"))
 		}
 		flusher.Flush()
 		return result, fmt.Errorf("stream ended abnormally: %w", err)
@@ -200,11 +213,12 @@ func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadClose
 		flusher.Flush()
 	}
 
-	// 统一补发终止符（客户端依赖它结束流）。
+	// 统一补发终止符：上游 [DONE] 已在扫描时跳过，这里始终补发一个。
 	if openAIClient {
 		w.Write([]byte("data: [DONE]\n\n"))
 	} else {
-		w.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
+		w.Write([]byte("event: message_stop\n"))
+		w.Write([]byte("data: {\"type\":\"message_stop\"}\n\n"))
 	}
 	flusher.Flush()
 	return result, nil
@@ -241,8 +255,11 @@ func (h *Handler) emitToolCallsChunk(w http.ResponseWriter, flusher http.Flusher
 		"tool_calls": toolCalls,
 	}
 	chunk := map[string]interface{}{
-		"choices":       []map[string]interface{}{{"index": 0, "delta": delta}},
-		"finish_reason": "tool_calls",
+		"choices": []map[string]interface{}{{
+			"index":        0,
+			"delta":        delta,
+			"finish_reason": "tool_calls",
+		}},
 	}
 	data, err := json.Marshal(chunk)
 	if err != nil {
