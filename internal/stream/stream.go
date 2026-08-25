@@ -85,80 +85,74 @@ func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadClose
 
 	scanner := bufio.NewScanner(upstream)
 	scanner.Split(bufio.ScanLines)
-	// 放大行缓冲：默认 64KB，超长 SSE 行（如超长 tool_call arguments）会触发 "token too long" 提前断流
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+
+	// 缓存所有上游行，直到流结束后统一决定转发策略。
+	// 原因：部分上游会把 tool_calls 以 XML 形式嵌在 content 里并跨多个
+	// SSE chunk 流出来（如 <invoke name=add_clarification>）。
+	// 若逐行透传，客户端会先收到一堆原始 XML，事后又收到我们转换出的
+	// tool_calls，两种形式并存会让下游 agent 困惑。所以先缓存，结束后：
+	//   - 无 XML tool calls       -> 原样回放所有行
+	//   - 有 XML tool calls 且 CleanContent 为空 -> 丢弃全部行，只发 tool_calls
+	//   - 有 XML tool calls 且 CleanContent 非空 -> 回放行 + 追加 tool_calls
+	type bufferedLine struct {
+		data     bool
+		line     []byte
+		payload  []byte
+		output   []byte
+	}
+	var buf []bufferedLine
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
+		entry := bufferedLine{line: line}
 
-		// 空行是 SSE 分隔符，直接转发
 		if len(line) == 0 {
-			w.Write([]byte("\n"))
-			flusher.Flush()
+			buf = append(buf, entry)
 			continue
 		}
+		if bytes.HasPrefix(line, []byte(`data: `)) {
+			payload := line[6:]
+			entry.data = true
+			entry.payload = payload
+			entry.output = append([]byte("data: "), h.rewriteModelField(payload, virtualModel)...)
+			entry.output = append(entry.output, byte(0x0a))
 
-		// 重写 data: 行中的 model 字段，同时累计 content / tool_calls
-		if bytes.HasPrefix(line, []byte("data: ")) {
-			payload := line[6:] // 去掉 "data: " 前缀
-
-			// 忽略 [DONE] 标记
-			if bytes.Equal(payload, []byte("[DONE]")) {
-				w.Write([]byte("data: [DONE]\n"))
-				flusher.Flush()
+			if bytes.Equal(payload, []byte(`[DONE]`)) {
+				buf = append(buf, entry)
 				continue
 			}
-
-			// 从 JSON 中提取 delta.content 用于累计
 			result.AccumulatedContent += extractContent(payload)
-
-			// 提取并累计 tool_calls
 			extractToolCalls(payload, result)
-
-			// 提取 usage（OpenAI 在最后一个 chunk 的 usage 字段返回真实 token 数）
 			if result.Usage == nil {
 				if usage := extractUsage(payload); usage != nil {
 					result.Usage = usage
 				}
 			} else {
-				// 合并增量 usage（Anthropic 格式）
 				mergeUsage(result.Usage, extractUsage(payload))
 			}
-
-			// 替换 model 字段
-			rewritten := h.rewriteModelField(payload, virtualModel)
-
-			w.Write([]byte("data: "))
-			w.Write(rewritten)
-			w.Write([]byte("\n"))
+			buf = append(buf, entry)
 		} else {
-			w.Write(line)
-			w.Write([]byte("\n"))
+			entry.output = append(line, byte(0x0a))
+			buf = append(buf, entry)
 		}
-
-		flusher.Flush()
 	}
 
 	if err := scanner.Err(); err != nil && err != io.EOF && err != context.Canceled {
-		log.Warn().Err(err).Msg("stream scan ended abnormally (upstream stall or line too long), sending terminator")
-		// 异常结束：补发终止符，避免客户端一直等待（context.Canceled 表示客户端已断开，无需补发）
+		log.Warn().Err(err).Msg("stream scan ended abnormally")
 		if openAIClient {
-			w.Write([]byte("data: [DONE]\n\n"))
+			w.Write([]byte(`data: [DONE]\n\n`))
 		} else {
-			w.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
+			w.Write([]byte(`event: message_stop\ndata: "type":"message_stop"}\n\n`))
 		}
 		flusher.Flush()
-		// 上游侧异常（非客户端断开）：返回错误供上层回报熔断，避免坏上游不被熔断
 		return result, fmt.Errorf("stream ended abnormally: %w", err)
 	}
 
-	// 后置处理：部分上游会把 tool_calls 以原始 XML 标签嵌在 content 里
-	// （例如 DeepSeek Chat），而不是以结构化 tool_calls 返回。此时
-	// AccumulatedToolCalls 为空，但 AccumulatedContent 里含有 XML 形式的标签。
-	// 这里做一次 Normalize：提取出工具调用并进 AccumulatedToolCalls，把
-	// 残留文本写回 AccumulatedContent。
+	// 后处理：将 XML 工具调用转换为标准 OpenAI tool_calls。
 	normalized := toolcall.Normalize(result.AccumulatedContent)
-	if len(normalized.ToolCalls) > 0 {
+	hasXMLToolCalls := len(normalized.ToolCalls) > 0
+	if hasXMLToolCalls {
 		for _, tc := range normalized.ToolCalls {
 			result.AccumulatedToolCalls = append(result.AccumulatedToolCalls, ToolCallChunk{
 				Index: -1,
@@ -172,12 +166,95 @@ func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadClose
 		}
 		result.AccumulatedContent = normalized.CleanContent
 	}
+
+	if hasXMLToolCalls {
+		toolCallsSlice := h.ExtractToolCalls(result)
+
+		if len(result.AccumulatedContent) == 0 {
+			// 整段 content 都是 XML 工具调用，没有真正的对话文本。
+			// 丢弃全部 content 行，只发一个结构化的 tool_calls chunk。
+			if len(toolCallsSlice) > 0 {
+				if err := h.emitToolCallsChunk(w, flusher, toolCallsSlice); err != nil {
+					log.Warn().Err(err).Msg("failed to emit XML-derived tool_calls chunk")
+				}
+			}
+			if openAIClient {
+				w.Write([]byte(`data: [DONE]\n\n`))
+			} else {
+				w.Write([]byte(`event: message_stop\ndata: "type":"message_stop"}\n\n`))
+			}
+			flusher.Flush()
+			return result, nil
+		}
+
+		// content 中既有对话文本也有 XML tool calls：先回放全部上游行，再追加 tool_calls。
+		for _, entry := range buf {
+			if entry.data && bytes.Equal(entry.payload, []byte(`[DONE]`)) {
+				w.Write([]byte(`data: [DONE]\n\n`))
+			} else {
+				w.Write(entry.output)
+			}
+			flusher.Flush()
+		}
+		if len(toolCallsSlice) > 0 {
+			if err := h.emitToolCallsChunk(w, flusher, toolCallsSlice); err != nil {
+				log.Warn().Err(err).Msg("failed to emit XML-derived tool_calls chunk")
+			}
+		}
+		if openAIClient {
+			w.Write([]byte(`data: [DONE]\n\n`))
+		} else {
+			w.Write([]byte(`event: message_stop\ndata: "type":"message_stop"}\n\n`))
+		}
+		flusher.Flush()
+		return result, nil
+	}
+
+	// 无 XML tool calls：原样回放所有上游行。
+	for _, entry := range buf {
+		if entry.data && bytes.Equal(entry.payload, []byte(`[DONE]`)) {
+			w.Write([]byte(`data: [DONE]\n\n`))
+		} else {
+			w.Write(entry.output)
+		}
+		flusher.Flush()
+	}
 	return result, nil
 }
-
 // extractUsage 从 SSE chunk 提取真实 token 用量
 // OpenAI 格式: {"choices":[...],"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150}}
 // Anthropic 格式: message_start 同时含 "input_tokens" 和 "output_tokens"，message_delta 同理
+// emitToolCallsChunk writes a single SSE chunk carrying a complete
+// delta.tool_calls payload (all arguments, not incremental) plus
+// finish_reason="tool_calls", then flushes the writer. Used when the
+// upstream sent XML-encoded tool calls in content and we converted them.
+func (h *Handler) emitToolCallsChunk(w http.ResponseWriter, flusher http.Flusher, toolCalls []map[string]interface{}) error {
+	delta := map[string]interface{}{
+		"role":       "assistant",
+		"content":    "",
+		"tool_calls": toolCalls,
+	}
+	chunk := map[string]interface{}{
+		"choices":       []map[string]interface{}{{"index": 0, "delta": delta}},
+		"finish_reason": "tool_calls",
+	}
+	data, err := json.Marshal(chunk)
+	if err != nil {
+		return err
+	}
+	sep := []byte{0x0a, 0x0a}
+	buf := make([]byte, 0, 6+len(data)+len(sep))
+	buf = append(buf, []byte("data: ")...)
+	buf = append(buf, data...)
+	buf = append(buf, sep...)
+	_, err = w.Write(buf)
+	if err != nil {
+		return err
+	}
+	flusher.Flush()
+	return nil
+}
+
 func extractUsage(payload []byte) *StreamUsage {
 	// 尝试 OpenAI 格式: {"choices":[...],"usage":{"prompt_tokens":...}}
 	var resp struct {
@@ -258,19 +335,34 @@ func mergeUsage(existing *StreamUsage, incoming *StreamUsage) {
 	}
 }
 
-// ExtractToolCalls 从 StreamResult 中提取 tool_calls
 func (h *Handler) ExtractToolCalls(result *StreamResult) []map[string]interface{} {
 	if len(result.AccumulatedToolCalls) == 0 {
 		return nil
 	}
 
-	// 按 index 分组，合并 function arguments
-	callMap := make(map[int]*FunctionChunk)
+	// 按 index 分组，合并 arguments。对 Index<0 的条目（XML 后置提取的 tool
+	// calls），在写入 map 前替换成一个不会碰撞到有效 index 的 key，避免
+	// 用负数做切片下标访问 result.AccumulatedToolCalls[idx].
+	type mergedEntry struct {
+		ID        string
+		Type      string
+		Name      string
+		Arguments string
+	}
+	callMap := make(map[int]*mergedEntry)
+	negSeq := 0
 	for _, tc := range result.AccumulatedToolCalls {
-		if fc, ok := callMap[tc.Index]; ok {
-			fc.Arguments += tc.Function.Arguments
+		key := tc.Index
+		if key < 0 {
+			negSeq--
+			key = negSeq
+		}
+		if me, ok := callMap[key]; ok {
+			me.Arguments += tc.Function.Arguments
 		} else {
-			callMap[tc.Index] = &FunctionChunk{
+			callMap[key] = &mergedEntry{
+				ID:        tc.ID,
+				Type:      tc.Type,
 				Name:      tc.Function.Name,
 				Arguments: tc.Function.Arguments,
 			}
@@ -278,20 +370,16 @@ func (h *Handler) ExtractToolCalls(result *StreamResult) []map[string]interface{
 	}
 
 	var toolCalls []map[string]interface{}
-	for idx, fc := range callMap {
-		// 取第一个 chunk 的 ID 和 Type
-		id := result.AccumulatedToolCalls[idx].ID
-		typ := result.AccumulatedToolCalls[idx].Type
-		argsBytes, _ := json.Marshal(fc.Arguments)
-		// 反序列化为对象
+	for _, me := range callMap {
+		argsBytes, _ := json.Marshal(me.Arguments)
 		var argsObj interface{}
 		json.Unmarshal(argsBytes, &argsObj)
 
 		toolCalls = append(toolCalls, map[string]interface{}{
-			"id":   id,
-			"type": typ,
+			"id":   me.ID,
+			"type": me.Type,
 			"function": map[string]interface{}{
-				"name":      fc.Name,
+				"name":      me.Name,
 				"arguments": argsObj,
 			},
 		})
