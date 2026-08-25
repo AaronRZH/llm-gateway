@@ -232,6 +232,10 @@ func containsXMLToolCallStart(content string) bool {
 		"<tool_name=",
 		"<tool_call=",
 		"<invoke name=",
+		// 外层包裹标签（无等号），如 ursal_call  / ursal_call
+		// 用 ">" 结尾区分 "<tool_call=NAME>"（带等号）
+		"<tool_call>",
+		"</tool_call>",
 	}
 	for _, p := range patterns {
 		if strings.Contains(content, p) {
