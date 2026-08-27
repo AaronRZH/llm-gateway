@@ -68,16 +68,28 @@ func TestRewriteModelField(t *testing.T) {
 // ==================== extractContent ====================
 
 func TestExtractContent(t *testing.T) {
-	if got := extractContent([]byte(`{"choices":[{"delta":{"content":"hello"}}]}`)); got != "hello" {
+	if got, _ := extractContent([]byte(`{"choices":[{"delta":{"content":"hello"}}]}`)); got != "hello" {
 		t.Errorf("expected hello, got %q", got)
 	}
 	// 无 choices
-	if got := extractContent([]byte(`{"id":"1"}`)); got != "" {
+	if got, _ := extractContent([]byte(`{"id":"1"}`)); got != "" {
 		t.Errorf("expected empty, got %q", got)
 	}
 	// 非法 JSON
-	if got := extractContent([]byte(`{bad`)); got != "" {
+	if got, _ := extractContent([]byte(`{bad`)); got != "" {
 		t.Errorf("expected empty for bad json, got %q", got)
+	}
+	// reasoning_content 字段
+	if _, got := extractContent([]byte(`{"choices":[{"delta":{"content":"","reasoning_content":"think"}}]}`)); got != "think" {
+		t.Errorf("expected reasoning think, got %q", got)
+	}
+	// reasoning 字段（sensenova 等）
+	if _, got := extractContent([]byte(`{"choices":[{"delta":{"reasoning":"plan"}}]}`)); got != "plan" {
+		t.Errorf("expected reasoning plan, got %q", got)
+	}
+	// reasoning_content 优先于 reasoning，避免重复计数
+	if _, got := extractContent([]byte(`{"choices":[{"delta":{"reasoning_content":"a","reasoning":"b"}}]}`)); got != "a" {
+		t.Errorf("expected reasoning_content a, got %q", got)
 	}
 }
 

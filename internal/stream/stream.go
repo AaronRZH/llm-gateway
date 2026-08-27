@@ -40,6 +40,8 @@ func (h *Handler) IdleTimeout() time.Duration {
 type StreamResult struct {
 	// AccumulatedContent 累计的响应内容文本（用于估算输出 token）
 	AccumulatedContent string
+	// AccumulatedReasoning 累计的推理文本（reasoning/reasoning_content，用于估算输出 token）
+	AccumulatedReasoning string
 	// AccumulatedToolCalls 累计的 tool_calls 列表
 	AccumulatedToolCalls []ToolCallChunk
 	// Usage 从 SSE 最后一个 chunk 提取的真实 token 用量
@@ -121,8 +123,9 @@ func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadClose
 				continue
 			}
 
-			content := extractContent(payload)
+			content, reasoning := extractContent(payload)
 			result.AccumulatedContent += content
+			result.AccumulatedReasoning += reasoning
 			extractToolCalls(payload, result)
 			if result.Usage == nil {
 				if usage := extractUsage(payload); usage != nil {
@@ -415,22 +418,31 @@ func (h *Handler) ExtractToolCalls(result *StreamResult) []map[string]interface{
 	return toolCalls
 }
 
-// extractContent 从 SSE chunk JSON 中提取 delta.content
-func extractContent(payload []byte) string {
+// extractContent 从 SSE chunk JSON 中提取 delta.content 和推理文本。
+// 推理字段同时支持 reasoning_content（DeepSeek/llama.cpp）与 reasoning（sensenova 等），
+// 取首个非空值，避免重复计数。reasoning 不参与 XML 工具调用检测，故单独返回；
+// 上游 usage 缺失时用于补全输出 token 估算。
+func extractContent(payload []byte) (content, reasoning string) {
 	var chunk struct {
 		Choices []struct {
 			Delta struct {
-				Content string `json:"content"`
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
+				Reasoning        string `json:"reasoning"`
 			} `json:"delta"`
 		} `json:"choices"`
 	}
 	if err := json.Unmarshal(payload, &chunk); err != nil {
-		return ""
+		return "", ""
 	}
-	if len(chunk.Choices) > 0 {
-		return chunk.Choices[0].Delta.Content
+	if len(chunk.Choices) == 0 {
+		return "", ""
 	}
-	return ""
+	d := chunk.Choices[0].Delta
+	if d.ReasoningContent != "" {
+		return d.Content, d.ReasoningContent
+	}
+	return d.Content, d.Reasoning
 }
 
 // extractToolCalls 从 SSE chunk 中提取 tool_calls

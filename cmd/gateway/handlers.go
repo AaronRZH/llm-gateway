@@ -196,7 +196,7 @@ func handleChatCompletion(
 			}
 
 			// 5. 流式：根据累计内容估算输出 token，异步记录用量
-			estimatedOutput := tokenService.EstimateOutput(result.AccumulatedContent, req.Model)
+			estimatedOutput := tokenService.EstimateOutput(result.AccumulatedContent+result.AccumulatedReasoning, req.Model)
 			toolCalls := streamHandler.ExtractToolCalls(result)
 			// 补充 tool_calls 的 token 开销（JSON 包装 + arguments 文本）
 			estimatedToolCallsTokens := tokenService.EstimateToolCallsOutput(toolCalls, req.Model)
@@ -737,7 +737,7 @@ func handleAnthropicMessages(
 			}
 
 			// 估算输出 token（含 tool_calls）
-			estimatedOutput := tokenService.EstimateOutput(result.AccumulatedContent, req.Model)
+			estimatedOutput := tokenService.EstimateOutput(result.AccumulatedContent+result.AccumulatedReasoning, req.Model)
 			toolCalls := streamHandler.ExtractToolCalls(result)
 			estimatedToolCallsTokens := tokenService.EstimateToolCallsOutput(toolCalls, req.Model)
 			estimatedOutput += estimatedToolCallsTokens

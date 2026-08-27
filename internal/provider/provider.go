@@ -16,6 +16,11 @@ import (
 // 触发 fallback，避免被"连上但不返回"的慢 provider 长时间阻塞。
 const defaultResponseHeaderTimeout = 15 * time.Second
 
+// defaultMaxTokens OpenAI 路径的输出 token 下限：客户端未指定 max_tokens 时注入。
+// 与 Anthropic 路径（buildAnthropicRequest 4096 下限）对齐，避免上游缺省预算过小，
+// 导致推理型模型 reasoning 耗尽预算后无法产出 content / tool_call，agent 循环误判完成而停止。
+const defaultMaxTokens = 4096
+
 // UpstreamHTTPError 表示上游返回非 2xx HTTP 状态码的错误。
 type UpstreamHTTPError struct {
 	StatusCode int
@@ -296,9 +301,14 @@ func (p *Provider) buildRequest(ctx context.Context, method string, url string, 
 	if params.TopP > 0 {
 		reqBody["top_p"] = params.TopP
 	}
-	if params.MaxTokens > 0 {
-		reqBody["max_tokens"] = params.MaxTokens
+	// max_tokens：客户端未指定时注入一个足够大的下限（与 Anthropic 路径的 4096 下限对齐）。
+	// 上游（如 sensenova）在缺省时往往给出极小的输出预算，推理型模型会先用 reasoning
+	// 耗尽整个预算，导致后续 content / tool_call 无法产出，agent 循环因此误判任务完成而停止。
+	maxTokens := params.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = defaultMaxTokens
 	}
+	reqBody["max_tokens"] = maxTokens
 	if params.ToolChoice != nil {
 		reqBody["tool_choice"] = params.ToolChoice
 	}
