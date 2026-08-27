@@ -16,10 +16,12 @@ import (
 // 触发 fallback，避免被"连上但不返回"的慢 provider 长时间阻塞。
 const defaultResponseHeaderTimeout = 15 * time.Second
 
-// defaultMaxTokens OpenAI 路径的输出 token 下限：客户端未指定 max_tokens 时注入。
-// 与 Anthropic 路径（buildAnthropicRequest 4096 下限）对齐，避免上游缺省预算过小，
-// 导致推理型模型 reasoning 耗尽预算后无法产出 content / tool_call，agent 循环误判完成而停止。
-const defaultMaxTokens = 4096
+// defaultMaxTokens OpenAI 路径在客户端未指定 max_tokens 时注入的输出 token 上限。
+// 不能设得太小：推理型模型的 reasoning 可能本身就很长，若上限过小会被截断，
+// 导致只有 reasoning 而无 content / tool_call，agent 循环误判任务完成而停止
+// （实测曾因 4096 上限在 reasoning 4097 tokens 处被截断，turn 以 max-tokens 结束）。
+// 设为上游普遍支持的上限值，仅作兜底防无限生成，不给正常生成设实际障碍。
+const defaultMaxTokens = 32768
 
 // UpstreamHTTPError 表示上游返回非 2xx HTTP 状态码的错误。
 type UpstreamHTTPError struct {
