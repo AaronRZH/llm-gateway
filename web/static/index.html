@@ -382,16 +382,17 @@
           <h3 class="card-title">虚拟模型 ({{ virtualModels.length }}) <button class="btn btn-primary btn-sm" @click="showAddModelModal = true" style="vertical-align: middle; margin-left: 12px;">+ 添加</button></h3>
           <table class="table">
             <thead>
-              <tr><th>模型名</th><th>Tier</th><th>操作</th></tr>
+              <tr><th>模型名</th><th>Tier</th><th>状态</th><th>操作</th></tr>
             </thead>
             <tbody>
               <tr v-for="m in virtualModels" :key="m.id">
                 <td><code>{{ m.id }}</code></td>
                 <td><span class="tier-badge" v-if="m.tier">{{ m.tier }}</span><span v-else class="text-muted">未设置</span></td>
+                <td><button type="button" class="btn-toggle" :class="m.disabled ? 'btn-off' : 'btn-on'" @click="toggleModelDisabled(m.id)">{{ m.disabled ? '禁用' : '启用' }}</button></td>
                 <td><button class="btn btn-danger btn-sm" @click="deleteModel(m.id)">删除</button></td>
               </tr>
               <tr v-if="virtualModels.length === 0">
-                <td colspan="3" class="text-center text-muted">暂无虚拟模型</td>
+                <td colspan="4" class="text-center text-muted">暂无虚拟模型</td>
               </tr>
             </tbody>
           </table>

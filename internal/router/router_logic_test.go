@@ -178,7 +178,7 @@ func TestFilterByTier(t *testing.T) {
 	s := newTestService(t, nil)
 	chain := []config.FallbackItem{
 		{Provider: "a", Tier: "premium"},
-		{Provider: "b", Tier: ""},       // 通用 fallback
+		{Provider: "b", Tier: ""},         // 通用 fallback
 		{Provider: "c", Tier: "standard"}, // 不匹配
 	}
 	got := s.filterByTier(chain, "premium")
@@ -341,6 +341,28 @@ func TestSelection_Next(t *testing.T) {
 	}
 	if sel.Next() != nil {
 		t.Error("expected nil after exhaustion")
+	}
+}
+
+func TestSelection_NextSkipsModelDisabledAfterSelection(t *testing.T) {
+	s := newTestService(t, []config.FallbackItem{
+		{Provider: "p1", Model: "m1", Weight: 1},
+		{Provider: "p2", Model: "m2", Weight: 1},
+	})
+	sel, err := s.SelectCandidates(context.Background(), "vm1", 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// 模拟 Admin 在候选列表已生成后禁用第一个模型。
+	s.UpdateRealModel(0, config.FallbackItem{Provider: "p1", Model: "m1", Weight: 1, Disabled: true})
+
+	tgt := sel.Next()
+	if tgt == nil {
+		t.Fatal("expected the next enabled candidate")
+	}
+	if tgt.ProviderName != "p2" || tgt.Model != "m2" {
+		t.Fatalf("expected p2/m2 after p1/m1 was disabled, got %s/%s", tgt.ProviderName, tgt.Model)
 	}
 }
 

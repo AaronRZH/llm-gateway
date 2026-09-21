@@ -45,3 +45,4 @@ plans/
 
 # Local Go build cache
 .gocache/
+.tmp/

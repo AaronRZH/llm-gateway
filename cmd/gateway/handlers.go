@@ -387,9 +387,18 @@ func handleCompletion(
 func handleListModels(mapper *mapper.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		models := mapper.ListVirtualModels()
+		// 对外列表过滤掉被禁用的虚拟模型：禁用对调用方表现为"不存在"
+		visible := make([]map[string]interface{}, 0, len(models))
+		for _, m := range models {
+			if disabled, _ := m["disabled"].(bool); !disabled {
+				// 移除内部 disabled 字段，避免暴露内部状态
+				delete(m, "disabled")
+				visible = append(visible, m)
+			}
+		}
 		c.JSON(http.StatusOK, gin.H{
 			"object": "list",
-			"data":   models,
+			"data":   visible,
 		})
 	}
 }
@@ -1810,8 +1819,9 @@ func handleAdminModels(mapperService *mapper.Service) gin.HandlerFunc {
 func handleAdminAddModel(mapperService *mapper.Service, routerSvc *router.Service, cfg *config.Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req struct {
-			Name string `json:"name"`
-			Tier string `json:"tier"`
+			Name     string `json:"name"`
+			Tier     string `json:"tier"`
+			Disabled bool   `json:"disabled"`
 		}
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -1825,14 +1835,57 @@ func handleAdminAddModel(mapperService *mapper.Service, routerSvc *router.Servic
 			c.JSON(http.StatusConflict, gin.H{"error": "model already exists"})
 			return
 		}
+		if req.Disabled {
+			mapperService.SetModelDisabled(req.Name, true)
+		}
 		// 同步路由器的 modelTiers 映射
 		routerSvc.SyncModelTiers(buildModelTiers(mapperService))
 		// 持久化：更新 Config.Models
-		cfg.Models = append(cfg.Models, config.ModelEntry{Name: req.Name, Tier: req.Tier})
-		if err := cfg.AppendModel(config.ModelEntry{Name: req.Name, Tier: req.Tier}); err != nil {
+		entry := config.ModelEntry{Name: req.Name, Tier: req.Tier, Disabled: req.Disabled}
+		cfg.Models = append(cfg.Models, entry)
+		if err := cfg.AppendModel(entry); err != nil {
 			log.Error().Err(err).Msg("failed to save config after add model")
 		}
 		c.JSON(http.StatusCreated, gin.H{"message": "model added"})
+	}
+}
+
+// handleAdminUpdateModelDisabled 更新虚拟模型的模型级禁用状态。
+// 与 real_models 条目级 disabled 不同，这里禁用的是对外暴露的虚拟模型名本身，
+// 禁用后该模型对所有调用方表现为"不存在"（/v1/models 中会被排除）。
+func handleAdminUpdateModelDisabled(mapperService *mapper.Service, routerSvc *router.Service, cfg *config.Config) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		name := c.Param("name")
+		if decoded, err := pathUnescape(name); err == nil {
+			name = decoded
+		}
+		var req struct {
+			Disabled bool `json:"disabled"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+			return
+		}
+		if ok := mapperService.SetModelDisabled(name, req.Disabled); !ok {
+			c.JSON(http.StatusNotFound, gin.H{"error": "model not found"})
+			return
+		}
+		// 更新内存中的 cfg.Models（供 handleAdminModels 返回）
+		for i, m := range cfg.Models {
+			if m.Name == name {
+				cfg.Models[i].Disabled = req.Disabled
+				break
+			}
+		}
+		// 持久化
+		if err := cfg.SetModelDisabled(name, req.Disabled); err != nil {
+			log.Error().Err(err).Msg("failed to save config after updating model disabled")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist config"})
+			return
+		}
+		// 同步路由器 tier 映射（虽然禁用不影响 tier，但保持代码路径一致）
+		routerSvc.SyncModelTiers(buildModelTiers(mapperService))
+		c.JSON(http.StatusOK, gin.H{"message": "model updated", "name": name, "disabled": req.Disabled})
 	}
 }
 

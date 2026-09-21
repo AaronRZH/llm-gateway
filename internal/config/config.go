@@ -94,8 +94,9 @@ type PostgresConfig struct {
 }
 
 type ModelEntry struct {
-	Name string `json:"id" mapstructure:"name" yaml:"name"`
-	Tier string `json:"tier" mapstructure:"tier" yaml:"tier"`
+	Name     string `json:"id" mapstructure:"name" yaml:"name"`
+	Tier     string `json:"tier" mapstructure:"tier" yaml:"tier"`
+	Disabled bool   `json:"disabled" mapstructure:"disabled" yaml:"disabled"`
 }
 
 type RealModelsConfig struct {
@@ -483,6 +484,33 @@ func (c *Config) RemoveModel(name string) error {
 	}
 	modelsNode.Content = filtered
 	return c.writeYAMLDoc(doc)
+}
+
+// SetModelDisabled 更新指定名称虚拟模型的 disabled 字段。
+// 用于实现"模型级禁用"——与 real_models 中按 (provider,model) 条目禁用不同，
+// 这里禁用的是对外暴露的虚拟模型名本身，禁用后该模型名对所有调用方不可用。
+func (c *Config) SetModelDisabled(name string, disabled bool) error {
+	doc, err := c.readYAMLDoc()
+	if err != nil {
+		return err
+	}
+	root := doc.Content[0]
+	_, modelsNode := findMappingKey(root, "models")
+	if modelsNode == nil || modelsNode.Kind != yaml.SequenceNode {
+		return fmt.Errorf("models sequence not found in config")
+	}
+	for _, item := range modelsNode.Content {
+		if item.Kind != yaml.MappingNode {
+			continue
+		}
+		_, nameNode := findMappingKey(item, "name")
+		if nameNode == nil || nameNode.Value != name {
+			continue
+		}
+		setMappingKey(item, "disabled", disabled)
+		return c.writeYAMLDoc(doc)
+	}
+	return fmt.Errorf("model %q not found in config", name)
 }
 
 // SaveStrategy 更新 real_models 的路由策略

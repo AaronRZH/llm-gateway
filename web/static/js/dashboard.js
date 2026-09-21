@@ -248,6 +248,22 @@ const app = createApp({
       if (res.status === 200) await loadConfig(); else alert("删除失败");
     }
 
+    async function toggleModelDisabled(name) {
+      const m = virtualModels.value.find(x => x.id === name);
+      if (!m) return;
+      const res = await fetch("/admin/models/" + encodeURIComponent(name) + "/disabled", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+        body: JSON.stringify({ disabled: !m.disabled }),
+      });
+      if (res.status === 200) {
+        await loadConfig();
+      } else {
+        const err = await res.json().catch(() => ({}));
+        alert("切换状态失败: " + (err.error || res.statusText));
+      }
+    }
+
     async function updateStrategy() {
       const res = await fetch("/admin/real-models/strategy", {
         method: "PATCH",

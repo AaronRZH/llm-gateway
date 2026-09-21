@@ -46,18 +46,23 @@ type Target struct {
 
 // Selection 路由候选列表，handler 通过 Next() 遍历以在请求失败时重试下一个候选
 type Selection struct {
-	targets  []*Target
-	position int
+	targets   []*Target
+	position  int
+	isEnabled func(*Target) bool
 }
 
 // Next 返回下一个候选 Target，如果没有更多候选则返回 nil
 func (sel *Selection) Next() *Target {
-	if sel.position >= len(sel.targets) {
-		return nil
+	for sel.position < len(sel.targets) {
+		t := sel.targets[sel.position]
+		sel.position++
+		// 候选列表在请求开始时生成，Admin 可能在 fallback 之前禁用其中的条目。
+		// 在真正取出候选时再检查一次，避免继续调用已禁用的模型。
+		if sel.isEnabled == nil || sel.isEnabled(t) {
+			return t
+		}
 	}
-	t := sel.targets[sel.position]
-	sel.position++
-	return t
+	return nil
 }
 
 // New 创建路由服务
@@ -161,7 +166,20 @@ func (s *Service) SelectCandidates(ctx context.Context, virtualModel string, est
 	if len(candidates) == 0 {
 		return nil, fmt.Errorf("no available model")
 	}
-	return &Selection{targets: candidates}, nil
+	return &Selection{targets: candidates, isEnabled: s.isTargetEnabled}, nil
+}
+
+// isTargetEnabled 检查候选在当前路由配置中是否仍然启用。
+// 同一 provider/model 如果有任一启用条目，仍视为可用。
+func (s *Service) isTargetEnabled(target *Target) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, item := range s.realModelsCfg.Models {
+		if item.Provider == target.ProviderName && item.Model == target.Model && !item.Disabled {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveModelTier 获取虚拟模型对应的 tier

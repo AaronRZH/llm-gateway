@@ -144,6 +144,7 @@ func main() {
 		adminAPI.DELETE("/providers/:name", handleAdminDeleteProvider(cfg, providerManager, routerService))
 		adminAPI.GET("/models", handleAdminModels(mapperService))
 		adminAPI.POST("/models", handleAdminAddModel(mapperService, routerService, cfg))
+		adminAPI.PUT("/models/:name/disabled", handleAdminUpdateModelDisabled(mapperService, routerService, cfg))
 		adminAPI.DELETE("/models/:name", handleAdminDeleteModel(mapperService, routerService, cfg))
 		adminAPI.GET("/real-models", handleAdminRealModels(routerService, cfg))
 		adminAPI.POST("/real-models", handleAdminAddRealModel(cfg, routerService))
