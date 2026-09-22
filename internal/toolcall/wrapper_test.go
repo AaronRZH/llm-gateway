@@ -73,6 +73,52 @@ func TestNormalize_ArgKeyValueWrapper(t *testing.T) {
 	}
 }
 
+func TestNormalize_EscapedArgKeyValueWrapperFromIncident(t *testing.T) {
+	command := `cd /Users/aaron/Desktop/figma-plugin && echo "=== find duplicated types (same name, same signature, in multiple packages) ===" && for func in mapPosition mapAngle tokenFingerprint; do echo "--- $func ---"; grep -rn "export.*function $func" packages/ --include="*.ts" 2>/dev/null | grep -v "test|.d.ts"; done`
+	text := `\<tool\_call>bash` +
+		`\<arg\_key>command\</arg\_key>\<arg\_value>` + command + `\</arg\_value>` +
+		`\<arg\_key>description\</arg\_key>\<arg\_value>Check for duplicated function signatures\</arg\_value>` +
+		`\</tool\_call>`
+
+	r := Normalize(text)
+	if r.CleanContent != "" {
+		t.Fatalf("expected no leftover content, got %q", r.CleanContent)
+	}
+	if len(r.ToolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(r.ToolCalls))
+	}
+	if r.ToolCalls[0].Function["name"] != "bash" {
+		t.Fatalf("unexpected name %v", r.ToolCalls[0].Function["name"])
+	}
+	var args map[string]interface{}
+	if err := json.Unmarshal([]byte(r.ToolCalls[0].Function["arguments"].(string)), &args); err != nil {
+		t.Fatalf("arguments not valid JSON: %v", err)
+	}
+	if args["command"] != command {
+		t.Fatalf("command changed during normalization: %q", args["command"])
+	}
+	if args["description"] != "Check for duplicated function signatures" {
+		t.Fatalf("unexpected description: %q", args["description"])
+	}
+}
+
+func TestNormalize_EscapedTagsDoNotChangeArgumentBackslashes(t *testing.T) {
+	command := `printf '\\_ \\/ \\='`
+	text := `\<tool\_call>bash\<arg\_key>command\</arg\_key>\<arg\_value>` + command +
+		`\</arg\_value>\</tool\_call>`
+	r := Normalize(text)
+	if len(r.ToolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(r.ToolCalls))
+	}
+	var args map[string]interface{}
+	if err := json.Unmarshal([]byte(r.ToolCalls[0].Function["arguments"].(string)), &args); err != nil {
+		t.Fatal(err)
+	}
+	if args["command"] != command {
+		t.Fatalf("argument backslashes changed: got %q want %q", args["command"], command)
+	}
+}
+
 func TestValidateRejectsUnknownToolAndMissingRequiredArgument(t *testing.T) {
 	definitions := []Definition{{
 		Name: "edit",

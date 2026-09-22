@@ -138,6 +138,46 @@ func TestStream_UnknownToolFormatRepairsOnce(t *testing.T) {
 	}
 }
 
+func TestStream_EscapedArgKeyValueWrapperFromIncident(t *testing.T) {
+	command := `cd /Users/aaron/Desktop/figma-plugin && echo "=== find duplicated types (same name, same signature, in multiple packages) ===" && for func in mapPosition mapAngle tokenFingerprint; do echo "--- $func ---"; grep -rn "export.*function $func" packages/ --include="*.ts" 2>/dev/null | grep -v "test|.d.ts"; done`
+	raw := `\<tool\_call>bash` +
+		`\<arg\_key>command\</arg\_key>\<arg\_value>` + command + `\</arg\_value>` +
+		`\<arg\_key>description\</arg\_key>\<arg\_value>Check for duplicated function signatures\</arg\_value>` +
+		`\</tool\_call>`
+	chunk, _ := json.Marshal(map[string]interface{}{
+		"choices": []interface{}{map[string]interface{}{
+			"delta": map[string]interface{}{"content": raw},
+		}},
+	})
+	upstream := "data: " + string(chunk) + "\n\ndata: [DONE]\n\n"
+
+	h := New(0)
+	rr := httptest.NewRecorder()
+	result, err := h.RewriteAndForwardWithToolRepair(
+		rr, io.NopCloser(strings.NewReader(upstream)), "virt", true,
+		[]toolcall.Definition{{Name: "bash", Parameters: map[string]interface{}{
+			"required": []interface{}{"command"},
+			"properties": map[string]interface{}{
+				"command":     map[string]interface{}{"type": "string"},
+				"description": map[string]interface{}{"type": "string"},
+			},
+		}}}, nil,
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(result.AccumulatedToolCalls) != 1 || result.AccumulatedToolCalls[0].Function.Name != "bash" {
+		t.Fatalf("unexpected tool calls: %#v", result.AccumulatedToolCalls)
+	}
+	body := rr.Body.String()
+	if strings.Contains(body, raw) || !strings.Contains(body, `"tool_calls"`) || !strings.Contains(body, `"name":"bash"`) {
+		t.Fatalf("unexpected forwarded body: %s", body)
+	}
+	if !strings.Contains(body, "[DONE]") {
+		t.Fatalf("missing stream terminator: %s", body)
+	}
+}
+
 func TestStream_UnknownToolFormatFailsExplicitlyWithoutRepair(t *testing.T) {
 	unknown := "<tool_call>edit<arguments>not-supported</arguments></tool_call>"
 	chunk, _ := json.Marshal(map[string]interface{}{

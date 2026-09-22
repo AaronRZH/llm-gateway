@@ -56,6 +56,8 @@ var (
 	argPairRe      = regexp.MustCompile(`<arg_key>([\s\S]*?)</arg_key>\s*<arg_value>([\s\S]*?)</arg_value>`)
 	toolNameRe     = regexp.MustCompile(`^[a-zA-Z0-9_.-]+$`)
 	suspiciousRe   = regexp.MustCompile(`(?i)<[^>]*(tool[_:-]?(call|use|name)?|function|invoke)[^>]*>|\[(tool[_ -]?call|function[_ -]?call)\]`)
+	escapedTagRe   = regexp.MustCompile(`\\?<[^>\r\n]{1,160}>`)
+	knownTagRe     = regexp.MustCompile(`^</?(tool_call|arg_key|arg_value|function|tool_name|invoke|parameter)>$|^<(function|tool_name|tool_call)=[a-zA-Z0-9_.-]+>$|^<invoke name=[a-zA-Z0-9_.-]+>$|^<parameter=[a-zA-Z0-9_.-]+>$`)
 )
 
 // buildRe matches any supported open tag (no ^ anchor). Capture group 1 = name.
@@ -97,6 +99,7 @@ func Normalize(text string) Result {
 	if text == "" {
 		return r
 	}
+	text = canonicalizeEscapedToolTags(text)
 
 	// Some OpenAI-compatible upstreams emit a tool call in this form:
 	//   <tool_call>edit<arg_key>file_path</arg_key><arg_value>...</arg_value></tool_call>
@@ -188,6 +191,7 @@ func Normalize(text string) Result {
 // suggests the upstream attempted to call a tool. Callers must not silently
 // downgrade such text to a normal assistant response when parsing fails.
 func LooksLikeToolCall(text string) bool {
+	text = canonicalizeEscapedToolTags(text)
 	markers := []string{"<tool_call", "<function=", "<tool_name=", "<invoke name=", "<arg_key>"}
 	for _, marker := range markers {
 		if strings.Contains(text, marker) {
@@ -195,6 +199,25 @@ func LooksLikeToolCall(text string) bool {
 		}
 	}
 	return suspiciousRe.MatchString(text)
+}
+
+// canonicalizeEscapedToolTags accepts the Markdown-escaped tag spelling some
+// models emit, for example \<tool\_call> and \</arg\_value>. Only known markup
+// tags are unescaped so backslashes inside shell commands and other argument
+// values remain byte-for-byte unchanged.
+func canonicalizeEscapedToolTags(text string) string {
+	return escapedTagRe.ReplaceAllStringFunc(text, func(candidate string) string {
+		canonical := strings.TrimPrefix(candidate, `\`)
+		canonical = strings.NewReplacer(
+			`\_`, `_`,
+			`\/`, `/`,
+			`\=`, `=`,
+		).Replace(canonical)
+		if knownTagRe.MatchString(canonical) {
+			return canonical
+		}
+		return candidate
+	})
 }
 
 // Validate checks tool names, JSON argument shape, required properties, and
