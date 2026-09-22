@@ -46,3 +46,55 @@ func TestNormalize_ToolCallWrapper(t *testing.T) {
 		}
 	}
 }
+
+func TestNormalize_ArgKeyValueWrapper(t *testing.T) {
+	text := `<tool_call>edit` +
+		`<arg_key>file_path</arg_key><arg_value>/tmp/server.ts</arg_value>` +
+		`<arg_key>new_string</arg_key><arg_value>new value</arg_value>` +
+		`<arg_key>old_string</arg_key><arg_value>old value</arg_value>` +
+		`</tool_call>`
+
+	r := Normalize(text)
+	if r.CleanContent != "" {
+		t.Fatalf("expected no leftover content, got %q", r.CleanContent)
+	}
+	if len(r.ToolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(r.ToolCalls))
+	}
+	if r.ToolCalls[0].Function["name"] != "edit" {
+		t.Fatalf("unexpected name %v", r.ToolCalls[0].Function["name"])
+	}
+	var args map[string]interface{}
+	if err := json.Unmarshal([]byte(r.ToolCalls[0].Function["arguments"].(string)), &args); err != nil {
+		t.Fatalf("arguments not valid JSON: %v", err)
+	}
+	if args["file_path"] != "/tmp/server.ts" || args["new_string"] != "new value" || args["old_string"] != "old value" {
+		t.Fatalf("unexpected args: %#v", args)
+	}
+}
+
+func TestValidateRejectsUnknownToolAndMissingRequiredArgument(t *testing.T) {
+	definitions := []Definition{{
+		Name: "edit",
+		Parameters: map[string]interface{}{
+			"type":     "object",
+			"required": []interface{}{"file_path"},
+			"properties": map[string]interface{}{
+				"file_path": map[string]interface{}{"type": "string"},
+			},
+		},
+	}}
+
+	unknown := Normalize(xmlOpenForWrapperTest("delete") + `{"file_path":"/tmp/a"}`)
+	if err := Validate(unknown.ToolCalls, definitions); err == nil {
+		t.Fatal("expected unknown tool to be rejected")
+	}
+	missing := Normalize(xmlOpenForWrapperTest("edit") + `{}`)
+	if err := Validate(missing.ToolCalls, definitions); err == nil {
+		t.Fatal("expected missing required argument to be rejected")
+	}
+}
+
+func xmlOpenForWrapperTest(name string) string {
+	return "<" + "function=" + name + ">"
+}

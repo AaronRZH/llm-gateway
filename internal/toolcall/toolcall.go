@@ -2,6 +2,8 @@ package toolcall
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"regexp"
 	"strings"
 
@@ -22,6 +24,15 @@ type Result struct {
 	ToolCalls    []OpenAIToolCall
 }
 
+var ErrMalformed = errors.New("malformed tool call")
+
+// Definition is the subset of a request tool definition needed to validate
+// model-produced calls before they are forwarded to the client.
+type Definition struct {
+	Name       string
+	Parameters any
+}
+
 // Supported open-tag families: their pattern and matching close tag.
 type tagFamily struct {
 	open  string
@@ -30,7 +41,7 @@ type tagFamily struct {
 
 var (
 	LT_SL = `</`
-	GT = `>`
+	GT    = `>`
 )
 
 var families = []tagFamily{
@@ -39,6 +50,13 @@ var families = []tagFamily{
 	{open: `<tool_call=([a-zA-Z0-9_.-]+)>`, close: `</tool_call>`},
 	{open: `<invoke name=([a-zA-Z0-9_.-]+)>`, close: `</invoke>`},
 }
+
+var (
+	plainWrapperRe = regexp.MustCompile(`<tool_call>([\s\S]*?)</tool_call>`)
+	argPairRe      = regexp.MustCompile(`<arg_key>([\s\S]*?)</arg_key>\s*<arg_value>([\s\S]*?)</arg_value>`)
+	toolNameRe     = regexp.MustCompile(`^[a-zA-Z0-9_.-]+$`)
+	suspiciousRe   = regexp.MustCompile(`(?i)<[^>]*(tool[_:-]?(call|use|name)?|function|invoke)[^>]*>|\[(tool[_ -]?call|function[_ -]?call)\]`)
+)
 
 // buildRe matches any supported open tag (no ^ anchor). Capture group 1 = name.
 func buildRe() *regexp.Regexp {
@@ -70,14 +88,21 @@ func paramRe() *regexp.Regexp {
 //
 // Supported open-tag spellings: <function=NAME>, <tool_name=NAME>, <tool_call=NAME>.
 // Supported payload shapes:
-//   1. Inline JSON: {"a":1}
-//   2. Nested parameters: <parameter=a>1</parameter>
+//  1. Inline JSON: {"a":1}
+//  2. Nested parameters: <parameter=a>1</parameter>
+//
 // Missing close tags are tolerated: the next sibling open tag terminates the block.
 func Normalize(text string) Result {
 	r := Result{}
 	if text == "" {
 		return r
 	}
+
+	// Some OpenAI-compatible upstreams emit a tool call in this form:
+	//   <tool_call>edit<arg_key>file_path</arg_key><arg_value>...</arg_value></tool_call>
+	// Parse and remove those wrappers first. The older function=/parameter=
+	// parser below then handles any remaining calls.
+	text, r.ToolCalls = extractPlainWrappers(text)
 	re := buildRe()
 	sibRe := buildSiblingRe()
 	pRe := paramRe()
@@ -110,7 +135,7 @@ func Normalize(text string) Result {
 		rest := text[absEnd:]
 		closeIdx := strings.Index(rest, closeTag)
 		if closeIdx < 0 {
-			closeIdx = strings.Index(rest, LT_SL + name + GT)
+			closeIdx = strings.Index(rest, LT_SL+name+GT)
 			closeTag = LT_SL + name + GT
 		}
 		sibIdx := -1
@@ -157,6 +182,177 @@ func Normalize(text string) Result {
 	cleanParts = append(cleanParts, text[pos:])
 	r.CleanContent = strings.TrimSpace(strings.Join(cleanParts, ""))
 	return r
+}
+
+// LooksLikeToolCall reports whether text contains a marker that strongly
+// suggests the upstream attempted to call a tool. Callers must not silently
+// downgrade such text to a normal assistant response when parsing fails.
+func LooksLikeToolCall(text string) bool {
+	markers := []string{"<tool_call", "<function=", "<tool_name=", "<invoke name=", "<arg_key>"}
+	for _, marker := range markers {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return suspiciousRe.MatchString(text)
+}
+
+// Validate checks tool names, JSON argument shape, required properties, and
+// the common primitive JSON-schema types. It deliberately stays conservative:
+// unknown schema keywords remain the upstream/client's responsibility.
+func Validate(calls []OpenAIToolCall, definitions []Definition) error {
+	if len(calls) == 0 {
+		return fmt.Errorf("%w: no calls parsed", ErrMalformed)
+	}
+	allowed := make(map[string]Definition, len(definitions))
+	for _, def := range definitions {
+		if def.Name != "" {
+			allowed[def.Name] = def
+		}
+	}
+	for _, call := range calls {
+		name, _ := call.Function["name"].(string)
+		def, ok := allowed[name]
+		if !ok {
+			return fmt.Errorf("%w: tool %q was not offered", ErrMalformed, name)
+		}
+		raw, _ := call.Function["arguments"].(string)
+		var args map[string]interface{}
+		if err := json.Unmarshal([]byte(raw), &args); err != nil {
+			return fmt.Errorf("%w: arguments for %q are not a JSON object: %v", ErrMalformed, name, err)
+		}
+		if err := validateArguments(args, def.Parameters); err != nil {
+			return fmt.Errorf("%w: arguments for %q: %v", ErrMalformed, name, err)
+		}
+	}
+	return nil
+}
+
+// ValidateMaps validates the generic OpenAI tool_calls representation used by
+// the gateway's response and streaming layers.
+func ValidateMaps(calls []map[string]interface{}, definitions []Definition) error {
+	typed := make([]OpenAIToolCall, 0, len(calls))
+	for _, call := range calls {
+		fn, ok := call["function"].(map[string]interface{})
+		if !ok {
+			return fmt.Errorf("%w: missing function object", ErrMalformed)
+		}
+		typed = append(typed, OpenAIToolCall{
+			ID:       stringValue(call["id"]),
+			Type:     stringValue(call["type"]),
+			Function: fn,
+		})
+	}
+	return Validate(typed, definitions)
+}
+
+func stringValue(v interface{}) string {
+	s, _ := v.(string)
+	return s
+}
+
+func validateArguments(args map[string]interface{}, schema any) error {
+	s, ok := schema.(map[string]interface{})
+	if !ok || s == nil {
+		return nil
+	}
+	if required, ok := s["required"].([]interface{}); ok {
+		for _, item := range required {
+			name, _ := item.(string)
+			if name != "" {
+				if _, exists := args[name]; !exists {
+					return fmt.Errorf("missing required property %q", name)
+				}
+			}
+		}
+	}
+	if required, ok := s["required"].([]string); ok {
+		for _, name := range required {
+			if _, exists := args[name]; !exists {
+				return fmt.Errorf("missing required property %q", name)
+			}
+		}
+	}
+	properties, _ := s["properties"].(map[string]interface{})
+	for name, value := range args {
+		property, _ := properties[name].(map[string]interface{})
+		expected, _ := property["type"].(string)
+		if expected == "" {
+			continue
+		}
+		valid := false
+		switch expected {
+		case "string":
+			_, valid = value.(string)
+		case "number":
+			_, valid = value.(float64)
+		case "integer":
+			n, numeric := value.(float64)
+			valid = numeric && n == float64(int64(n))
+		case "boolean":
+			_, valid = value.(bool)
+		case "object":
+			_, valid = value.(map[string]interface{})
+		case "array":
+			_, valid = value.([]interface{})
+		case "null":
+			valid = value == nil
+		default:
+			valid = true
+		}
+		if !valid {
+			return fmt.Errorf("property %q must be %s", name, expected)
+		}
+	}
+	return nil
+}
+
+func extractPlainWrappers(text string) (string, []OpenAIToolCall) {
+	var calls []OpenAIToolCall
+	clean := plainWrapperRe.ReplaceAllStringFunc(text, func(block string) string {
+		match := plainWrapperRe.FindStringSubmatch(block)
+		if len(match) != 2 {
+			return block
+		}
+		body := match[1]
+		firstArg := strings.Index(body, "<arg_key>")
+		if firstArg < 0 {
+			return block
+		}
+		name := strings.TrimSpace(body[:firstArg])
+		if !toolNameRe.MatchString(name) {
+			return block
+		}
+		pairs := argPairRe.FindAllStringSubmatch(body[firstArg:], -1)
+		if len(pairs) == 0 {
+			return block
+		}
+		if leftover := strings.TrimSpace(argPairRe.ReplaceAllString(body[firstArg:], "")); leftover != "" {
+			return block
+		}
+		args := make(map[string]interface{}, len(pairs))
+		for _, pair := range pairs {
+			key := strings.TrimSpace(pair[1])
+			if key == "" {
+				return block
+			}
+			if _, duplicate := args[key]; duplicate {
+				return block
+			}
+			args[key] = pair[2]
+		}
+		argsJSON, _ := json.Marshal(args)
+		calls = append(calls, OpenAIToolCall{
+			ID:   "call_" + uuid.New().String()[:8],
+			Type: "function",
+			Function: map[string]interface{}{
+				"name":      name,
+				"arguments": string(argsJSON),
+			},
+		})
+		return ""
+	})
+	return clean, calls
 }
 
 // extractArgs turns a payload blob into a map[string]interface{} of arguments.

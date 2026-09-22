@@ -2,13 +2,64 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
+
+	"llm-gateway/internal/toolcall"
 )
 
 // xmlOpen is a test helper that avoids raw XML literals in source.
 func xmlOpen(name string) string {
 	return "<" + "function=" + name + ">"
+}
+
+func TestRewriteXMLToolCallsChecked_UnknownFormatRequiresRepair(t *testing.T) {
+	content := "<tool_call>edit<arguments>unsupported</arguments></tool_call>"
+	body := makeResp(content)
+	out, raw, err := rewriteXMLToolCallsChecked(body, []toolcall.Definition{{Name: "edit"}})
+	if !errors.Is(err, toolcall.ErrMalformed) {
+		t.Fatalf("expected ErrMalformed, got %v", err)
+	}
+	if raw != content {
+		t.Fatalf("unexpected malformed payload %q", raw)
+	}
+	if !bytesEq(out, body) {
+		t.Fatal("malformed response must not be partially rewritten")
+	}
+}
+
+func TestRewriteAnthropicXMLToolCallsChecked(t *testing.T) {
+	body, _ := json.Marshal(map[string]interface{}{
+		"id": "msg_test", "type": "message", "role": "assistant",
+		"content": []interface{}{map[string]interface{}{
+			"type": "text",
+			"text": `<tool_call>edit<arg_key>file_path</arg_key><arg_value>/tmp/a</arg_value></tool_call>`,
+		}},
+		"stop_reason": "end_turn",
+	})
+	definitions := []toolcall.Definition{{
+		Name: "edit",
+		Parameters: map[string]interface{}{
+			"required":   []interface{}{"file_path"},
+			"properties": map[string]interface{}{"file_path": map[string]interface{}{"type": "string"}},
+		},
+	}}
+	out, raw, err := rewriteAnthropicXMLToolCallsChecked(body, definitions)
+	if err != nil || raw != "" {
+		t.Fatalf("unexpected result raw=%q err=%v", raw, err)
+	}
+	var response map[string]interface{}
+	if err := json.Unmarshal(out, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response["stop_reason"] != "tool_use" {
+		t.Fatalf("unexpected stop reason %v", response["stop_reason"])
+	}
+	blocks := response["content"].([]interface{})
+	if len(blocks) != 1 || blocks[0].(map[string]interface{})["type"] != "tool_use" {
+		t.Fatalf("expected one tool_use block, got %#v", blocks)
+	}
 }
 
 // makeResp builds an OpenAI-shaped ChatCompletionResponse body with the given content.
@@ -82,7 +133,8 @@ func TestRewriteXMLToolCalls_ClosingTag(t *testing.T) {
 	var resp map[string]interface{}
 	_ = json.Unmarshal(out, &resp)
 	choices := resp["choices"].([]interface{})
-	c0 := choices[0].(map[string]interface{}); msg := c0["message"].(map[string]interface{})
+	c0 := choices[0].(map[string]interface{})
+	msg := c0["message"].(map[string]interface{})
 	tcs := msg["tool_calls"].([]interface{})
 	if len(tcs) != 1 {
 		t.Fatalf("expected 1 tool call, got %d", len(tcs))
@@ -96,7 +148,8 @@ func TestRewriteXMLToolCalls_MultipleTags(t *testing.T) {
 	var resp map[string]interface{}
 	_ = json.Unmarshal(out, &resp)
 	choices := resp["choices"].([]interface{})
-	c0 := choices[0].(map[string]interface{}); msg := c0["message"].(map[string]interface{})
+	c0 := choices[0].(map[string]interface{})
+	msg := c0["message"].(map[string]interface{})
 	tcs := msg["tool_calls"].([]interface{})
 	if len(tcs) != 2 {
 		t.Fatalf("expected 2 tool calls, got %d", len(tcs))
@@ -110,7 +163,8 @@ func TestRewriteXMLToolCalls_InvalidJSONKeepsRaw(t *testing.T) {
 	var resp map[string]interface{}
 	_ = json.Unmarshal(out, &resp)
 	choices := resp["choices"].([]interface{})
-	c0 := choices[0].(map[string]interface{}); msg := c0["message"].(map[string]interface{})
+	c0 := choices[0].(map[string]interface{})
+	msg := c0["message"].(map[string]interface{})
 	tcs := msg["tool_calls"].([]interface{})
 	if len(tcs) != 1 {
 		t.Fatalf("expected 1 tool call, got %d", len(tcs))

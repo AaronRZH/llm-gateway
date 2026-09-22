@@ -69,13 +69,32 @@ type FunctionChunk struct {
 	Arguments string
 }
 
+// ToolRepairFunc performs one format-only repair request. It receives the
+// malformed model output and must return validated, OpenAI-shaped tool calls.
+type ToolRepairFunc func(raw string) ([]map[string]interface{}, error)
+
 // RewriteAndForward 重写并转发 SSE 流，返回累计的响应内容与错误。
 // openAIClient 指示下游客户端协议：异常结束（上游 stall / 单行超长）时补发对应的终止符，
 // 避免客户端一直等待。OpenAI 客户端补发 [DONE]；Anthropic 客户端补发 message_stop。
 //
-// 返回错误仅用于"上游侧异常结束"（空闲超时触发 / 单行超长 / 其它非 EOF 错误），供上层回报熔断；
+// 返回错误用于上游侧异常结束或无法纠正的工具调用协议错误，供上层回报熔断；
 // 客户端主动断开（context.Canceled）或正常 EOF 返回 nil，不惩罚上游。
 func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadCloser, virtualModel string, openAIClient bool) (*StreamResult, error) {
+	return h.RewriteAndForwardWithToolRepair(w, upstream, virtualModel, openAIClient, nil, nil)
+}
+
+// RewriteAndForwardWithToolRepair behaves like RewriteAndForward, but if an
+// attempted XML tool call cannot be parsed or validated it performs at most
+// one caller-provided format repair. Unknown formats are never replayed as
+// ordinary assistant text.
+func (h *Handler) RewriteAndForwardWithToolRepair(
+	w http.ResponseWriter,
+	upstream io.ReadCloser,
+	virtualModel string,
+	openAIClient bool,
+	definitions []toolcall.Definition,
+	repair ToolRepairFunc,
+) (*StreamResult, error) {
 	upstream = NewIdleTimeoutReader(upstream, h.idleTimeout)
 	defer upstream.Close()
 
@@ -96,6 +115,7 @@ func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadClose
 	// 流结束后统一转换为结构化的 delta.tool_calls。
 	// 普通文本响应完全不受影响，逐行实时透传（与旧行为一致）。
 	xmlSuppressed := false
+	structuredToolSuppressed := false
 	var suppressedOutput []byte
 
 	// 滚动缓冲：保留最近 4KB content 用于跨 chunk 检测 XML 标签。
@@ -126,6 +146,7 @@ func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadClose
 			content, reasoning := extractContent(payload)
 			result.AccumulatedContent += content
 			result.AccumulatedReasoning += reasoning
+			beforeToolCalls := len(result.AccumulatedToolCalls)
 			extractToolCalls(payload, result)
 			if result.Usage == nil {
 				if usage := extractUsage(payload); usage != nil {
@@ -133,6 +154,10 @@ func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadClose
 				}
 			} else {
 				mergeUsage(result.Usage, extractUsage(payload))
+			}
+			if definitions != nil && (structuredToolSuppressed || len(result.AccumulatedToolCalls) > beforeToolCalls) {
+				structuredToolSuppressed = true
+				continue
 			}
 
 			rewritten := h.rewriteModelField(payload, virtualModel)
@@ -188,6 +213,12 @@ func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadClose
 	// 后处理：将 XML 工具调用转换为标准 OpenAI tool_calls。
 	normalized := toolcall.Normalize(result.AccumulatedContent)
 	hasXMLToolCalls := len(normalized.ToolCalls) > 0
+	if hasXMLToolCalls && definitions != nil {
+		if err := toolcall.Validate(normalized.ToolCalls, definitions); err != nil {
+			log.Warn().Err(err).Msg("rejected invalid XML-derived tool call")
+			hasXMLToolCalls = false
+		}
+	}
 	if hasXMLToolCalls {
 		for _, tc := range normalized.ToolCalls {
 			result.AccumulatedToolCalls = append(result.AccumulatedToolCalls, ToolCallChunk{
@@ -210,12 +241,69 @@ func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadClose
 				log.Warn().Err(err).Msg("failed to emit XML-derived tool_calls chunk")
 			}
 		}
+	} else if structuredToolSuppressed {
+		calls := h.ExtractToolCalls(result)
+		if err := toolcall.ValidateMaps(calls, definitions); err == nil {
+			if openAIClient {
+				if emitErr := h.emitToolCallsChunk(w, flusher, calls); emitErr != nil {
+					return result, emitErr
+				}
+			} else {
+				if emitErr := h.emitAnthropicToolCalls(w, flusher, calls); emitErr != nil {
+					return result, emitErr
+				}
+			}
+		} else {
+			raw, _ := json.Marshal(calls)
+			repaired, repairErr := attemptToolRepair(string(raw), repair)
+			if repairErr != nil {
+				h.emitToolCallError(w, flusher, openAIClient, repairErr)
+				return result, repairErr
+			}
+			result.AccumulatedToolCalls = nil
+			appendGenericToolCalls(result, repaired)
+			if openAIClient {
+				if emitErr := h.emitToolCallsChunk(w, flusher, repaired); emitErr != nil {
+					return result, emitErr
+				}
+			} else {
+				if emitErr := h.emitAnthropicToolCalls(w, flusher, repaired); emitErr != nil {
+					return result, emitErr
+				}
+			}
+		}
+	} else if xmlSuppressed && toolcall.LooksLikeToolCall(result.AccumulatedContent) {
+		// A tool-call marker was present but the payload was not parseable (or
+		// failed schema validation). Never downgrade it to assistant text.
+		if repair != nil {
+			calls, repairErr := repair(result.AccumulatedContent)
+			if repairErr == nil && len(calls) > 0 {
+				appendGenericToolCalls(result, calls)
+				if openAIClient {
+					if err := h.emitToolCallsChunk(w, flusher, calls); err != nil {
+						return result, err
+					}
+				} else {
+					if err := h.emitAnthropicToolCalls(w, flusher, calls); err != nil {
+						return result, err
+					}
+				}
+				goto finish
+			}
+			if repairErr != nil {
+				log.Warn().Err(repairErr).Msg("tool-call format repair failed")
+			}
+		}
+		err := fmt.Errorf("%w: upstream emitted an unsupported tool-call format", toolcall.ErrMalformed)
+		h.emitToolCallError(w, flusher, openAIClient, err)
+		return result, err
 	} else if xmlSuppressed {
-		// 误判（普通文本包含工具调用标签字样）：补发被抑制的内容，避免丢文本
+		// A literal marker occurred in normal prose rather than a tool call.
 		w.Write(suppressedOutput)
 		flusher.Flush()
 	}
 
+finish:
 	// 统一补发终止符：上游 [DONE] 已在扫描时跳过，这里始终补发一个。
 	if openAIClient {
 		w.Write([]byte("data: [DONE]\n\n"))
@@ -227,8 +315,83 @@ func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadClose
 	return result, nil
 }
 
-// containsXMLToolCallStart 判断 content 是否包含 XML 工具调用标签开头。
-// 识别四种上游拼写：<function=, <tool_name=, <tool_call=, <invoke name=。
+func attemptToolRepair(raw string, repair ToolRepairFunc) ([]map[string]interface{}, error) {
+	if repair == nil {
+		return nil, fmt.Errorf("%w: no repair function configured", toolcall.ErrMalformed)
+	}
+	calls, err := repair(raw)
+	if err != nil {
+		return nil, err
+	}
+	if len(calls) == 0 {
+		return nil, fmt.Errorf("%w: repair returned no calls", toolcall.ErrMalformed)
+	}
+	return calls, nil
+}
+
+func appendGenericToolCalls(result *StreamResult, calls []map[string]interface{}) {
+	for _, tc := range calls {
+		fn, _ := tc["function"].(map[string]interface{})
+		name, _ := fn["name"].(string)
+		arguments, _ := fn["arguments"].(string)
+		id, _ := tc["id"].(string)
+		if id == "" {
+			id = "call_" + uuid.New().String()[:8]
+		}
+		result.AccumulatedToolCalls = append(result.AccumulatedToolCalls, ToolCallChunk{
+			Index: -1, ID: id, Type: "function",
+			Function: FunctionChunk{Name: name, Arguments: arguments},
+		})
+	}
+}
+
+func (h *Handler) emitToolCallError(w http.ResponseWriter, flusher http.Flusher, openAIClient bool, err error) {
+	data, _ := json.Marshal(map[string]interface{}{
+		"error": map[string]interface{}{
+			"type":    "malformed_tool_call",
+			"message": err.Error(),
+		},
+	})
+	if openAIClient {
+		_, _ = w.Write(append(append([]byte("data: "), data...), []byte("\n\n")...))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	} else {
+		_, _ = w.Write([]byte("event: error\n"))
+		_, _ = w.Write(append(append([]byte("data: "), data...), []byte("\n\n")...))
+		_, _ = w.Write([]byte("event: message_stop\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"message_stop\"}\n\n"))
+	}
+	flusher.Flush()
+}
+
+func (h *Handler) emitAnthropicToolCalls(w http.ResponseWriter, flusher http.Flusher, calls []map[string]interface{}) error {
+	for i, tc := range calls {
+		fn, _ := tc["function"].(map[string]interface{})
+		name, _ := fn["name"].(string)
+		arguments, _ := fn["arguments"].(string)
+		id, _ := tc["id"].(string)
+		if id == "" {
+			id = "call_" + uuid.New().String()[:8]
+		}
+		input := map[string]interface{}{}
+		_ = json.Unmarshal([]byte(arguments), &input)
+		start, _ := json.Marshal(map[string]interface{}{
+			"type": "content_block_start", "index": i,
+			"content_block": map[string]interface{}{"type": "tool_use", "id": id, "name": name, "input": input},
+		})
+		if _, err := fmt.Fprintf(w, "event: content_block_start\ndata: %s\n\n", start); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(w, "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":%d}\n\n", i); err != nil {
+			return err
+		}
+	}
+	_, err := w.Write([]byte("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":0}}\n\n"))
+	flusher.Flush()
+	return err
+}
+
+// containsXMLToolCallStart 判断 content 是否包含已知或疑似的标记式工具调用。
 func containsXMLToolCallStart(content string) bool {
 	patterns := []string{
 		"<function=",
@@ -245,7 +408,7 @@ func containsXMLToolCallStart(content string) bool {
 			return true
 		}
 	}
-	return false
+	return toolcall.LooksLikeToolCall(content)
 }
 
 // extractUsage 从 SSE chunk 提取真实 token 用量
@@ -263,8 +426,8 @@ func (h *Handler) emitToolCallsChunk(w http.ResponseWriter, flusher http.Flusher
 	}
 	chunk := map[string]interface{}{
 		"choices": []map[string]interface{}{{
-			"index":        0,
-			"delta":        delta,
+			"index":         0,
+			"delta":         delta,
 			"finish_reason": "tool_calls",
 		}},
 	}

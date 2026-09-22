@@ -26,8 +26,8 @@ import (
 	"llm-gateway/internal/router"
 	"llm-gateway/internal/storage"
 	"llm-gateway/internal/stream"
-	"llm-gateway/internal/toolcall"
 	"llm-gateway/internal/token"
+	"llm-gateway/internal/toolcall"
 )
 
 func handleChatCompletion(
@@ -189,7 +189,13 @@ func handleChatCompletion(
 				routerSvc.RecordLatency(targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
 			}
 
-			result, streamErr := streamHandler.RewriteAndForward(c.Writer, upstream, req.Model, true)
+			definitions := openAIToolDefinitions(req.Tools)
+			repair := func(raw string) ([]map[string]interface{}, error) {
+				return repairOpenAIToolCalls(c.Request.Context(), target, req, raw, streamHandler, definitions)
+			}
+			result, streamErr := streamHandler.RewriteAndForwardWithToolRepair(
+				c.Writer, upstream, req.Model, true, definitions, repair,
+			)
 			// 流异常结束（上游 stall / 超长）回报熔断，避免坏上游不被熔断；客户端断开不惩罚上游
 			if streamErr != nil && target.Breaker != nil {
 				target.Breaker.Execute(func() (interface{}, error) { return nil, streamErr })
@@ -324,7 +330,26 @@ func handleChatCompletion(
 
 				// 6. 将 Anthropic tool_use 转换为 OpenAI tool_calls 格式
 				body = rewriteAnthropicToolCalls(body, targetProvider)
-				body = rewriteXMLToolCalls(body)
+				definitions := openAIToolDefinitions(req.Tools)
+				var malformedRaw string
+				var toolErr error
+				body, malformedRaw, toolErr = rewriteXMLToolCallsChecked(body, definitions)
+				if toolErr != nil {
+					log.Warn().Err(toolErr).Int("malformed_length", len(malformedRaw)).Msg("repairing malformed non-stream tool call")
+					calls, repairErr := repairOpenAIToolCalls(reqCtx, target, req, malformedRaw, streamHandler, definitions)
+					if repairErr != nil {
+						log.Error().Err(repairErr).Msg("tool-call format repair failed")
+						c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{
+							"type": "malformed_tool_call", "message": repairErr.Error(),
+						}})
+						return
+					}
+					body, toolErr = replaceOpenAIToolCalls(body, calls)
+					if toolErr != nil {
+						c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"type": "malformed_tool_call", "message": toolErr.Error()}})
+						return
+					}
+				}
 				go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
 					inputTokens, 0, 0, effInput, effOutput, effTotal, toolCallsCount(body), apiKey)
 				c.Data(res.StatusCode, "application/json", body)
@@ -739,7 +764,13 @@ func handleAnthropicMessages(
 				routerSvc.RecordLatency(targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
 			}
 
-			result, streamErr := streamHandler.RewriteAndForward(c.Writer, protocolResult.StreamBody, req.Model, false)
+			definitions := anthropicToolDefinitions(req.Tools)
+			repair := func(raw string) ([]map[string]interface{}, error) {
+				return repairAnthropicToolCalls(c.Request.Context(), target, req, raw, definitions)
+			}
+			result, streamErr := streamHandler.RewriteAndForwardWithToolRepair(
+				c.Writer, protocolResult.StreamBody, req.Model, false, definitions, repair,
+			)
 			// 流异常结束（上游 stall / 超长）回报熔断，避免坏上游不被熔断；客户端断开不惩罚上游
 			if streamErr != nil && target.Breaker != nil {
 				target.Breaker.Execute(func() (interface{}, error) { return nil, streamErr })
@@ -778,6 +809,24 @@ func handleAnthropicMessages(
 			if protocolResult.Response != nil {
 				defer protocolResult.Response.Body.Close()
 			}
+
+			definitions := anthropicToolDefinitions(req.Tools)
+			body, malformedRaw, toolErr := rewriteAnthropicXMLToolCallsChecked(protocolResult.Body, definitions)
+			if toolErr != nil {
+				log.Warn().Err(toolErr).Int("malformed_length", len(malformedRaw)).Msg("repairing malformed Anthropic tool call")
+				calls, repairErr := repairAnthropicToolCalls(c.Request.Context(), target, req, malformedRaw, definitions)
+				if repairErr != nil {
+					log.Error().Err(repairErr).Msg("Anthropic tool-call format repair failed")
+					c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"type": "malformed_tool_call", "message": repairErr.Error()}})
+					return
+				}
+				body, toolErr = replaceAnthropicToolCalls(body, calls)
+				if toolErr != nil {
+					c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"type": "malformed_tool_call", "message": toolErr.Error()}})
+					return
+				}
+			}
+			protocolResult.Body = body
 
 			// 记录延迟
 			if targetProvider != "" {
@@ -997,8 +1046,6 @@ func toolsFromAnthropicRequest(reqTools []map[string]interface{}) []provider.Too
 	return out
 }
 
-
-
 // toolCallsCount returns the number of tool_calls in the first choice of an
 // OpenAI-shaped response. Used after rewriteAnthropicToolCalls +
 // rewriteXMLToolCalls so the usage accounting picks up XML-embedded tool
@@ -1026,6 +1073,7 @@ func toolCallsCount(body []byte) int {
 	}
 	return len(tcs)
 }
+
 // rewriteXMLToolCalls handles the case where an OpenAI-compatible upstream
 // returns tool calls as raw XML tags embedded in choices[0].message.content
 // instead of a structured tool_calls array. It runs toolcall.Normalize on the
@@ -1034,29 +1082,53 @@ func toolCallsCount(body []byte) int {
 // This is applied after rewriteAnthropicToolCalls, so it only touches bodies
 // that still have a choices array (i.e. OpenAI-shaped).
 func rewriteXMLToolCalls(body []byte) []byte {
+	out, _, _ := rewriteXMLToolCallsChecked(body, nil)
+	return out
+}
+
+// rewriteXMLToolCallsChecked converts known text encodings and distinguishes
+// ordinary text from an attempted-but-unparseable tool call. When definitions
+// are supplied, derived calls are validated before they can reach the client.
+func rewriteXMLToolCallsChecked(body []byte, definitions []toolcall.Definition) ([]byte, string, error) {
 	var resp map[string]interface{}
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return body
+		return body, "", nil
 	}
 	choices, ok := resp["choices"].([]interface{})
 	if !ok || len(choices) == 0 {
-		return body
+		return body, "", nil
 	}
 	choice0, ok := choices[0].(map[string]interface{})
 	if !ok {
-		return body
+		return body, "", nil
 	}
 	msg, ok := choice0["message"].(map[string]interface{})
 	if !ok {
-		return body
+		return body, "", nil
+	}
+	if definitions != nil {
+		if calls, err := extractOpenAIToolCalls(body); err == nil {
+			if validateErr := toolcall.ValidateMaps(calls, definitions); validateErr != nil {
+				raw, _ := json.Marshal(calls)
+				return body, string(raw), validateErr
+			}
+		}
 	}
 	content, _ := msg["content"].(string)
 	if content == "" {
-		return body
+		return body, "", nil
 	}
 	result := toolcall.Normalize(content)
 	if len(result.ToolCalls) == 0 {
-		return body
+		if toolcall.LooksLikeToolCall(content) {
+			return body, content, fmt.Errorf("%w: unsupported tool-call format", toolcall.ErrMalformed)
+		}
+		return body, "", nil
+	}
+	if definitions != nil {
+		if err := toolcall.Validate(result.ToolCalls, definitions); err != nil {
+			return body, content, err
+		}
 	}
 	// Move extracted tool calls into the message and clean the content.
 	msg["content"] = result.CleanContent
@@ -1071,10 +1143,269 @@ func rewriteXMLToolCalls(body []byte) []byte {
 	choice0["finish_reason"] = "tool_calls"
 	out, err := json.Marshal(resp)
 	if err != nil {
-		return body
+		return body, content, err
 	}
-	return out
+	return out, "", nil
 }
+
+func openAIToolDefinitions(tools []protocol.Tool) []toolcall.Definition {
+	definitions := make([]toolcall.Definition, 0, len(tools))
+	for _, t := range tools {
+		definitions = append(definitions, toolcall.Definition{
+			Name: t.Function.Name, Parameters: t.Function.Parameters,
+		})
+	}
+	return definitions
+}
+
+func anthropicToolDefinitions(tools []map[string]interface{}) []toolcall.Definition {
+	definitions := make([]toolcall.Definition, 0, len(tools))
+	for _, t := range tools {
+		name, _ := t["name"].(string)
+		parameters := t["input_schema"]
+		if fn, ok := t["function"].(map[string]interface{}); ok {
+			name, _ = fn["name"].(string)
+			parameters = fn["parameters"]
+		}
+		definitions = append(definitions, toolcall.Definition{Name: name, Parameters: parameters})
+	}
+	return definitions
+}
+
+func extractOpenAIToolCalls(body []byte) ([]map[string]interface{}, error) {
+	var resp map[string]interface{}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, err
+	}
+	choices, _ := resp["choices"].([]interface{})
+	if len(choices) == 0 {
+		return nil, fmt.Errorf("%w: repair response has no choices", toolcall.ErrMalformed)
+	}
+	choice, _ := choices[0].(map[string]interface{})
+	message, _ := choice["message"].(map[string]interface{})
+	rawCalls, _ := message["tool_calls"].([]interface{})
+	calls := make([]map[string]interface{}, 0, len(rawCalls))
+	for _, raw := range rawCalls {
+		if call, ok := raw.(map[string]interface{}); ok {
+			calls = append(calls, call)
+		}
+	}
+	if len(calls) == 0 {
+		return nil, fmt.Errorf("%w: repair response did not contain tool_calls", toolcall.ErrMalformed)
+	}
+	return calls, nil
+}
+
+func repairOpenAIToolCalls(
+	ctx context.Context,
+	target *router.Target,
+	original protocol.ChatCompletionRequest,
+	malformed string,
+	streamHandler *stream.Handler,
+	definitions []toolcall.Definition,
+) ([]map[string]interface{}, error) {
+	if target == nil || len(definitions) == 0 {
+		return nil, fmt.Errorf("%w: repair unavailable without a target and tool definitions", toolcall.ErrMalformed)
+	}
+	if len(malformed) > 64*1024 {
+		return nil, fmt.Errorf("%w: malformed payload exceeds repair limit", toolcall.ErrMalformed)
+	}
+	repairReq := original
+	repairReq.Stream = false
+	repairReq.Temperature = 0
+	repairReq.MaxTokens = 4096
+	repairReq.ToolChoice = "required"
+	repairReq.Messages = append(append([]protocol.Message(nil), original.Messages...),
+		protocol.Message{Role: "assistant", Content: malformed},
+		protocol.Message{Role: "user", Content: "Your previous response attempted a tool call but used an unsupported format. Do not repeat the analysis and do not change the intended tool name or argument values. Return only one native structured tool call using the tools provided in this request."},
+	)
+
+	res, err := protocol.Resolve(protocol.Request{
+		ClientProtocol: provider.ProtocolOpenAI,
+		UpstreamTarget: target,
+		ChatReq:        &repairReq,
+		IsStream:       false,
+		Ctx:            ctx,
+		StreamHandler:  streamHandler,
+		VirtualModel:   original.Model,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if res == nil || res.StatusCode >= 400 {
+		return nil, fmt.Errorf("%w: repair upstream returned status %d", toolcall.ErrMalformed, func() int {
+			if res == nil {
+				return 0
+			}
+			return res.StatusCode
+		}())
+	}
+	if res.Response != nil && res.Response.Body != nil {
+		defer res.Response.Body.Close()
+	}
+	body := rewriteAnthropicToolCalls(res.Body, target.ProviderName)
+	body, raw, parseErr := rewriteXMLToolCallsChecked(body, definitions)
+	if parseErr != nil {
+		return nil, fmt.Errorf("%w after one repair (payload length %d)", parseErr, len(raw))
+	}
+	calls, err := extractOpenAIToolCalls(body)
+	if err != nil {
+		return nil, err
+	}
+	if err := toolcall.ValidateMaps(calls, definitions); err != nil {
+		return nil, err
+	}
+	return calls, nil
+}
+
+func repairAnthropicToolCalls(
+	ctx context.Context,
+	target *router.Target,
+	original protocol.AnthropicRequest,
+	malformed string,
+	definitions []toolcall.Definition,
+) ([]map[string]interface{}, error) {
+	if target == nil || len(definitions) == 0 {
+		return nil, fmt.Errorf("%w: repair unavailable without a target and tool definitions", toolcall.ErrMalformed)
+	}
+	if len(malformed) > 64*1024 {
+		return nil, fmt.Errorf("%w: malformed payload exceeds repair limit", toolcall.ErrMalformed)
+	}
+	messages, tools := target.Provider.ConvertAnthropicMessagesToOpenAI(original.Messages, original.System, original.Tools)
+	messages = append(messages,
+		provider.Message{Role: "assistant", Content: malformed},
+		provider.Message{Role: "user", Content: "Your previous response attempted a tool call but used an unsupported format. Do not repeat the analysis and do not change the intended tool name or argument values. Return only one native structured tool call using the tools provided in this request."},
+	)
+	resp, err := target.Provider.ChatWithProtocol(ctx, target.Model, messages, tools, provider.ProtocolOpenAI, provider.ChatParams{
+		MaxTokens: 4096, ToolChoice: "required",
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if target.Provider.GetProtocol() == provider.ProtocolAnthropic {
+		body, err = target.Provider.ConvertAnthropicToOpenAIResponse(body, original.Model)
+		if err != nil {
+			return nil, err
+		}
+	}
+	body, raw, parseErr := rewriteXMLToolCallsChecked(body, definitions)
+	if parseErr != nil {
+		return nil, fmt.Errorf("%w after one repair (payload length %d)", parseErr, len(raw))
+	}
+	calls, err := extractOpenAIToolCalls(body)
+	if err != nil {
+		return nil, err
+	}
+	if err := toolcall.ValidateMaps(calls, definitions); err != nil {
+		return nil, err
+	}
+	return calls, nil
+}
+
+func replaceOpenAIToolCalls(body []byte, calls []map[string]interface{}) ([]byte, error) {
+	var resp map[string]interface{}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, err
+	}
+	choices, _ := resp["choices"].([]interface{})
+	if len(choices) == 0 {
+		return nil, fmt.Errorf("response has no choices")
+	}
+	choice, _ := choices[0].(map[string]interface{})
+	message, _ := choice["message"].(map[string]interface{})
+	if message == nil {
+		message = map[string]interface{}{"role": "assistant"}
+		choice["message"] = message
+	}
+	generic := make([]interface{}, len(calls))
+	for i := range calls {
+		generic[i] = calls[i]
+	}
+	message["content"] = ""
+	message["tool_calls"] = generic
+	choice["finish_reason"] = "tool_calls"
+	return json.Marshal(resp)
+}
+
+func rewriteAnthropicXMLToolCallsChecked(body []byte, definitions []toolcall.Definition) ([]byte, string, error) {
+	var resp map[string]interface{}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return body, "", nil
+	}
+	blocks, ok := resp["content"].([]interface{})
+	if !ok {
+		return body, "", nil
+	}
+	var textContent strings.Builder
+	for _, raw := range blocks {
+		block, _ := raw.(map[string]interface{})
+		if block["type"] == "text" {
+			text, _ := block["text"].(string)
+			textContent.WriteString(text)
+		}
+	}
+	content := textContent.String()
+	if content == "" || !toolcall.LooksLikeToolCall(content) {
+		return body, "", nil
+	}
+	normalized := toolcall.Normalize(content)
+	if len(normalized.ToolCalls) == 0 {
+		return body, content, fmt.Errorf("%w: unsupported tool-call format", toolcall.ErrMalformed)
+	}
+	if definitions != nil {
+		if err := toolcall.Validate(normalized.ToolCalls, definitions); err != nil {
+			return body, content, err
+		}
+	}
+	out, err := replaceAnthropicToolCalls(body, normalized.ToOpenAISlice())
+	return out, "", err
+}
+
+func replaceAnthropicToolCalls(body []byte, calls []map[string]interface{}) ([]byte, error) {
+	var resp map[string]interface{}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, err
+	}
+	blocks, _ := resp["content"].([]interface{})
+	kept := make([]interface{}, 0, len(blocks)+len(calls))
+	for _, raw := range blocks {
+		block, _ := raw.(map[string]interface{})
+		if block["type"] != "text" {
+			kept = append(kept, raw)
+			continue
+		}
+		text, _ := block["text"].(string)
+		clean := toolcall.Normalize(text).CleanContent
+		if clean != "" && !toolcall.LooksLikeToolCall(clean) {
+			kept = append(kept, map[string]interface{}{"type": "text", "text": clean})
+		}
+	}
+	for _, call := range calls {
+		fn, _ := call["function"].(map[string]interface{})
+		name, _ := fn["name"].(string)
+		arguments, _ := fn["arguments"].(string)
+		input := map[string]interface{}{}
+		if err := json.Unmarshal([]byte(arguments), &input); err != nil {
+			return nil, err
+		}
+		id, _ := call["id"].(string)
+		if id == "" {
+			id = "call_" + uuid.New().String()[:8]
+		}
+		kept = append(kept, map[string]interface{}{
+			"type": "tool_use", "id": id, "name": name, "input": input,
+		})
+	}
+	resp["content"] = kept
+	resp["stop_reason"] = "tool_use"
+	return json.Marshal(resp)
+}
+
 // parseToolCalls 从响应中解析 tool_calls
 func parseToolCalls(body []byte, providerName string) []protocol.ChatCompletionResponse {
 	var results []protocol.ChatCompletionResponse
