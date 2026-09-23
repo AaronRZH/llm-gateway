@@ -14,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/sony/gobreaker"
 
@@ -106,26 +107,12 @@ func handleChatCompletion(
 				var res *protocol.Result
 				var resolveErr error
 				res, resolveErr = resolveWithBreaker(target, createOpenAIChatRequest(target, req, true, reqCtx))
-				if resolveErr != nil {
-					if resolveErr == gobreaker.ErrOpenState || resolveErr == gobreaker.ErrTooManyRequests {
-						log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
-						continue
-					}
-					if lastErr == nil {
-						lastErr = resolveErr
-					}
-					if ue, ok := resolveErr.(*provider.UpstreamHTTPError); ok {
-						log.Error().Err(resolveErr).Str("provider", targetProvider).Str("body", string(ue.Body)).Msg("stream connect failed, trying next")
-					} else {
-						log.Error().Err(resolveErr).Str("provider", targetProvider).Msg("stream connect failed, trying next")
-					}
+				updatedLastErr, retryNext := classifyResolveError(log, resolveErr, targetProvider, "stream connect failed, trying next", lastErr)
+				lastErr = updatedLastErr
+				if retryNext {
 					continue
 				}
-				// 429 退避：不触发熔断，退避后继续 fallback 尝试下一个候选
-				if res.StatusCode == 429 {
-					backoff := parseRetryAfter(res.Body, 5*time.Second)
-					log.Warn().Dur("backoff", backoff).Str("provider", targetProvider).Msg("rate limited (429), backing off")
-					sleepWithContext(reqCtx, backoff)
+				if isRateLimited(log, res, targetProvider, reqCtx) {
 					continue
 				}
 				upstream = res.StreamBody
@@ -225,26 +212,12 @@ func handleChatCompletion(
 				var res *protocol.Result
 				var resolveErr error
 				res, resolveErr = resolveWithBreaker(target, createOpenAIChatRequest(target, req, false, reqCtx))
-				if resolveErr != nil {
-					if resolveErr == gobreaker.ErrOpenState || resolveErr == gobreaker.ErrTooManyRequests {
-						log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
-						continue
-					}
-					if lastErr == nil {
-						lastErr = resolveErr
-					}
-					if ue, ok := resolveErr.(*provider.UpstreamHTTPError); ok {
-						log.Error().Err(resolveErr).Str("provider", targetProvider).Str("body", string(ue.Body)).Msg("upstream request failed, trying next")
-					} else {
-						log.Error().Err(resolveErr).Str("provider", targetProvider).Msg("upstream request failed, trying next")
-					}
+				updatedLastErr, retryNext := classifyResolveError(log, resolveErr, targetProvider, "upstream request failed, trying next", lastErr)
+				lastErr = updatedLastErr
+				if retryNext {
 					continue
 				}
-				// 429 退避：不触发熔断，退避后继续 fallback 尝试下一个候选
-				if res.StatusCode == 429 {
-					backoff := parseRetryAfter(res.Body, 5*time.Second)
-					log.Warn().Dur("backoff", backoff).Str("provider", targetProvider).Msg("rate limited (429), backing off")
-					sleepWithContext(reqCtx, backoff)
+				if isRateLimited(log, res, targetProvider, reqCtx) {
 					continue
 				}
 				// Body 已在 protocol.Resolve 中读取并转换，直接使用
@@ -495,6 +468,53 @@ func handleCountTokens(mapper *mapper.Service, routerSvc *router.Service, provid
 	}
 }
 
+// classifyResolveError 统一处理 protocol.Resolve 返回的错误，返回更新后的 lastErr 与是否应继续尝试下一个候选。
+// 语义与原内联写法逐行一致：
+//   - resolveErr 为 nil → 不重试，lastErr 不变
+//   - breaker 拒绝（ErrOpenState / ErrTooManyRequests）→ debug 日志后重试，不污染 lastErr
+//   - 其他错误 → 仅记录首个错误到 lastErr（保持 fallback 失败原因），并区分 UpstreamHTTPError 附带 body 日志
+func classifyResolveError(
+	log zerolog.Logger,
+	resolveErr error,
+	targetProvider string,
+	logMsg string,
+	lastErr error,
+) (error, bool) {
+	if resolveErr == nil {
+		return lastErr, false
+	}
+	if resolveErr == gobreaker.ErrOpenState || resolveErr == gobreaker.ErrTooManyRequests {
+		log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
+		return lastErr, true
+	}
+	if lastErr == nil {
+		lastErr = resolveErr
+	}
+	if ue, ok := resolveErr.(*provider.UpstreamHTTPError); ok {
+		log.Error().Err(resolveErr).Str("provider", targetProvider).Str("body", string(ue.Body)).Msg(logMsg)
+	} else {
+		log.Error().Err(resolveErr).Str("provider", targetProvider).Msg(logMsg)
+	}
+	return lastErr, true
+}
+
+// isRateLimited 处理上游 429 退避：返回 true 表示已退避并应继续尝试下一个候选。
+// 语义与原内联写法一致：429 不触发熔断，退避后继续 fallback。
+func isRateLimited(
+	log zerolog.Logger,
+	res *protocol.Result,
+	targetProvider string,
+	reqCtx context.Context,
+) bool {
+	if res.StatusCode != 429 {
+		return false
+	}
+	backoff := parseRetryAfter(res.Body, 5*time.Second)
+	log.Warn().Dur("backoff", backoff).Str("provider", targetProvider).Msg("rate limited (429), backing off")
+	sleepWithContext(reqCtx, backoff)
+	return true
+}
+
 // createOpenAIChatRequest 创建 OpenAI 客户端路径的 protocol.Request 参数对象。
 // 保持与原代码完全相同的字段填充逻辑（ClientProtocol 固定 OpenAI，无 ExtraParams）。
 func createOpenAIChatRequest(
@@ -680,26 +700,12 @@ func handleAnthropicMessages(
 				extraParams,
 				reqCtx,
 			))
-			if resolveErr != nil {
-				if resolveErr == gobreaker.ErrOpenState || resolveErr == gobreaker.ErrTooManyRequests {
-					log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
-					continue
-				}
-				if lastErr == nil {
-					lastErr = resolveErr
-				}
-				if ue, ok := resolveErr.(*provider.UpstreamHTTPError); ok {
-					log.Error().Err(resolveErr).Str("provider", targetProvider).Str("body", string(ue.Body)).Msg("anthropic upstream request failed, trying next")
-				} else {
-					log.Error().Err(resolveErr).Str("provider", targetProvider).Msg("anthropic upstream request failed, trying next")
-				}
+			updatedLastErr, retryNext := classifyResolveError(log, resolveErr, targetProvider, "anthropic upstream request failed, trying next", lastErr)
+			lastErr = updatedLastErr
+			if retryNext {
 				continue
 			}
-			// 429 退避：不触发熔断，退避后继续 fallback 尝试下一个候选
-			if res.StatusCode == 429 {
-				backoff := parseRetryAfter(res.Body, 5*time.Second)
-				log.Warn().Dur("backoff", backoff).Str("provider", targetProvider).Msg("rate limited (429), backing off")
-				sleepWithContext(reqCtx, backoff)
+			if isRateLimited(log, res, targetProvider, reqCtx) {
 				continue
 			}
 			protocolResult = res
