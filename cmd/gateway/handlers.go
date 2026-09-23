@@ -516,6 +516,131 @@ func computeEffectiveUsage(realInput, realOutput, realTotal, inputTokens, fallba
 	return effInput, effOutput, effTotal
 }
 
+// forwardUpstreamError 上游返回错误状态码时，直接转发错误 body（含响应体读取与关闭）。
+// 复用场景：handleAnthropicMessages 与 handleChatCompletion 的候选循环成功之后。
+func forwardUpstreamError(c *gin.Context, log zerolog.Logger, res *protocol.Result, targetProvider string) {
+	body := res.Body
+	if len(body) == 0 {
+		body, _ = io.ReadAll(res.Response.Body)
+	}
+	res.Response.Body.Close()
+	log.Error().Int("status", res.StatusCode).RawJSON("body", body).Str("provider", targetProvider).Msg("upstream returned error")
+	c.Data(res.StatusCode, "application/json", body)
+}
+
+// forwardStreamResponse 流式响应：使用 StreamBody（可能已包装 SSE converter），
+// 转发 SSE 数据流并统计真实 token 用量。
+func forwardStreamResponse(
+	c *gin.Context,
+	log zerolog.Logger,
+	routerSvc *router.Service,
+	streamHandler *stream.Handler,
+	tokenService *token.Service,
+	res *protocol.Result,
+	target *router.Target,
+	req protocol.AnthropicRequest,
+	reqID, apiKey, upstreamModel, targetProvider string,
+	inputTokens int,
+	start time.Time,
+) {
+	if res.StreamBody == nil {
+		log.Error().Msg("stream body is nil after successful resolve")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "upstream returned empty stream"})
+		return
+	}
+	defer res.StreamBody.Close()
+
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+
+	// 记录延迟（在流开始后记录，而不是结束后）
+	if targetProvider != "" {
+		routerSvc.RecordLatency(targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
+	}
+
+	definitions := anthropicToolDefinitions(req.Tools)
+	repair := func(raw string) ([]map[string]interface{}, error) {
+		return repairAnthropicToolCalls(c.Request.Context(), target, req, raw, definitions)
+	}
+	result, streamErr := streamHandler.RewriteAndForwardWithToolRepair(
+		c.Writer, res.StreamBody, req.Model, false, definitions, repair,
+	)
+	// 流异常结束（上游 stall / 超长）回报熔断，避免坏上游不被熔断；客户端断开不惩罚上游
+	if streamErr != nil && target.Breaker != nil {
+		target.Breaker.Execute(func() (interface{}, error) { return nil, streamErr })
+	}
+
+	// 估算输出 token（含 tool_calls）
+	estimatedOutput := tokenService.EstimateOutput(result.AccumulatedContent+result.AccumulatedReasoning, req.Model)
+	toolCalls := streamHandler.ExtractToolCalls(result)
+	estimatedToolCallsTokens := tokenService.EstimateToolCallsOutput(toolCalls, req.Model)
+	estimatedOutput += estimatedToolCallsTokens
+
+	// 记录用量：优先使用从 SSE 提取的真实 token 数，没有则使用本地估算值
+	var realInput, realOutput, realTotal int
+	if result.Usage != nil {
+		realInput = result.Usage.PromptTokens
+		realOutput = result.Usage.CompletionTokens
+		realTotal = result.Usage.TotalTokens
+	}
+	effInput, effOutput, effTotal := computeEffectiveUsage(realInput, realOutput, realTotal, inputTokens, estimatedOutput)
+	go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
+		inputTokens, estimatedOutput, estimatedToolCallsTokens, effInput, effOutput, effTotal, len(toolCalls), apiKey)
+}
+
+// forwardNonStreamResponse 非流式响应：使用 Body（已在 Resolve 中读取并转换），
+// 修复 Anthropic XML 工具调用格式后转发，并统计真实 token 用量。
+func forwardNonStreamResponse(
+	c *gin.Context,
+	log zerolog.Logger,
+	routerSvc *router.Service,
+	tokenService *token.Service,
+	res *protocol.Result,
+	target *router.Target,
+	req protocol.AnthropicRequest,
+	reqID, apiKey, upstreamModel, targetProvider string,
+	inputTokens int,
+	start time.Time,
+) {
+	if res.Response != nil {
+		defer res.Response.Body.Close()
+	}
+
+	definitions := anthropicToolDefinitions(req.Tools)
+	body, malformedRaw, toolErr := rewriteAnthropicXMLToolCallsChecked(res.Body, definitions)
+	if toolErr != nil {
+		log.Warn().Err(toolErr).Int("malformed_length", len(malformedRaw)).Msg("repairing malformed Anthropic tool call")
+		calls, repairErr := repairAnthropicToolCalls(c.Request.Context(), target, req, malformedRaw, definitions)
+		if repairErr != nil {
+			log.Error().Err(repairErr).Msg("Anthropic tool-call format repair failed")
+			c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"type": "malformed_tool_call", "message": repairErr.Error()}})
+			return
+		}
+		body, toolErr = replaceAnthropicToolCalls(body, calls)
+		if toolErr != nil {
+			c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"type": "malformed_tool_call", "message": toolErr.Error()}})
+			return
+		}
+	}
+	res.Body = body
+
+	// 记录延迟
+	if targetProvider != "" {
+		routerSvc.RecordLatency(targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
+	}
+
+	// 记录用量
+	realInput, realOutput, realTotal := parseUsage(res.Body)
+	toolCalls := parseToolCalls(res.Body, targetProvider)
+	// 上游未返回 usage 时回退到本地估算，避免 token 统计漏记（与流式路径保持一致）
+	effInput, effOutput, effTotal := computeEffectiveUsage(realInput, realOutput, realTotal, inputTokens, len(res.Body)/4)
+	go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
+		inputTokens, 0, 0, effInput, effOutput, effTotal, len(toolCalls), apiKey)
+
+	c.Data(res.StatusCode, "application/json", res.Body)
+}
+
 // createOpenAIChatRequest 创建 OpenAI 客户端路径的 protocol.Request 参数对象。
 // 保持与原代码完全相同的字段填充逻辑（ClientProtocol 固定 OpenAI，无 ExtraParams）。
 func createOpenAIChatRequest(
@@ -601,6 +726,47 @@ func createProtocolRequest(
 	}
 }
 
+// resolveAnthropicCandidate 对单个候选执行 protocol.Resolve，并判定是否需要继续尝试下一个候选。
+// 返回 (结果, 更新后的 lastErr, 是否继续下一个候选)。
+//
+// 注意：本函数不创建也不取消 context。每候选的超时 context 仍由调用方派生并 defer cancel，
+// 以保持「cancel 在 handler 返回时才触发」的既有语义——流式响应依赖该 context 在整个
+// 转发期间存活，若在此处 defer 会提前取消并掐断流。
+func resolveAnthropicCandidate(
+	log zerolog.Logger,
+	target *router.Target,
+	clientProtocol provider.ClientProtocol,
+	req protocol.AnthropicRequest,
+	reqCtx context.Context,
+	lastErr error,
+) (*protocol.Result, error, bool) {
+	res, resolveErr := resolveWithBreaker(target, createProtocolRequest(
+		clientProtocol,
+		target,
+		req,
+		buildAnthropicExtraParams(req),
+		reqCtx,
+	))
+	updatedLastErr, retryNext := classifyResolveError(log, resolveErr, target.ProviderName, "anthropic upstream request failed, trying next", lastErr)
+	if retryNext {
+		return nil, updatedLastErr, true
+	}
+	if isRateLimited(log, res, target.ProviderName, reqCtx) {
+		return nil, updatedLastErr, true
+	}
+	return res, updatedLastErr, false
+}
+
+// forwardUpstreamErrorIfPresent 若上游返回错误状态码（>=400）且响应体可用，
+// 则转发错误 body 并返回 true，表示调用方应立即 return。
+func forwardUpstreamErrorIfPresent(c *gin.Context, log zerolog.Logger, res *protocol.Result, targetProvider string) bool {
+	if res.Response == nil || res.StatusCode < 400 {
+		return false
+	}
+	forwardUpstreamError(c, log, res, targetProvider)
+	return true
+}
+
 func handleAnthropicMessages(
 	mapper *mapper.Service,
 	routerSvc *router.Service,
@@ -678,10 +844,10 @@ func handleAnthropicMessages(
 			upstreamModel = target.Model
 			targetProvider = target.ProviderName
 
-			// 构建额外参数（Case 4 专用）
-			extraParams := buildAnthropicExtraParams(req)
-
-			// 使用 target 的超时时间设置 context deadline（基于整体预算 reqCtx 派生）
+			// 使用 target 的超时时间设置 context deadline（基于整体预算 reqCtx 派生）。
+			// cancel 的 defer 注册在 handler 函数作用域上（而非本迭代），循环 break 后仍会在
+			// handler 返回时执行——这是刻意的：流式转发依赖该 context 在整个响应生命周期内存活，
+			// 若在此处提前取消会掐断长连接。
 			var cancel context.CancelFunc
 			if target.Timeout > 0 {
 				reqCtx, cancel = context.WithTimeout(reqCtx, target.Timeout)
@@ -689,27 +855,11 @@ func handleAnthropicMessages(
 			}
 
 			start = time.Now()
-
-			// 协议处理：统一调用 protocol.Resolve 处理 4 种协议组合
-			// 通过 Breaker.Execute() 包裹，使熔断器可统计成功/失败并自动转换状态
-			var res *protocol.Result
-			var resolveErr error
-			res, resolveErr = resolveWithBreaker(target, createProtocolRequest(
-				clientProtocol,
-				target,
-				req,
-				extraParams,
-				reqCtx,
-			))
-			updatedLastErr, retryNext := classifyResolveError(log, resolveErr, targetProvider, "anthropic upstream request failed, trying next", lastErr)
-			lastErr = updatedLastErr
+			var retryNext bool
+			protocolResult, lastErr, retryNext = resolveAnthropicCandidate(log, target, clientProtocol, req, reqCtx, lastErr)
 			if retryNext {
 				continue
 			}
-			if isRateLimited(log, res, targetProvider, reqCtx) {
-				continue
-			}
-			protocolResult = res
 			// 流式连接已成功，释放整体预算，避免长连接被预算超时掐断
 			if cancelBudget != nil {
 				cancelBudget()
@@ -725,101 +875,16 @@ func handleAnthropicMessages(
 
 		// 上游返回错误状态码时，直接转发错误 body
 		// （仅当 Response 可用时 — Case 4 流式/非流式及 Cases 1-3 非流式）
-		if protocolResult.Response != nil && protocolResult.StatusCode >= 400 {
-			body := protocolResult.Body
-			if len(body) == 0 {
-				body, _ = io.ReadAll(protocolResult.Response.Body)
-			}
-			protocolResult.Response.Body.Close()
-			log.Error().Int("status", protocolResult.StatusCode).RawJSON("body", body).Str("provider", targetProvider).Msg("upstream returned error")
-			c.Data(protocolResult.StatusCode, "application/json", body)
+		if forwardUpstreamErrorIfPresent(c, log, protocolResult, targetProvider) {
 			return
 		}
 
 		if req.Stream {
-			// 流式响应：使用 StreamBody（可能已包装 SSE converter）
-			if protocolResult.StreamBody == nil {
-				log.Error().Msg("stream body is nil after successful resolve")
-				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "upstream returned empty stream"})
-				return
-			}
-			defer protocolResult.StreamBody.Close()
-
-			c.Header("Content-Type", "text/event-stream")
-			c.Header("Cache-Control", "no-cache")
-			c.Header("Connection", "keep-alive")
-
-			// 记录延迟（在流开始后记录，而不是结束后）
-			if targetProvider != "" {
-				routerSvc.RecordLatency(targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
-			}
-
-			definitions := anthropicToolDefinitions(req.Tools)
-			repair := func(raw string) ([]map[string]interface{}, error) {
-				return repairAnthropicToolCalls(c.Request.Context(), target, req, raw, definitions)
-			}
-			result, streamErr := streamHandler.RewriteAndForwardWithToolRepair(
-				c.Writer, protocolResult.StreamBody, req.Model, false, definitions, repair,
-			)
-			// 流异常结束（上游 stall / 超长）回报熔断，避免坏上游不被熔断；客户端断开不惩罚上游
-			if streamErr != nil && target.Breaker != nil {
-				target.Breaker.Execute(func() (interface{}, error) { return nil, streamErr })
-			}
-
-			// 估算输出 token（含 tool_calls）
-			estimatedOutput := tokenService.EstimateOutput(result.AccumulatedContent+result.AccumulatedReasoning, req.Model)
-			toolCalls := streamHandler.ExtractToolCalls(result)
-			estimatedToolCallsTokens := tokenService.EstimateToolCallsOutput(toolCalls, req.Model)
-			estimatedOutput += estimatedToolCallsTokens
-
-			// 记录用量：优先使用从 SSE 提取的真实 token 数，没有则使用本地估算值
-			var realInput, realOutput, realTotal int
-			if result.Usage != nil {
-				realInput = result.Usage.PromptTokens
-				realOutput = result.Usage.CompletionTokens
-				realTotal = result.Usage.TotalTokens
-			}
-			effInput, effOutput, effTotal := computeEffectiveUsage(realInput, realOutput, realTotal, inputTokens, estimatedOutput)
-			go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
-				inputTokens, estimatedOutput, estimatedToolCallsTokens, effInput, effOutput, effTotal, len(toolCalls), apiKey)
+			forwardStreamResponse(c, log, routerSvc, streamHandler, tokenService,
+				protocolResult, target, req, reqID, apiKey, upstreamModel, targetProvider, inputTokens, start)
 		} else {
-			// 非流式响应：使用 Body（已在 Resolve 中读取并转换）
-			if protocolResult.Response != nil {
-				defer protocolResult.Response.Body.Close()
-			}
-
-			definitions := anthropicToolDefinitions(req.Tools)
-			body, malformedRaw, toolErr := rewriteAnthropicXMLToolCallsChecked(protocolResult.Body, definitions)
-			if toolErr != nil {
-				log.Warn().Err(toolErr).Int("malformed_length", len(malformedRaw)).Msg("repairing malformed Anthropic tool call")
-				calls, repairErr := repairAnthropicToolCalls(c.Request.Context(), target, req, malformedRaw, definitions)
-				if repairErr != nil {
-					log.Error().Err(repairErr).Msg("Anthropic tool-call format repair failed")
-					c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"type": "malformed_tool_call", "message": repairErr.Error()}})
-					return
-				}
-				body, toolErr = replaceAnthropicToolCalls(body, calls)
-				if toolErr != nil {
-					c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"type": "malformed_tool_call", "message": toolErr.Error()}})
-					return
-				}
-			}
-			protocolResult.Body = body
-
-			// 记录延迟
-			if targetProvider != "" {
-				routerSvc.RecordLatency(targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
-			}
-
-			// 记录用量
-			realInput, realOutput, realTotal := parseUsage(protocolResult.Body)
-			toolCalls := parseToolCalls(protocolResult.Body, targetProvider)
-			// 上游未返回 usage 时回退到本地估算，避免 token 统计漏记（与流式路径保持一致）
-			effInput, effOutput, effTotal := computeEffectiveUsage(realInput, realOutput, realTotal, inputTokens, len(protocolResult.Body)/4)
-			go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
-				inputTokens, 0, 0, effInput, effOutput, effTotal, len(toolCalls), apiKey)
-
-			c.Data(protocolResult.StatusCode, "application/json", protocolResult.Body)
+			forwardNonStreamResponse(c, log, routerSvc, tokenService,
+				protocolResult, target, req, reqID, apiKey, upstreamModel, targetProvider, inputTokens, start)
 		}
 	}
 }
