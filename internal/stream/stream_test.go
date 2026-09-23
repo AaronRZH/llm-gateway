@@ -2,6 +2,7 @@ package stream
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -198,9 +199,9 @@ func TestHandlerExtractToolCalls_Empty(t *testing.T) {
 // ==================== RewriteAndForward ====================
 
 type flushWriter struct {
-	buf    bytes.Buffer
-	status int
-	header http.Header
+	buf     bytes.Buffer
+	status  int
+	header  http.Header
 	flushed int
 }
 
@@ -211,8 +212,8 @@ func (f *flushWriter) Header() http.Header {
 	return f.header
 }
 func (f *flushWriter) Write(p []byte) (int, error) { return f.buf.Write(p) }
-func (f *flushWriter) WriteHeader(s int)            { f.status = s }
-func (f *flushWriter) Flush()                       { f.flushed++ }
+func (f *flushWriter) WriteHeader(s int)           { f.status = s }
+func (f *flushWriter) Flush()                      { f.flushed++ }
 
 type rc struct{ io.Reader }
 
@@ -393,6 +394,60 @@ func TestOpenAIStreamConverter_PingForwarded(t *testing.T) {
 	c.Close()
 }
 
+// TestOpenAIStreamConverter_AllChunkJSONValid 校验 text 与 tool 两条路径生成的每个 chunk 都是合法 JSON。
+// OpenAIStreamConverter 通过字符串拼接构造 chunk，历史上出现过形如
+// {"index":0,{"delta":...}} 的非法输出（choice 对象的 delta 键丢失），
+// 该缺陷在文本与工具两条路径均存在，故两者都必须覆盖。
+func TestOpenAIStreamConverter_AllChunkJSONValid(t *testing.T) {
+	cases := []struct {
+		name     string
+		upstream string
+	}{
+		{
+			name: "text",
+			upstream: "data: {\"type\":\"message_start\",\"message\":{\"role\":\"assistant\"}}\n\n" +
+				"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n" +
+				"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n" +
+				"data: {\"type\":\"message_stop\"}\n\n",
+		},
+		{
+			name: "tool",
+			upstream: "data: {\"type\":\"message_start\",\"message\":{\"role\":\"assistant\"}}\n\n" +
+				"data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call1\",\"name\":\"get\"}}\n\n" +
+				"data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n" +
+				"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":3}}\n\n" +
+				"data: {\"type\":\"message_stop\"}\n\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := NewOpenAIStreamConverter(rc{strings.NewReader(tc.upstream)}, "virt", 0)
+			defer c.Close()
+			out, err := io.ReadAll(c)
+			if err != nil {
+				t.Fatalf("read error: %v", err)
+			}
+			n := 0
+			for _, line := range strings.Split(string(out), "\n") {
+				if !strings.HasPrefix(line, "data: ") {
+					continue
+				}
+				payload := strings.TrimPrefix(line, "data: ")
+				if payload == "[DONE]" {
+					continue
+				}
+				n++
+				if !json.Valid([]byte(payload)) {
+					t.Errorf("chunk is not valid JSON: %s", payload)
+				}
+			}
+			if n == 0 {
+				t.Fatal("no chunks produced")
+			}
+		})
+	}
+}
+
 // ==================== IdleTimeoutReader ====================
 
 func TestNewIdleTimeoutReader_NoTimeout(t *testing.T) {
@@ -426,7 +481,7 @@ func TestNewIdleTimeoutReader_ReadAndClose(t *testing.T) {
 // ==================== errWriter ====================
 
 type failAfterN struct {
-	n      int
+	n       int
 	written int
 }
 
@@ -454,5 +509,38 @@ func TestErrWriter(t *testing.T) {
 	// 后续写入直接返回已记录的错误
 	if _, err := ew.Write([]byte("hij")); err == nil {
 		t.Error("expected subsequent write to fail fast")
+	}
+}
+
+// TestAnthropicSSEConverter_JSONValid 校验反向转换器（OpenAI→Anthropic）的每个 SSE data 行都是合法 JSON。
+// 该转换器用 map + json.Marshal 生成事件，理论上不会拼接出错；此测试用于防止未来重构破坏该不变量。
+func TestAnthropicSSEConverter_JSONValid(t *testing.T) {
+	in := sse(
+		`{"id":"1","choices":[{"index":0,"delta":{"role":"assistant","content":"Hi"}}]}`,
+		`{"id":"1","choices":[{"index":0,"delta":{"content":" there"},"finish_reason":"stop"}]}`,
+		`[DONE]`,
+	)
+	c := NewAnthropicSSEConverter(rc{strings.NewReader(in)}, "virt", 0)
+	defer c.Close()
+	out, err := io.ReadAll(c)
+	if err != nil {
+		t.Fatalf("read error: %v", err)
+	}
+	n := 0
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimPrefix(line, "data: ")
+		if payload == "[DONE]" {
+			continue
+		}
+		n++
+		if !json.Valid([]byte(payload)) {
+			t.Errorf("chunk is not valid JSON: %s", payload)
+		}
+	}
+	if n == 0 {
+		t.Fatal("no events produced")
 	}
 }
