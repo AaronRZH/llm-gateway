@@ -212,16 +212,40 @@ func (h *Handler) RewriteAndForwardWithToolRepair(
 
 	if err := scanner.Err(); err != nil && err != io.EOF && err != context.Canceled {
 		log.Warn().Err(err).Msg("stream scan ended abnormally")
-		if openAIClient {
-			w.Write([]byte("data: [DONE]\n\n"))
-		} else {
-			w.Write([]byte("event: message_stop\n"))
-			w.Write([]byte("data: {\"type\":\"message_stop\"}\n\n"))
-		}
-		flusher.Flush()
+		h.emitStreamTerminator(w, flusher, openAIClient)
 		return result, fmt.Errorf("stream ended abnormally: %w", err)
 	}
 
+	// 后处理：将 XML 工具调用转换为标准 OpenAI tool_calls。
+	if err := h.postProcessToolCalls(w, flusher, openAIClient, definitions, repair,
+		result, xmlSuppressed, structuredToolSuppressed, suppressedOutput); err != nil {
+		return result, err
+	}
+
+
+	// 统一补发终止符：上游 [DONE] 已在扫描时被跳过，这里始终补发一个。
+	h.emitStreamTerminator(w, flusher, openAIClient)
+	return result, nil
+}
+
+// postProcessToolCalls 处理流结束后的工具调用后处理。
+// 语义与原内联写法逐行一致：
+//   - hasXMLToolCalls → ExtractToolCalls → emitToolCallsOrWarn
+//   - structuredToolSuppressed → ValidateMaps → emitToolCalls / repair → emitToolCalls
+//   - xmlSuppressed + LooksLikeToolCall → repair → emitToolCalls / emitToolCallError
+//   - xmlSuppressed → 直接转发 suppressedOutput
+//
+// 返回 error 表示流程中断（emitToolCallError 或 emitToolCalls 的错误向上传播）
+func (h *Handler) postProcessToolCalls(
+	w http.ResponseWriter,
+	flusher http.Flusher,
+	openAIClient bool,
+	definitions []toolcall.Definition,
+	repair ToolRepairFunc,
+	result *StreamResult,
+	xmlSuppressed, structuredToolSuppressed bool,
+	suppressedOutput []byte,
+) error {
 	// 后处理：将 XML 工具调用转换为标准 OpenAI tool_calls。
 	normalized := toolcall.Normalize(result.AccumulatedContent)
 	hasXMLToolCalls := len(normalized.ToolCalls) > 0
@@ -249,82 +273,93 @@ func (h *Handler) RewriteAndForwardWithToolRepair(
 	if hasXMLToolCalls {
 		toolCallsSlice := h.ExtractToolCalls(result)
 		if len(toolCallsSlice) > 0 {
-			if err := h.emitToolCallsChunk(w, flusher, toolCallsSlice); err != nil {
-				log.Warn().Err(err).Msg("failed to emit XML-derived tool_calls chunk")
-			}
+			h.emitToolCallsOrWarn(w, flusher, openAIClient, toolCallsSlice)
 		}
-	} else if structuredToolSuppressed {
-		calls := h.ExtractToolCalls(result)
-		if err := toolcall.ValidateMaps(calls, definitions); err == nil {
-			if openAIClient {
-				if emitErr := h.emitToolCallsChunk(w, flusher, calls); emitErr != nil {
-					return result, emitErr
-				}
-			} else {
-				if emitErr := h.emitAnthropicToolCalls(w, flusher, calls); emitErr != nil {
-					return result, emitErr
-				}
-			}
-		} else {
-			raw, _ := json.Marshal(calls)
-			repaired, repairErr := attemptToolRepair(string(raw), repair)
-			if repairErr != nil {
-				h.emitToolCallError(w, flusher, openAIClient, repairErr)
-				return result, repairErr
-			}
-			result.AccumulatedToolCalls = nil
-			appendGenericToolCalls(result, repaired)
-			if openAIClient {
-				if emitErr := h.emitToolCallsChunk(w, flusher, repaired); emitErr != nil {
-					return result, emitErr
-				}
-			} else {
-				if emitErr := h.emitAnthropicToolCalls(w, flusher, repaired); emitErr != nil {
-					return result, emitErr
-				}
-			}
-		}
-	} else if xmlSuppressed && toolcall.LooksLikeToolCall(result.AccumulatedContent) {
-		// A tool-call marker was present but the payload was not parseable (or
-		// failed schema validation). Never downgrade it to assistant text.
-		if repair != nil {
-			calls, repairErr := repair(result.AccumulatedContent)
-			if repairErr == nil && len(calls) > 0 {
-				appendGenericToolCalls(result, calls)
-				if openAIClient {
-					if err := h.emitToolCallsChunk(w, flusher, calls); err != nil {
-						return result, err
-					}
-				} else {
-					if err := h.emitAnthropicToolCalls(w, flusher, calls); err != nil {
-						return result, err
-					}
-				}
-				goto finish
-			}
-			if repairErr != nil {
-				log.Warn().Err(repairErr).Msg("tool-call format repair failed")
-			}
-		}
-		err := fmt.Errorf("%w: upstream emitted an unsupported tool-call format", toolcall.ErrMalformed)
-		h.emitToolCallError(w, flusher, openAIClient, err)
-		return result, err
-	} else if xmlSuppressed {
+		return nil
+	}
+	if structuredToolSuppressed {
+		return h.emitStructuredToolCalls(w, flusher, openAIClient, definitions, repair, result)
+	}
+	if !xmlSuppressed {
+		return nil
+	}
+	if !toolcall.LooksLikeToolCall(result.AccumulatedContent) {
 		// A literal marker occurred in normal prose rather than a tool call.
 		w.Write(suppressedOutput)
 		flusher.Flush()
+		return nil
 	}
 
-finish:
-	// 统一补发终止符：上游 [DONE] 已在扫描时跳过，这里始终补发一个。
+	// A tool-call marker was present but the payload was not parseable (or
+	// failed schema validation). Never downgrade it to assistant text.
+	if repair != nil {
+		calls, repairErr := repair(result.AccumulatedContent)
+		if repairErr == nil && len(calls) > 0 {
+			appendGenericToolCalls(result, calls)
+			return h.emitToolCalls(w, flusher, openAIClient, calls)
+		}
+		if repairErr != nil {
+			log.Warn().Err(repairErr).Msg("tool-call format repair failed")
+		}
+	}
+	err := fmt.Errorf("%w: upstream emitted an unsupported tool-call format", toolcall.ErrMalformed)
+	h.emitToolCallError(w, flusher, openAIClient, err)
+	return err
+}
+
+// emitStructuredToolCalls 处理扫描阶段抑制的结构化工具调用。
+// 先按 definitions 校验：通过则直接下发；失败则尝试一次格式修复后再下发。
+// 返回 error 时调用方应中断流程（修复失败已 emitToolCallError 并补发终止符）。
+func (h *Handler) emitStructuredToolCalls(
+	w http.ResponseWriter,
+	flusher http.Flusher,
+	openAIClient bool,
+	definitions []toolcall.Definition,
+	repair ToolRepairFunc,
+	result *StreamResult,
+) error {
+	calls := h.ExtractToolCalls(result)
+	if err := toolcall.ValidateMaps(calls, definitions); err == nil {
+		return h.emitToolCalls(w, flusher, openAIClient, calls)
+	}
+	raw, _ := json.Marshal(calls)
+	repaired, repairErr := attemptToolRepair(string(raw), repair)
+	if repairErr != nil {
+		h.emitToolCallError(w, flusher, openAIClient, repairErr)
+		return repairErr
+	}
+	result.AccumulatedToolCalls = nil
+	appendGenericToolCalls(result, repaired)
+	return h.emitToolCalls(w, flusher, openAIClient, repaired)
+}
+
+// emitStreamTerminator 根据下游客户端协议补发终止符并 flush。
+// 上游 [DONE] / message_stop 已在扫描时被跳过，异常结束与正常结束都要在末尾补发一次。
+func (h *Handler) emitStreamTerminator(w http.ResponseWriter, flusher http.Flusher, openAIClient bool) {
 	if openAIClient {
-		w.Write([]byte("data: [DONE]\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
 	} else {
-		w.Write([]byte("event: message_stop\n"))
-		w.Write([]byte("data: {\"type\":\"message_stop\"}\n\n"))
+		_, _ = w.Write([]byte("event: message_stop\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"message_stop\"}\n\n"))
 	}
 	flusher.Flush()
-	return result, nil
+}
+
+// emitToolCalls 按下游客户端协议把结构化工具调用写入流并 flush。
+// 出错时返回 error（不打印日志），由调用方决定是向上返回还是记录警告。
+func (h *Handler) emitToolCalls(w http.ResponseWriter, flusher http.Flusher, openAIClient bool, calls []map[string]interface{}) error {
+	if openAIClient {
+		return h.emitToolCallsChunk(w, flusher, calls)
+	}
+	return h.emitAnthropicToolCalls(w, flusher, calls)
+}
+
+// emitToolCallsOrWarn 同 emitToolCalls，但写入失败只记一条 warn 日志、不返回错误。
+// 用于"已发出部分数据后再发工具调用"的收尾场景——此时流已无法中断，失败不影响已发内容。
+func (h *Handler) emitToolCallsOrWarn(w http.ResponseWriter, flusher http.Flusher, openAIClient bool, calls []map[string]interface{}) {
+	if err := h.emitToolCalls(w, flusher, openAIClient, calls); err != nil {
+		log.Warn().Err(err).Msg("failed to emit XML-derived tool_calls chunk")
+	}
 }
 
 func attemptToolRepair(raw string, repair ToolRepairFunc) ([]map[string]interface{}, error) {

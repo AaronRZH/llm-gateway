@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"llm-gateway/internal/toolcall"
 )
 
 // ==================== escapeJSON ====================
@@ -542,5 +544,41 @@ func TestAnthropicSSEConverter_JSONValid(t *testing.T) {
 	}
 	if n == 0 {
 		t.Fatal("no events produced")
+	}
+}
+
+// TestRewriteAndForwardWithToolRepair_StructuredToolCalls 测试 structuredToolSuppressed 分支：
+// 上游返回结构化 tool_calls，但 schema 校验失败，触发 format repair。
+func TestRewriteAndForwardWithToolRepair_StructuredToolCalls(t *testing.T) {
+	upstream := rc{strings.NewReader(
+		"data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\n" +
+			"data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call1\",\"type\":\"function\",\"function\":{\"name\":\"get\",\"arguments\":\"{\\\"key\\\":\\\"value\\\"}\"}}]}}],\"finish_reason\":\"tool_calls\"}]}\n\n" +
+			"data: [DONE]\n\n",
+	)}
+	h := &Handler{idleTimeout: 0}
+	definitions := []toolcall.Definition{
+		{Name: "get", Parameters: map[string]interface{}{"type": "object", "properties": map[string]interface{}{"key": map[string]interface{}{"type": "string"}}}},
+	}
+	repair := func(raw string) ([]map[string]interface{}, error) {
+		var calls []map[string]interface{}
+		if err := json.Unmarshal([]byte(raw), &calls); err != nil {
+			return nil, err
+		}
+		if len(calls) > 0 {
+			calls[0]["function"].(map[string]interface{})["name"] = "fixed"
+		}
+		return calls, nil
+	}
+
+	fw := &flushWriter{}
+	result, err := h.RewriteAndForwardWithToolRepair(fw, upstream, "virt", true, definitions, repair)
+	if err != nil {
+		t.Fatalf("expected success, got error: %v", err)
+	}
+	if len(result.AccumulatedToolCalls) == 0 {
+		t.Fatal("expected at least one tool call after repair")
+	}
+	if result.AccumulatedToolCalls[0].Function.Name != "fixed" {
+		t.Errorf("expected repaired tool call name 'fixed', got %q", result.AccumulatedToolCalls[0].Function.Name)
 	}
 }
