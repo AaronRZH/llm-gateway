@@ -14,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/sony/gobreaker"
 
@@ -105,51 +106,13 @@ func handleChatCompletion(
 				// 通过 Breaker.Execute() 包裹，使熔断器可统计成功/失败并自动转换状态
 				var res *protocol.Result
 				var resolveErr error
-				if target.Breaker != nil {
-					result, breakerErr := target.Breaker.Execute(func() (interface{}, error) {
-						return protocol.Resolve(protocol.Request{
-							ClientProtocol: provider.ProtocolOpenAI,
-							UpstreamTarget: target,
-							ChatReq:        &req,
-							IsStream:       true,
-							Ctx:            reqCtx,
-							VirtualModel:   req.Model,
-						})
-					})
-					if result != nil {
-						res = result.(*protocol.Result)
-					}
-					resolveErr = breakerErr
-				} else {
-					res, resolveErr = protocol.Resolve(protocol.Request{
-						ClientProtocol: provider.ProtocolOpenAI,
-						UpstreamTarget: target,
-						ChatReq:        &req,
-						IsStream:       true,
-						Ctx:            reqCtx,
-						VirtualModel:   req.Model,
-					})
-				}
-				if resolveErr != nil {
-					if resolveErr == gobreaker.ErrOpenState || resolveErr == gobreaker.ErrTooManyRequests {
-						log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
-						continue
-					}
-					if lastErr == nil {
-						lastErr = resolveErr
-					}
-					if ue, ok := resolveErr.(*provider.UpstreamHTTPError); ok {
-						log.Error().Err(resolveErr).Str("provider", targetProvider).Str("body", string(ue.Body)).Msg("stream connect failed, trying next")
-					} else {
-						log.Error().Err(resolveErr).Str("provider", targetProvider).Msg("stream connect failed, trying next")
-					}
+				res, resolveErr = resolveWithBreaker(target, createOpenAIChatRequest(target, req, true, reqCtx))
+				updatedLastErr, retryNext := classifyResolveError(log, resolveErr, targetProvider, "stream connect failed, trying next", lastErr)
+				lastErr = updatedLastErr
+				if retryNext {
 					continue
 				}
-				// 429 退避：不触发熔断，退避后继续 fallback 尝试下一个候选
-				if res.StatusCode == 429 {
-					backoff := parseRetryAfter(res.Body, 5*time.Second)
-					log.Warn().Dur("backoff", backoff).Str("provider", targetProvider).Msg("rate limited (429), backing off")
-					sleepWithContext(reqCtx, backoff)
+				if isRateLimited(log, res, targetProvider, reqCtx) {
 					continue
 				}
 				upstream = res.StreamBody
@@ -161,20 +124,8 @@ func handleChatCompletion(
 			}
 
 			if upstream == nil {
-				if lastErr != nil {
-					if ue, ok := lastErr.(*provider.UpstreamHTTPError); ok {
-						log.Error().Err(lastErr).Str("provider", ue.Provider).Str("body", string(ue.Body)).Msg("all upstream models failed for stream")
-						c.Data(ue.StatusCode, "application/json", ue.Body)
-						return
-					}
-					log.Error().Err(lastErr).Msg("all upstream models failed for stream")
-				} else {
-					log.Error().Msg("all upstream models failed for stream")
-				}
-				// 记录失败请求（仅估算输入），计入请求次数，避免 dashboard 漏算
-				go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
-					inputTokens, 0, 0, 0, 0, 0, 0, apiKey)
-				c.JSON(http.StatusServiceUnavailable, gin.H{"error": upstreamFailedMessage(lastErr)})
+				handleAllCandidatesFailed(c, log, lastErr, "all upstream models failed for stream",
+					reqID, upstreamModel, req.Model, targetProvider, apiKey, inputTokens, tokenService)
 				return
 			}
 
@@ -215,19 +166,7 @@ func handleChatCompletion(
 				realOutput = result.Usage.CompletionTokens
 				realTotal = result.Usage.TotalTokens
 			}
-			// 记录用量：优先使用 upstream 返回的真实 token 数，没有则使用本地估算值
-			effInput := realInput
-			if effInput == 0 {
-				effInput = inputTokens
-			}
-			effOutput := realOutput
-			if effOutput == 0 {
-				effOutput = estimatedOutput
-			}
-			effTotal := effInput + effOutput
-			if realTotal > 0 {
-				effTotal = realTotal
-			}
+			effInput, effOutput, effTotal := computeEffectiveUsage(realInput, realOutput, realTotal, inputTokens, estimatedOutput)
 			go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
 				inputTokens, estimatedOutput, estimatedToolCallsTokens, effInput, effOutput, effTotal, len(toolCalls), apiKey)
 
@@ -248,51 +187,13 @@ func handleChatCompletion(
 				// 通过 Breaker.Execute() 包裹，使熔断器可统计成功/失败并自动转换状态
 				var res *protocol.Result
 				var resolveErr error
-				if target.Breaker != nil {
-					result, breakerErr := target.Breaker.Execute(func() (interface{}, error) {
-						return protocol.Resolve(protocol.Request{
-							ClientProtocol: provider.ProtocolOpenAI,
-							UpstreamTarget: target,
-							ChatReq:        &req,
-							IsStream:       false,
-							Ctx:            reqCtx,
-							VirtualModel:   req.Model,
-						})
-					})
-					if result != nil {
-						res = result.(*protocol.Result)
-					}
-					resolveErr = breakerErr
-				} else {
-					res, resolveErr = protocol.Resolve(protocol.Request{
-						ClientProtocol: provider.ProtocolOpenAI,
-						UpstreamTarget: target,
-						ChatReq:        &req,
-						IsStream:       false,
-						Ctx:            reqCtx,
-						VirtualModel:   req.Model,
-					})
-				}
-				if resolveErr != nil {
-					if resolveErr == gobreaker.ErrOpenState || resolveErr == gobreaker.ErrTooManyRequests {
-						log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
-						continue
-					}
-					if lastErr == nil {
-						lastErr = resolveErr
-					}
-					if ue, ok := resolveErr.(*provider.UpstreamHTTPError); ok {
-						log.Error().Err(resolveErr).Str("provider", targetProvider).Str("body", string(ue.Body)).Msg("upstream request failed, trying next")
-					} else {
-						log.Error().Err(resolveErr).Str("provider", targetProvider).Msg("upstream request failed, trying next")
-					}
+				res, resolveErr = resolveWithBreaker(target, createOpenAIChatRequest(target, req, false, reqCtx))
+				updatedLastErr, retryNext := classifyResolveError(log, resolveErr, targetProvider, "upstream request failed, trying next", lastErr)
+				lastErr = updatedLastErr
+				if retryNext {
 					continue
 				}
-				// 429 退避：不触发熔断，退避后继续 fallback 尝试下一个候选
-				if res.StatusCode == 429 {
-					backoff := parseRetryAfter(res.Body, 5*time.Second)
-					log.Warn().Dur("backoff", backoff).Str("provider", targetProvider).Msg("rate limited (429), backing off")
-					sleepWithContext(reqCtx, backoff)
+				if isRateLimited(log, res, targetProvider, reqCtx) {
 					continue
 				}
 				// Body 已在 protocol.Resolve 中读取并转换，直接使用
@@ -309,21 +210,8 @@ func handleChatCompletion(
 
 				// 5. 解析上游返回的真实 usage，异步记录用量
 				realInput, realOutput, realTotal := parseUsage(body)
-				// 解析 tool_calls
-				_ = realTotal // 保留用于未来的扩展
 				// 上游未返回 usage 时回退到本地估算，避免 token 统计漏记（与流式路径保持一致）
-				effInput := realInput
-				if effInput == 0 {
-					effInput = inputTokens
-				}
-				effOutput := realOutput
-				if effOutput == 0 {
-					effOutput = len(body) / 4 // 粗略估算输出 token
-				}
-				effTotal := effInput + effOutput
-				if realTotal > 0 {
-					effTotal = realTotal
-				}
+				effInput, effOutput, effTotal := computeEffectiveUsage(realInput, realOutput, realTotal, inputTokens, len(body)/4)
 
 				// 重写响应中的 model 字段
 				body = mapper.RewriteResponse(body, req.Model)
@@ -356,22 +244,8 @@ func handleChatCompletion(
 				return
 			}
 
-			if lastErr != nil {
-				if ue, ok := lastErr.(*provider.UpstreamHTTPError); ok {
-					log.Error().Err(lastErr).Str("provider", ue.Provider).Str("body", string(ue.Body)).Msg("all upstream models failed for non-stream")
-					// SendDirect 路径（Case 4: Anthropic→Anthropic）的 4xx 透传：
-					// 客户端应该收到上游的原始状态码和 body，而不是泛化 503
-					c.Data(ue.StatusCode, "application/json", ue.Body)
-					return
-				}
-				log.Error().Err(lastErr).Msg("all upstream models failed for non-stream")
-			} else {
-				log.Error().Msg("all upstream models failed for non-stream")
-			}
-			// 记录失败请求（仅估算输入），计入请求次数，避免 dashboard 漏算
-			go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
-				inputTokens, 0, 0, 0, 0, 0, 0, apiKey)
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": upstreamFailedMessage(lastErr)})
+			handleAllCandidatesFailed(c, log, lastErr, "all upstream models failed for non-stream",
+				reqID, upstreamModel, req.Model, targetProvider, apiKey, inputTokens, tokenService)
 			return
 		}
 	}
@@ -543,6 +417,141 @@ func handleCountTokens(mapper *mapper.Service, routerSvc *router.Service, provid
 	}
 }
 
+// classifyResolveError 统一处理 protocol.Resolve 返回的错误，返回更新后的 lastErr 与是否应继续尝试下一个候选。
+// 语义与原内联写法逐行一致：
+//   - resolveErr 为 nil → 不重试，lastErr 不变
+//   - breaker 拒绝（ErrOpenState / ErrTooManyRequests）→ debug 日志后重试，不污染 lastErr
+//   - 其他错误 → 仅记录首个错误到 lastErr（保持 fallback 失败原因），并区分 UpstreamHTTPError 附带 body 日志
+func classifyResolveError(
+	log zerolog.Logger,
+	resolveErr error,
+	targetProvider string,
+	logMsg string,
+	lastErr error,
+) (error, bool) {
+	if resolveErr == nil {
+		return lastErr, false
+	}
+	if resolveErr == gobreaker.ErrOpenState || resolveErr == gobreaker.ErrTooManyRequests {
+		log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
+		return lastErr, true
+	}
+	if lastErr == nil {
+		lastErr = resolveErr
+	}
+	if ue, ok := resolveErr.(*provider.UpstreamHTTPError); ok {
+		log.Error().Err(resolveErr).Str("provider", targetProvider).Str("body", string(ue.Body)).Msg(logMsg)
+	} else {
+		log.Error().Err(resolveErr).Str("provider", targetProvider).Msg(logMsg)
+	}
+	return lastErr, true
+}
+
+// isRateLimited 处理上游 429 退避：返回 true 表示已退避并应继续尝试下一个候选。
+// 语义与原内联写法一致：429 不触发熔断，退避后继续 fallback。
+func isRateLimited(
+	log zerolog.Logger,
+	res *protocol.Result,
+	targetProvider string,
+	reqCtx context.Context,
+) bool {
+	if res.StatusCode != 429 {
+		return false
+	}
+	backoff := parseRetryAfter(res.Body, 5*time.Second)
+	log.Warn().Dur("backoff", backoff).Str("provider", targetProvider).Msg("rate limited (429), backing off")
+	sleepWithContext(reqCtx, backoff)
+	return true
+}
+
+// handleAllCandidatesFailed 处理"所有 fallback 候选均失败"的统一收尾。
+// 语义与原三处内联写法逐行一致：
+//   - lastErr 为 *UpstreamHTTPError 时记录含 body 的错误日志，并直接转发上游状态码与 body（4xx 透传，不泛化为 503）
+//   - 否则记录普通错误日志（lastErr 为 nil 时不附带 Err）
+//   - 随后记录一次仅含输入 token 的失败请求用量，避免 dashboard 漏算
+//
+// 该函数总是写出响应，调用方应在其后 return。
+func handleAllCandidatesFailed(
+	c *gin.Context,
+	log zerolog.Logger,
+	lastErr error,
+	logMsg string,
+	reqID, upstreamModel, model, targetProvider, apiKey string,
+	inputTokens int,
+	tokenService *token.Service,
+) {
+	if lastErr != nil {
+		if ue, ok := lastErr.(*provider.UpstreamHTTPError); ok {
+			log.Error().Err(lastErr).Str("provider", ue.Provider).Str("body", string(ue.Body)).Msg(logMsg)
+			c.Data(ue.StatusCode, "application/json", ue.Body)
+			return
+		}
+		log.Error().Err(lastErr).Msg(logMsg)
+	} else {
+		log.Error().Msg(logMsg)
+	}
+	// 记录失败请求（仅估算输入），计入请求次数，避免 dashboard 漏算
+	go tokenService.RecordUsageNow(reqID, upstreamModel, model, targetProvider,
+		inputTokens, 0, 0, 0, 0, 0, 0, apiKey)
+	c.JSON(http.StatusServiceUnavailable, gin.H{"error": upstreamFailedMessage(lastErr)})
+}
+
+// computeEffectiveUsage 统一计算最终记录的 token 用量，返回 effInput/effOutput/effTotal。
+// 语义与原内联写法逐行一致：
+//   - 上游返回的真实 token 优先；为 0 时回退到本地估算（effInput 用 inputTokens，effOutput 用 fallbackOutput）
+//   - effTotal 优先使用上游 realTotal，否则为 effInput + effOutput
+func computeEffectiveUsage(realInput, realOutput, realTotal, inputTokens, fallbackOutput int) (int, int, int) {
+	effInput := realInput
+	if effInput == 0 {
+		effInput = inputTokens
+	}
+	effOutput := realOutput
+	if effOutput == 0 {
+		effOutput = fallbackOutput
+	}
+	effTotal := effInput + effOutput
+	if realTotal > 0 {
+		effTotal = realTotal
+	}
+	return effInput, effOutput, effTotal
+}
+
+// createOpenAIChatRequest 创建 OpenAI 客户端路径的 protocol.Request 参数对象。
+// 保持与原代码完全相同的字段填充逻辑（ClientProtocol 固定 OpenAI，无 ExtraParams）。
+func createOpenAIChatRequest(
+	target *router.Target,
+	req protocol.ChatCompletionRequest,
+	isStream bool,
+	reqCtx context.Context,
+) protocol.Request {
+	return protocol.Request{
+		ClientProtocol: provider.ProtocolOpenAI,
+		UpstreamTarget: target,
+		ChatReq:        &req,
+		IsStream:       isStream,
+		Ctx:            reqCtx,
+		VirtualModel:   req.Model,
+	}
+}
+
+// resolveWithBreaker 通过熔断器包裹 protocol.Resolve，统一 breaker 启用/未启用两条路径。
+// 语义与内联写法完全一致：breaker 为 nil 时直接调用 Resolve；
+// 否则在 Breaker.Execute 内调用，并把结果做一次 *protocol.Result 类型断言。
+// breaker 拒绝（ErrOpenState / ErrTooManyRequests）同样通过 error 返回，由调用方决定重试。
+func resolveWithBreaker(target *router.Target, preq protocol.Request) (*protocol.Result, error) {
+	if target.Breaker == nil {
+		return protocol.Resolve(preq)
+	}
+	result, breakerErr := target.Breaker.Execute(func() (interface{}, error) {
+		return protocol.Resolve(preq)
+	})
+	var res *protocol.Result
+	if result != nil {
+		res = result.(*protocol.Result)
+	}
+	return res, breakerErr
+}
+
 // buildAnthropicExtraParams 构建 Anthropic 请求的额外参数（Case 4 专用）。
 // 保持与原内层逻辑完全相同的语义：max_tokens 默认 4096，Temperature/TopP/StopSequences/Tools/ToolChoice 有条件添加。
 func buildAnthropicExtraParams(req protocol.AnthropicRequest) map[string]interface{} {
@@ -685,49 +694,19 @@ func handleAnthropicMessages(
 			// 通过 Breaker.Execute() 包裹，使熔断器可统计成功/失败并自动转换状态
 			var res *protocol.Result
 			var resolveErr error
-			if target.Breaker != nil {
-				result, breakerErr := target.Breaker.Execute(func() (interface{}, error) {
-					return protocol.Resolve(createProtocolRequest(
-						clientProtocol,
-						target,
-						req,
-						extraParams,
-						reqCtx,
-					))
-				})
-				if result != nil {
-					res = result.(*protocol.Result)
-				}
-				resolveErr = breakerErr
-			} else {
-				res, resolveErr = protocol.Resolve(createProtocolRequest(
-					clientProtocol,
-					target,
-					req,
-					extraParams,
-					reqCtx,
-				))
-			}
-			if resolveErr != nil {
-				if resolveErr == gobreaker.ErrOpenState || resolveErr == gobreaker.ErrTooManyRequests {
-					log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
-					continue
-				}
-				if lastErr == nil {
-					lastErr = resolveErr
-				}
-				if ue, ok := resolveErr.(*provider.UpstreamHTTPError); ok {
-					log.Error().Err(resolveErr).Str("provider", targetProvider).Str("body", string(ue.Body)).Msg("anthropic upstream request failed, trying next")
-				} else {
-					log.Error().Err(resolveErr).Str("provider", targetProvider).Msg("anthropic upstream request failed, trying next")
-				}
+			res, resolveErr = resolveWithBreaker(target, createProtocolRequest(
+				clientProtocol,
+				target,
+				req,
+				extraParams,
+				reqCtx,
+			))
+			updatedLastErr, retryNext := classifyResolveError(log, resolveErr, targetProvider, "anthropic upstream request failed, trying next", lastErr)
+			lastErr = updatedLastErr
+			if retryNext {
 				continue
 			}
-			// 429 退避：不触发熔断，退避后继续 fallback 尝试下一个候选
-			if res.StatusCode == 429 {
-				backoff := parseRetryAfter(res.Body, 5*time.Second)
-				log.Warn().Dur("backoff", backoff).Str("provider", targetProvider).Msg("rate limited (429), backing off")
-				sleepWithContext(reqCtx, backoff)
+			if isRateLimited(log, res, targetProvider, reqCtx) {
 				continue
 			}
 			protocolResult = res
@@ -739,20 +718,8 @@ func handleAnthropicMessages(
 		}
 
 		if protocolResult == nil {
-			if lastErr != nil {
-				if ue, ok := lastErr.(*provider.UpstreamHTTPError); ok {
-					log.Error().Err(lastErr).Str("provider", ue.Provider).Str("body", string(ue.Body)).Msg("all upstream models failed for anthropic /messages")
-					c.Data(ue.StatusCode, "application/json", ue.Body)
-					return
-				}
-				log.Error().Err(lastErr).Msg("all upstream models failed for anthropic /messages")
-			} else {
-				log.Error().Msg("all upstream models failed for anthropic /messages")
-			}
-			// 记录失败请求（仅估算输入），计入请求次数，避免 dashboard 漏算
-			go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
-				inputTokens, 0, 0, 0, 0, 0, 0, apiKey)
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": upstreamFailedMessage(lastErr)})
+			handleAllCandidatesFailed(c, log, lastErr, "all upstream models failed for anthropic /messages",
+				reqID, upstreamModel, req.Model, targetProvider, apiKey, inputTokens, tokenService)
 			return
 		}
 
@@ -812,19 +779,7 @@ func handleAnthropicMessages(
 				realOutput = result.Usage.CompletionTokens
 				realTotal = result.Usage.TotalTokens
 			}
-			// 优先使用 upstream 返回的真实 token 数，没有则使用本地估算值
-			effInput := realInput
-			if effInput == 0 {
-				effInput = inputTokens
-			}
-			effOutput := realOutput
-			if effOutput == 0 {
-				effOutput = estimatedOutput
-			}
-			effTotal := effInput + effOutput
-			if realTotal > 0 {
-				effTotal = realTotal
-			}
+			effInput, effOutput, effTotal := computeEffectiveUsage(realInput, realOutput, realTotal, inputTokens, estimatedOutput)
 			go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
 				inputTokens, estimatedOutput, estimatedToolCallsTokens, effInput, effOutput, effTotal, len(toolCalls), apiKey)
 		} else {
@@ -859,20 +814,8 @@ func handleAnthropicMessages(
 			// 记录用量
 			realInput, realOutput, realTotal := parseUsage(protocolResult.Body)
 			toolCalls := parseToolCalls(protocolResult.Body, targetProvider)
-			_ = realTotal
 			// 上游未返回 usage 时回退到本地估算，避免 token 统计漏记（与流式路径保持一致）
-			effInput := realInput
-			if effInput == 0 {
-				effInput = inputTokens
-			}
-			effOutput := realOutput
-			if effOutput == 0 {
-				effOutput = len(protocolResult.Body) / 4 // 粗略估算输出 token
-			}
-			effTotal := effInput + effOutput
-			if realTotal > 0 {
-				effTotal = realTotal
-			}
+			effInput, effOutput, effTotal := computeEffectiveUsage(realInput, realOutput, realTotal, inputTokens, len(protocolResult.Body)/4)
 			go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
 				inputTokens, 0, 0, effInput, effOutput, effTotal, len(toolCalls), apiKey)
 
