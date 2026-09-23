@@ -1,6 +1,6 @@
 # llm-gateway 技术债治理清单
 
-> **最后度量**: 2026-09-23（合并 refactor/resolve、refactor/content-to-blocks、refactor/validate-arguments、refactor/anthropic-handler，刷新复杂度基线）  
+> **最后度量**: 2026-09-23（合并 PR #7-#10：stream-scan-forward、docs/refresh-debt-baseline、handle-chat-completion、anthropic-sse-convert，刷新复杂度基线）  
 > **适用范围**: 生产 Go 代码（排除 `*_test.go` 与 `.tmp/`）  
 > **治理原则**: 先锁定行为，再小步重构；优先级由业务风险、变更频率、测试保护和复杂度共同决定
 
@@ -31,41 +31,49 @@ go tool cover -func=coverage.out
 | 指标 | 当前值 |
 |------|--------|
 | 生产 Go 文件数 | 28 |
-| 函数/方法数 | 354 |
-| 代码行 | 8586 |
-| 平均函数复杂度 | 4.96 |
-| 最大函数复杂度 | 47（`handleChatCompletion`） |
-| 最大函数行数 | 346（`handleChatCompletion`） |
-| 测试文件数 | 18 |
-| 总语句覆盖率 | 39.8% |
+| 函数/方法数 | 384 |
+| 代码行 | 8548 |
+| 平均函数复杂度 | 4.55 |
+| 最大函数复杂度 | 28（`handleAnthropicMessages`） |
+| 最大函数行数 | 222（`handleAnthropicMessages`） |
+| 测试文件数 | 25 |
+| 总语句覆盖率 | 54.8% |
 
 复杂度最高的函数：
 
 | 函数 | 位置 | 复杂度 | 行数 |
 |------|------|--------|------|
-| `handleChatCompletion` | `cmd/gateway/handlers.go` | 47 | 346 |
-| `handleAnthropicMessages` | `cmd/gateway/handlers.go` | 42 | 288 |
-| `RewriteAndForwardWithToolRepair` | `internal/stream/stream.go` | 34 | 149 |
-| `AnthropicSSEConverter.convert` | `internal/stream/anthropic_sse.go` | 33 | 194 |
+| `handleAnthropicMessages` | `cmd/gateway/handlers.go` | 28 | 222 |
+| `handleChatCompletion` | `cmd/gateway/handlers.go` | 25 | 219 |
 | `ConvertAnthropicMessagesToOpenAI` | `internal/provider/anthropic_converter.go` | 23 | 100 |
 | `handleCountTokens` | `cmd/gateway/handlers.go` | 20 | 113 |
 | `Normalize` | `internal/toolcall/toolcall.go` | 20 | 92 |
 | `ConvertResponse` | `internal/provider/anthropic_converter.go` | 20 | 86 |
 | `OpenAIStreamConverter.convert` | `internal/stream/anthropic_sse.go` | 20 | 79 |
+| `main` | `cmd/gateway/main.go` | 19 | 193 |
+| `AnthropicSSEConverter.convert` | `internal/stream/anthropic_sse.go` | 19 | 92 |
+
+> 复杂度基线已从阶段 1 的最高值 48 降至 28。`RewriteAndForwardWithToolRepair`（原 C=48）与两个 handler（原 C=47/48）均已拆分，不再进入前 9 名。剩余热点集中在两个 handler 和 `internal/provider` 的 Anthropic 转换链路。
 
 重点包覆盖率：
 
 | 包 | 覆盖率 | 说明 |
 |----|--------|------|
-| `cmd/gateway` | 6.7% | 两个核心请求 handler 均为 0% |
-| `internal/auth` | 0.0% | API Key、缓存及 Redis 回退无测试 |
-| `internal/protocol` | 29.8% | `Resolve` 为 0% |
-| `internal/provider` | 36.7% | 已有转换测试，但主路径覆盖不足 |
+| `cmd/gateway` | 34.1% | 两个核心 handler 已有 characterization tests，但分支覆盖不足 |
+| `internal/auth` | 98.0% | 已建立完整测试（种子 Key、缓存、Redis 回退） |
+| `internal/protocol` | 88.5% | `Resolve` 拆分后覆盖 97.6% |
+| `internal/provider` | 43.7% | 转换主路径覆盖不足，是下一个重点 |
 | `internal/storage` | 29.6% | 文件后端覆盖较好，Redis/PostgreSQL 路径不足 |
-| `internal/stream` | 76.5% | 已有流式和工具调用修复测试 |
+| `internal/stream` | 81.4% | 已有流式和工具调用修复测试 |
 | `internal/middleware` | 93.7% | `AdminAuth` 已有 JWT、Basic Auth 等测试 |
-| `internal/health` | 0.0% | 无测试 |
-| `pkg/redis` | 0.0% | 无测试 |
+| `internal/health` | 100.0% | 已补全测试 |
+| `internal/mapper` | 81.2% | 模型映射逻辑 |
+| `internal/router` | 89.9% | 路由链与候选选择 |
+| `internal/token` | 58.7% | 用量统计与估算 |
+| `pkg/redis` | 100.0% | 已补全测试 |
+| `pkg/breaker` | 75.0% | 熔断器 |
+| `pkg/ratelimit` | 31.6% | 限流器，覆盖不足 |
+| `pkg/tokenizer` | 67.9% | 分词与 token 估算 |
 
 ### 1.3 治理进展（阶段 1 / P0 行为锁定）
 
