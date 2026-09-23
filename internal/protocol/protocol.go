@@ -33,140 +33,69 @@ type Result struct {
 	StreamBody io.ReadCloser  // 流式响应体（已包装 SSE converter 如需）
 }
 
-// Resolve 根据客户端协议和上游协议的组合执行对应的 HTTP 请求和转换逻辑。
-// handler 侧负责重试循环（breaker 错误时 continue 重试下一个候选），
-// Resolve 侧负责协议判断、格式转换和 SSE 转换包装。
-func Resolve(req Request) (*Result, error) {
-	clientProto := req.ClientProtocol
-	upstreamProto := req.UpstreamTarget.Provider.GetProtocol()
-
-	// handleProviderErr: treat 429 as non-breaker (backoff), 4xx/5xx as breaker errors
-	// UpstreamHTTPError 429 → return Result (nil error), breaker does not count
-	// UpstreamHTTPError 4xx/5xx → return nil + error, breaker counts
-	// Non-UpstreamHTTPError → return nil + error, breaker counts
-	handleProviderErr := func(err error) (*Result, error) {
-		if err == nil {
-			return nil, nil
-		}
-		ue, ok := err.(*provider.UpstreamHTTPError)
-		if !ok {
-			return nil, err
-		}
-		if ue.StatusCode == 429 {
-			return &Result{
-				Body:       ue.Body,
-				StatusCode: 429,
-			}, nil
-		}
+// handleProviderErr 统一处理上游 provider 错误：
+//   - 非 *UpstreamHTTPError 直接透传，breaker 计数；
+//   - 429 返回 Result（nil error），不触发 breaker，由 handler 侧做退避重试；
+//   - 其他 4xx/5xx 返回 nil+err，breaker 计数。
+func handleProviderErr(err error) (*Result, error) {
+	if err == nil {
+		return nil, nil
+	}
+	ue, ok := err.(*provider.UpstreamHTTPError)
+	if !ok {
 		return nil, err
 	}
+	if ue.StatusCode == 429 {
+		return &Result{Body: ue.Body, StatusCode: 429}, nil
+	}
+	return nil, err
+}
 
-	log.Debug().
-		Str("provider", req.UpstreamTarget.ProviderName).
-		Str("upstream_model", req.UpstreamTarget.Model).
-		Str("upstream_url", req.UpstreamTarget.Provider.FullURL()).
-		Str("client_protocol", string(clientProto)).
-		Str("upstream_protocol", string(upstreamProto)).
-		Bool("stream", req.IsStream).
-		Msg("sending request to upstream")
+// resolveSameProtocolCase4 Anthropic 客户端 → Anthropic 上游，直接转发（含流式/非流式）。
+func resolveSameProtocolCase4(req Request) (*Result, error) {
+	if req.IsStream {
+		resp, err := req.UpstreamTarget.Provider.SendDirect(
+			req.Ctx,
+			req.UpstreamTarget.Model,
+			req.AnthropicReq.Messages,
+			req.AnthropicReq.System,
+			req.ExtraParams,
+			true,
+		)
+		if r, e := handleProviderErr(err); r != nil || e != nil {
+			return r, e
+		}
+		return &Result{
+			Response:   resp,
+			StatusCode: resp.StatusCode,
+			StreamBody: resp.Body,
+		}, nil
+	}
+	resp, err := req.UpstreamTarget.Provider.SendDirect(
+		req.Ctx,
+		req.UpstreamTarget.Model,
+		req.AnthropicReq.Messages,
+		req.AnthropicReq.System,
+		req.ExtraParams,
+		false,
+	)
+	if r, e := handleProviderErr(err); r != nil || e != nil {
+		return r, e
+	}
+	body, _ := io.ReadAll(resp.Body)
+	return &Result{Response: resp, Body: body, StatusCode: resp.StatusCode}, nil
+}
 
-	if clientProto == upstreamProto {
-		// Case 1/4: 协议一致，直接转发
-		if upstreamProto == provider.ProtocolAnthropic {
-			// Case 4: Anthropic → Anthropic
-			if req.IsStream {
-				resp, err := req.UpstreamTarget.Provider.SendDirect(
-					req.Ctx,
-					req.UpstreamTarget.Model,
-					req.AnthropicReq.Messages,
-					req.AnthropicReq.System,
-					req.ExtraParams,
-					true,
-				)
-				if r, e := handleProviderErr(err); r != nil || e != nil {
-					return r, e
-				}
-				return &Result{
-					Response:   resp,
-					StatusCode: resp.StatusCode,
-					StreamBody: resp.Body,
-				}, nil
-			}
-			resp, err := req.UpstreamTarget.Provider.SendDirect(
-				req.Ctx,
-				req.UpstreamTarget.Model,
-				req.AnthropicReq.Messages,
-				req.AnthropicReq.System,
-				req.ExtraParams,
-				false,
-			)
-			if r, e := handleProviderErr(err); r != nil || e != nil {
-				return r, e
-			}
-			body, _ := io.ReadAll(resp.Body)
-			return &Result{
-				Response:   resp,
-				Body:       body,
-				StatusCode: resp.StatusCode,
-			}, nil
-		}
-		// Case 1: OpenAI → OpenAI
-		if req.ChatReq == nil {
-			// Anthropic 客户端 → OpenAI 上游（非标准情况），使用 Chat
-			params := provider.ChatParams{
-				Temperature: req.AnthropicReq.Temperature,
-				TopP:        req.AnthropicReq.TopP,
-				MaxTokens:   req.AnthropicReq.MaxTokens,
-				ToolChoice:  provider.ConvertAnthropicToolChoiceToOpenAI(req.AnthropicReq.ToolChoice),
-			}
-			messages := toProviderMessagesFromMap(req.AnthropicReq.Messages)
-			tools := toolsFromAnthropicRequest(req.AnthropicReq.Tools)
-			if req.IsStream {
-				body, err := req.UpstreamTarget.Provider.StreamChat(req.Ctx, req.UpstreamTarget.Model, messages, tools, params)
-				if r, e := handleProviderErr(err); r != nil || e != nil {
-					return r, e
-				}
-				return &Result{
-					StatusCode: http.StatusOK,
-					StreamBody: body,
-				}, nil
-			}
-			messages = toProviderMessagesFromMap(req.AnthropicReq.Messages)
-			tools = toolsFromAnthropicRequest(req.AnthropicReq.Tools)
-			resp, err := req.UpstreamTarget.Provider.Chat(req.Ctx, req.UpstreamTarget.Model, messages, tools, params)
-			if r, e := handleProviderErr(err); r != nil || e != nil {
-				return r, e
-			}
-			body, _ := io.ReadAll(resp.Body)
-			return &Result{
-				Response:   resp,
-				Body:       body,
-				StatusCode: resp.StatusCode,
-			}, nil
-		}
-		// OpenAI 客户端 → OpenAI 上游
-		params := provider.ChatParams{
-			Temperature: req.ChatReq.Temperature,
-			TopP:        req.ChatReq.TopP,
-			MaxTokens:   req.ChatReq.MaxTokens,
-			ToolChoice:  req.ChatReq.ToolChoice,
-		}
-		if req.IsStream {
-			body, err := req.UpstreamTarget.Provider.StreamChat(
-				req.Ctx, req.UpstreamTarget.Model,
-				toProviderMessages(req.ChatReq.Messages),
-				toProviderTools(req.ChatReq.Tools),
-				params,
-			)
-			if r, e := handleProviderErr(err); r != nil || e != nil {
-				return r, e
-			}
-			return &Result{
-				StatusCode: http.StatusOK,
-				StreamBody: body,
-			}, nil
-		}
-		resp, err := req.UpstreamTarget.Provider.Chat(
+// resolveOpenAIChat 处理客户端与上游均为 OpenAI 的请求（Case 1）。
+func resolveOpenAIChat(req Request) (*Result, error) {
+	params := provider.ChatParams{
+		Temperature: req.ChatReq.Temperature,
+		TopP:        req.ChatReq.TopP,
+		MaxTokens:   req.ChatReq.MaxTokens,
+		ToolChoice:  req.ChatReq.ToolChoice,
+	}
+	if req.IsStream {
+		body, err := req.UpstreamTarget.Provider.StreamChat(
 			req.Ctx, req.UpstreamTarget.Model,
 			toProviderMessages(req.ChatReq.Messages),
 			toProviderTools(req.ChatReq.Tools),
@@ -175,67 +104,23 @@ func Resolve(req Request) (*Result, error) {
 		if r, e := handleProviderErr(err); r != nil || e != nil {
 			return r, e
 		}
-		body, _ := io.ReadAll(resp.Body)
-		return &Result{
-			Response:   resp,
-			Body:       body,
-			StatusCode: resp.StatusCode,
-		}, nil
+		return &Result{StatusCode: http.StatusOK, StreamBody: body}, nil
 	}
-
-	// clientProto != upstreamProto
-	if clientProto == provider.ProtocolOpenAI && upstreamProto == provider.ProtocolAnthropic {
-		// Case 2: OpenAI 客户端 → Anthropic 上游
-		params := provider.ChatParams{
-			Temperature: req.ChatReq.Temperature,
-			TopP:        req.ChatReq.TopP,
-			MaxTokens:   req.ChatReq.MaxTokens,
-			ToolChoice:  req.ChatReq.ToolChoice,
-		}
-		if req.IsStream {
-			body, err := req.UpstreamTarget.Provider.StreamChatWithProtocol(
-				req.Ctx, req.UpstreamTarget.Model,
-				toProviderMessages(req.ChatReq.Messages),
-				toProviderTools(req.ChatReq.Tools),
-				provider.ProtocolOpenAI,
-				params,
-			)
-			if r, e := handleProviderErr(err); r != nil || e != nil {
-				return r, e
-			}
-			return &Result{
-				StatusCode: http.StatusOK,
-				StreamBody: stream.NewOpenAIStreamConverter(body, req.VirtualModel, req.StreamHandler.IdleTimeout()),
-			}, nil
-		}
-		// 非流式：ChatWithProtocol 转换格式
-		resp, err := req.UpstreamTarget.Provider.ChatWithProtocol(
-			req.Ctx, req.UpstreamTarget.Model,
-			toProviderMessages(req.ChatReq.Messages),
-			toProviderTools(req.ChatReq.Tools),
-			provider.ProtocolOpenAI,
-			params,
-		)
-		if r, e := handleProviderErr(err); r != nil || e != nil {
-			return r, e
-		}
-		respBody, _ := io.ReadAll(resp.Body)
-		converted, convErr := req.UpstreamTarget.Provider.ConvertAnthropicToOpenAIResponse(respBody, req.VirtualModel)
-		if convErr == nil {
-			return &Result{
-				Response:   resp,
-				Body:       converted,
-				StatusCode: resp.StatusCode,
-			}, nil
-		}
-		return &Result{
-			Response:   resp,
-			Body:       respBody,
-			StatusCode: resp.StatusCode,
-		}, nil
+	resp, err := req.UpstreamTarget.Provider.Chat(
+		req.Ctx, req.UpstreamTarget.Model,
+		toProviderMessages(req.ChatReq.Messages),
+		toProviderTools(req.ChatReq.Tools),
+		params,
+	)
+	if r, e := handleProviderErr(err); r != nil || e != nil {
+		return r, e
 	}
+	body, _ := io.ReadAll(resp.Body)
+	return &Result{Response: resp, Body: body, StatusCode: resp.StatusCode}, nil
+}
 
-	// Case 3: Anthropic 客户端 → OpenAI 上游
+// resolveAnthropicToOpenAI 处理 Anthropic 客户端 → OpenAI 上游（Case 3，含非标准 Case 1 变体）。
+func resolveAnthropicToOpenAI(req Request) (*Result, error) {
 	params := provider.ChatParams{
 		Temperature: req.AnthropicReq.Temperature,
 		TopP:        req.AnthropicReq.TopP,
@@ -255,45 +140,108 @@ func Resolve(req Request) (*Result, error) {
 			StreamBody: stream.NewAnthropicSSEConverter(body, req.VirtualModel, req.StreamHandler.IdleTimeout()),
 		}, nil
 	}
-
-	// 非流式 Case 3
 	openAIMsgs, openAITools := req.UpstreamTarget.Provider.ConvertAnthropicMessagesToOpenAI(
 		req.AnthropicReq.Messages, req.AnthropicReq.System, req.AnthropicReq.Tools)
-
 	log.Debug().
 		Str("provider", req.UpstreamTarget.ProviderName).
 		Str("model", req.UpstreamTarget.Model).
 		Interface("messages", openAIMsgs).
 		Interface("tools", openAITools).
 		Msg("sending openai request to upstream")
-
 	resp, err := req.UpstreamTarget.Provider.Chat(
 		req.Ctx, req.UpstreamTarget.Model, openAIMsgs, openAITools, params)
 	if r, e := handleProviderErr(err); r != nil || e != nil {
 		return r, e
 	}
 	respBody, _ := io.ReadAll(resp.Body)
-
 	log.Debug().
 		Int("upstream_status", resp.StatusCode).
 		RawJSON("upstream_body", respBody).
 		Str("provider", req.UpstreamTarget.ProviderName).
 		Str("model", req.UpstreamTarget.Model).
 		Msg("openai upstream response (raw)")
-
 	converted, convErr := req.UpstreamTarget.Provider.ConvertOpenAIToAnthropicResponse(respBody, req.VirtualModel, 0)
 	if convErr == nil {
+		return &Result{Response: resp, Body: converted, StatusCode: resp.StatusCode}, nil
+	}
+	return &Result{Response: resp, Body: respBody, StatusCode: resp.StatusCode}, nil
+}
+
+// resolveOpenAIToAnthropic 处理 OpenAI 客户端 → Anthropic 上游（Case 2），需协议转换包装。
+func resolveOpenAIToAnthropic(req Request) (*Result, error) {
+	params := provider.ChatParams{
+		Temperature: req.ChatReq.Temperature,
+		TopP:        req.ChatReq.TopP,
+		MaxTokens:   req.ChatReq.MaxTokens,
+		ToolChoice:  req.ChatReq.ToolChoice,
+	}
+	if req.IsStream {
+		body, err := req.UpstreamTarget.Provider.StreamChatWithProtocol(
+			req.Ctx, req.UpstreamTarget.Model,
+			toProviderMessages(req.ChatReq.Messages),
+			toProviderTools(req.ChatReq.Tools),
+			provider.ProtocolOpenAI,
+			params,
+		)
+		if r, e := handleProviderErr(err); r != nil || e != nil {
+			return r, e
+		}
 		return &Result{
-			Response:   resp,
-			Body:       converted,
-			StatusCode: resp.StatusCode,
+			StatusCode: http.StatusOK,
+			StreamBody: stream.NewOpenAIStreamConverter(body, req.VirtualModel, req.StreamHandler.IdleTimeout()),
 		}, nil
 	}
-	return &Result{
-		Response:   resp,
-		Body:       respBody,
-		StatusCode: resp.StatusCode,
-	}, nil
+	resp, err := req.UpstreamTarget.Provider.ChatWithProtocol(
+		req.Ctx, req.UpstreamTarget.Model,
+		toProviderMessages(req.ChatReq.Messages),
+		toProviderTools(req.ChatReq.Tools),
+		provider.ProtocolOpenAI,
+		params,
+	)
+	if r, e := handleProviderErr(err); r != nil || e != nil {
+		return r, e
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	converted, convErr := req.UpstreamTarget.Provider.ConvertAnthropicToOpenAIResponse(respBody, req.VirtualModel)
+	if convErr == nil {
+		return &Result{Response: resp, Body: converted, StatusCode: resp.StatusCode}, nil
+	}
+	return &Result{Response: resp, Body: respBody, StatusCode: resp.StatusCode}, nil
+}
+
+// Resolve 根据客户端协议和上游协议的组合执行对应的 HTTP 请求和转换逻辑。
+// handler 侧负责重试循环（breaker 错误时 continue 重试下一个候选），
+// Resolve 侧负责协议判断、格式转换和 SSE 转换包装。
+func Resolve(req Request) (*Result, error) {
+	clientProto := req.ClientProtocol
+	upstreamProto := req.UpstreamTarget.Provider.GetProtocol()
+
+	log.Debug().
+		Str("provider", req.UpstreamTarget.ProviderName).
+		Str("upstream_model", req.UpstreamTarget.Model).
+		Str("upstream_url", req.UpstreamTarget.Provider.FullURL()).
+		Str("client_protocol", string(clientProto)).
+		Str("upstream_protocol", string(upstreamProto)).
+		Bool("stream", req.IsStream).
+		Msg("sending request to upstream")
+
+	// 协议一致：Case 4（Anthropic 直接转发）或 Case 1（OpenAI 直接转发）。
+	if clientProto == upstreamProto {
+		if upstreamProto == provider.ProtocolAnthropic {
+			return resolveSameProtocolCase4(req)
+		}
+		if req.ChatReq == nil {
+			// Anthropic 客户端 → OpenAI 上游（非标准组合），走 Case 3 转换路径。
+			return resolveAnthropicToOpenAI(req)
+		}
+		return resolveOpenAIChat(req)
+	}
+
+	// 协议不一致：Case 2（OpenAI 客户端 → Anthropic 上游）或 Case 3（Anthropic 客户端 → OpenAI 上游）。
+	if clientProto == provider.ProtocolOpenAI && upstreamProto == provider.ProtocolAnthropic {
+		return resolveOpenAIToAnthropic(req)
+	}
+	return resolveAnthropicToOpenAI(req)
 }
 
 // ==================== 辅助函数 ====================
