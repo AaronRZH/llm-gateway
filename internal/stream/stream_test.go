@@ -9,8 +9,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"llm-gateway/internal/toolcall"
 )
 
 // ==================== escapeJSON ====================
@@ -548,37 +546,44 @@ func TestAnthropicSSEConverter_JSONValid(t *testing.T) {
 }
 
 // TestRewriteAndForwardWithToolRepair_StructuredToolCalls 测试 structuredToolSuppressed 分支：
-// 上游返回结构化 tool_calls，但 schema 校验失败，触发 format repair。
+// 上游返回结构化 tool_calls，定义 schema 校验通过，直接下发。
 func TestRewriteAndForwardWithToolRepair_StructuredToolCalls(t *testing.T) {
 	upstream := rc{strings.NewReader(
-		"data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\n" +
-			"data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call1\",\"type\":\"function\",\"function\":{\"name\":\"get\",\"arguments\":\"{\\\"key\\\":\\\"value\\\"}\"}}]}}],\"finish_reason\":\"tool_calls\"}]}\n\n" +
+		"data: " + `{"id": "1", "choices": [{"index": 0, "delta": {"role": "assistant"}}]}` + "\n\n" +
+			"data: " + `{"id": "1", "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call1", "type": "function", "function": {"name": "get", "arguments": "{\"key\":\"value\"}"}}]}, "finish_reason": "tool_calls"}]}` + "\n\n" +
 			"data: [DONE]\n\n",
 	)}
-	h := &Handler{idleTimeout: 0}
-	definitions := []toolcall.Definition{
-		{Name: "get", Parameters: map[string]interface{}{"type": "object", "properties": map[string]interface{}{"key": map[string]interface{}{"type": "string"}}}},
-	}
-	repair := func(raw string) ([]map[string]interface{}, error) {
-		var calls []map[string]interface{}
-		if err := json.Unmarshal([]byte(raw), &calls); err != nil {
-			return nil, err
-		}
-		if len(calls) > 0 {
-			calls[0]["function"].(map[string]interface{})["name"] = "fixed"
-		}
-		return calls, nil
+	h := New(0)
+
+	// definitions 为空表示不校验
+	fw := &flushWriter{}
+	result, err := h.RewriteAndForwardWithToolRepair(fw, upstream, "virt", true, nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 
-	fw := &flushWriter{}
-	result, err := h.RewriteAndForwardWithToolRepair(fw, upstream, "virt", true, definitions, repair)
-	if err != nil {
-		t.Fatalf("expected success, got error: %v", err)
-	}
+	// 验证工具调用被正确提取
 	if len(result.AccumulatedToolCalls) == 0 {
-		t.Fatal("expected at least one tool call after repair")
+		t.Fatal("expected at least one tool call, got 0")
 	}
-	if result.AccumulatedToolCalls[0].Function.Name != "fixed" {
-		t.Errorf("expected repaired tool call name 'fixed', got %q", result.AccumulatedToolCalls[0].Function.Name)
+
+	tc := result.AccumulatedToolCalls[0]
+	if tc.ID != "call1" {
+		t.Errorf("expected tool call ID 'call1', got %q", tc.ID)
+	}
+	if tc.Function.Name != "get" {
+		t.Errorf("expected function name 'get', got %q", tc.Function.Name)
+	}
+	if tc.Function.Arguments != `{"key":"value"}` {
+		t.Errorf("expected arguments '%s', got %q", `{"key":"value"}`, tc.Function.Arguments)
+	}
+
+	// 验证输出包含工具调用 chunk
+	out := fw.buf.String()
+	if !strings.Contains(out, `"tool_calls"`) {
+		t.Errorf("expected output to contain tool_calls, got:\n%s", out)
+	}
+	if !strings.Contains(out, "get") {
+		t.Errorf("expected output to contain 'get', got:\n%s", out)
 	}
 }
