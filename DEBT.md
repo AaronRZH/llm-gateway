@@ -1,6 +1,6 @@
 # llm-gateway 技术债治理清单
 
-> **最后度量**: 2026-09-22（合并 refactor/openai-converter-events、refactor/stream-extract-postprocess，更新复杂度基线）  
+> **最后度量**: 2026-09-23（合并 refactor/resolve、refactor/content-to-blocks、refactor/validate-arguments、refactor/anthropic-handler，刷新复杂度基线）  
 > **适用范围**: 生产 Go 代码（排除 `*_test.go` 与 `.tmp/`）  
 > **治理原则**: 先锁定行为，再小步重构；优先级由业务风险、变更频率、测试保护和复杂度共同决定
 
@@ -34,7 +34,7 @@ go tool cover -func=coverage.out
 | 函数/方法数 | 354 |
 | 代码行 | 8586 |
 | 平均函数复杂度 | 4.96 |
-| 最大函数复杂度 | 48（两处并列） |
+| 最大函数复杂度 | 47（`handleChatCompletion`） |
 | 最大函数行数 | 346（`handleChatCompletion`） |
 | 测试文件数 | 18 |
 | 总语句覆盖率 | 39.8% |
@@ -43,13 +43,15 @@ go tool cover -func=coverage.out
 
 | 函数 | 位置 | 复杂度 | 行数 |
 |------|------|--------|------|
-| `handleAnthropicMessages` | `cmd/gateway/handlers.go` | 48 | 314 |
 | `handleChatCompletion` | `cmd/gateway/handlers.go` | 47 | 346 |
-| `Resolve` | `internal/protocol/protocol.go` | 36 | 259 |
+| `handleAnthropicMessages` | `cmd/gateway/handlers.go` | 42 | 288 |
 | `RewriteAndForwardWithToolRepair` | `internal/stream/stream.go` | 34 | 149 |
-| `OpenAIStreamConverter.convert` | `internal/stream/anthropic_sse.go` | 20 | 163 |
 | `AnthropicSSEConverter.convert` | `internal/stream/anthropic_sse.go` | 33 | 194 |
-| `ContentToBlocks` | `internal/provider/anthropic_converter.go` | 31 | 83 |
+| `ConvertAnthropicMessagesToOpenAI` | `internal/provider/anthropic_converter.go` | 23 | 100 |
+| `handleCountTokens` | `cmd/gateway/handlers.go` | 20 | 113 |
+| `Normalize` | `internal/toolcall/toolcall.go` | 20 | 92 |
+| `ConvertResponse` | `internal/provider/anthropic_converter.go` | 20 | 86 |
+| `OpenAIStreamConverter.convert` | `internal/stream/anthropic_sse.go` | 20 | 79 |
 
 重点包覆盖率：
 
@@ -132,7 +134,7 @@ P0 表示当前缺少足够回归保护，继续修改可能造成认证、协�
 
 - `handleChatCompletion`：C=47、346 行、函数覆盖率 0%。
 - `handleAnthropicMessages`：C=48、314 行、函数覆盖率 0%。
-- `protocol.Resolve`：C=36、259 行、函数覆盖率 0%。
+- `protocol.Resolve`：C=36、259 行、函数覆盖率 0%。**已完成（refactor/resolve）**：拆为薄分发器 + 4 个 case handler，C=36 → 10，覆盖率 0% → 88.5%。
 - 现有 `handlers_test.go` 主要覆盖工具调用辅助函数，没有锁定完整请求行为。
 
 **行动**
@@ -220,8 +222,8 @@ P0 表示当前缺少足够回归保护，继续修改可能造成认证、协�
 
 **现状**
 
-- `OpenAIStreamConverter.convert`：C=39、163 行，负责 Anthropic → OpenAI。
-- `AnthropicSSEConverter.convert`：C=33、194 行，负责 OpenAI → Anthropic。
+- `OpenAIStreamConverter.convert`：C=39、163 行，负责 Anthropic → OpenAI。**已完成（refactor/openai-converter-events）**：拆为 5 个事件处理器，C=39 → 20、163 → 79 行（详见 `b503f95`）。
+- `AnthropicSSEConverter.convert`：C=33、194 行，负责 OpenAI → Anthropic。**已完成（refactor/anthropic-sse-convert）**：拆为 4 个事件处理器 + 1 个 tool 状态结构体，C=33 → 19、194 → 92 行。
 - 两个方法同名，讨论和度量时必须带接收者名称。
 
 **行动**
