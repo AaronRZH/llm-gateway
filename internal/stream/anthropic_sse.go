@@ -106,6 +106,14 @@ func (c *AnthropicSSEConverter) Close() error {
 }
 
 // convert 在 goroutine 中运行，读取上游 OpenAI SSE 并转换为 Anthropic SSE
+// anthropicToolState 累积 tool_use 的跨迭代状态（原为 convert 内的局部变量）。
+type anthropicToolState struct {
+	id     string
+	name   string
+	input  strings.Builder
+	inTool bool
+}
+
 func (c *AnthropicSSEConverter) convert() {
 	defer c.pw.Close()
 	defer c.upstream.Close()
@@ -121,10 +129,7 @@ func (c *AnthropicSSEConverter) convert() {
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 
 	// 用于累积 tool_use 信息
-	var toolID string
-	var toolName string
-	var toolInputBuf strings.Builder
-	inTool := false
+	st := &anthropicToolState{}
 
 	for scanner.Scan() {
 		// 客户端断开（写失败）后及时退出，避免无谓读取上游
@@ -152,7 +157,7 @@ func (c *AnthropicSSEConverter) convert() {
 
 		// [DONE] 标记
 		if bytes.Equal(payload, []byte("[DONE]")) {
-			c.finish(true, inTool, toolID, toolName, toolInputBuf.String())
+			c.finish(true, st.inTool, st.id, st.name, st.input.String())
 			continue
 		}
 
@@ -170,124 +175,25 @@ func (c *AnthropicSSEConverter) convert() {
 		delta := choice.Delta
 
 		// === 处理 role 字段：message_start + content_block_start ===
-		if delta.Role == "assistant" && c.state == stateIdle {
-			c.state = stateStarted
-
-			// message_start
-			msgStart := map[string]interface{}{
-				"type": "message_start",
-				"message": map[string]interface{}{
-					"id":      "msg_" + uuid.New().String()[:12],
-					"type":    "message",
-					"role":    "assistant",
-					"content": []interface{}{},
-					"model":   c.model,
-				},
-			}
-			writeSSE(c.ew, msgStart)
-		}
+		c.handleRoleStart(delta.Role)
 
 		// === 处理 tool_calls ===
-		if len(delta.ToolCalls) > 0 {
-			for _, tc := range delta.ToolCalls {
-				idx, _ := tc["index"].(float64)
-				fnRaw, hasFn := tc["function"].(map[string]interface{})
-
-				if int(idx) == 0 && !inTool {
-					// 关闭 text content block（如果有）
-					if c.hasContent {
-						writeSSE(c.ew, map[string]interface{}{
-							"type":  "content_block_stop",
-							"index": 0,
-						})
-						c.hasContent = false
-					}
-
-					// 开始 tool_use content block
-					if id, ok := tc["id"].(string); ok {
-						toolID = id
-					} else {
-						toolID = "toolu_" + uuid.New().String()[:12]
-					}
-					if hasFn {
-						toolName, _ = fnRaw["name"].(string)
-					}
-					toolInputBuf.Reset()
-					inTool = true
-
-					c.state = stateTool
-					writeSSE(c.ew, map[string]interface{}{
-						"type":  "content_block_start",
-						"index": 1,
-						"content_block": map[string]interface{}{
-							"type":  "tool_use",
-							"id":    toolID,
-							"name":  toolName,
-							"input": map[string]interface{}{},
-						},
-					})
-				}
-
-				// tool_use input_json_delta
-				if hasFn {
-					if args, ok := fnRaw["arguments"].(string); ok {
-						toolInputBuf.WriteString(args)
-						writeSSE(c.ew, map[string]interface{}{
-							"type":  "content_block_delta",
-							"index": 1,
-							"delta": map[string]interface{}{
-								"type":         "input_json_delta",
-								"partial_json": args,
-							},
-						})
-					}
-				}
-			}
-
-			// 如果有 finish_reason，在 tool_calls 行处理结束
-			if choice.FinishReason != "" {
-				c.finishTool(inTool, toolID, toolName, toolInputBuf.String())
-				inTool = false
-				continue
-			}
+		// 返回 true 表示已在 tool_calls 分支内收尾（含 finish_reason），应跳过本 chunk 后续处理
+		if c.handleToolCalls(delta.ToolCalls, choice.FinishReason, st) {
+			continue
 		}
 
 		// === 处理 content delta ===
-		if delta.Content != "" {
-			if !c.hasContent {
-				c.hasContent = true
-				// content_block_start（text）
-				writeSSE(c.ew, map[string]interface{}{
-					"type":  "content_block_start",
-					"index": 0,
-					"content_block": map[string]interface{}{
-						"type": "text",
-						"text": "",
-					},
-				})
-			}
-
-			// content_block_delta（text_delta）
-			writeSSE(c.ew, map[string]interface{}{
-				"type":  "content_block_delta",
-				"index": 0,
-				"delta": map[string]interface{}{
-					"type": "text_delta",
-					"text": delta.Content,
-				},
-			})
-		}
+		c.handleContentDelta(delta.Content)
 
 		// === 处理 finish_reason ===
 		if choice.FinishReason != "" {
-			c.finish(c.hasContent || inTool, inTool, toolID, toolName, toolInputBuf.String())
+			c.finish(c.hasContent || st.inTool, st.inTool, st.id, st.name, st.input.String())
 		}
 
 		// === 处理 usage ===
-		if event.Usage != nil && !c.usageDone {
-			c.promptTokens = event.Usage.PromptTokens
-			c.completionTokens = event.Usage.CompletionTokens
-			c.usageDone = true
+		if event.Usage != nil {
+			c.handleUsage(event.Usage.PromptTokens, event.Usage.CompletionTokens)
 		}
 	}
 
@@ -297,8 +203,143 @@ func (c *AnthropicSSEConverter) convert() {
 
 	// 扫描结束，确保完成（异常结束时也会补发 message_delta + message_stop，避免客户端一直等待）
 	if c.state != stateDone {
-		c.finish(c.hasContent || inTool, inTool, toolID, toolName, toolInputBuf.String())
+		c.finish(c.hasContent || st.inTool, st.inTool, st.id, st.name, st.input.String())
 	}
+}
+
+// handleRoleStart 处理 delta.role == "assistant" 时的 message_start 事件。
+// 仅在 stateIdle 时发送一次，避免重复 message_start。
+func (c *AnthropicSSEConverter) handleRoleStart(role string) {
+	if role != "assistant" || c.state != stateIdle {
+		return
+	}
+	c.state = stateStarted
+
+	// message_start
+	msgStart := map[string]interface{}{
+		"type": "message_start",
+		"message": map[string]interface{}{
+			"id":      "msg_" + uuid.New().String()[:12],
+			"type":    "message",
+			"role":    "assistant",
+			"content": []interface{}{},
+			"model":   c.model,
+		},
+	}
+	writeSSE(c.ew, msgStart)
+}
+
+// handleToolCalls 处理 delta.tool_calls，累积 tool_use 状态并写出 content_block_start / input_json_delta。
+// 返回 true 表示本 chunk 已处理完（tool_calls 携带 finish_reason），调用方应 continue 跳过后续步骤。
+func (c *AnthropicSSEConverter) handleToolCalls(
+	toolCalls []map[string]interface{},
+	finishReason string,
+	st *anthropicToolState,
+) bool {
+	if len(toolCalls) == 0 {
+		return false
+	}
+	for _, tc := range toolCalls {
+		idx, _ := tc["index"].(float64)
+		fnRaw, hasFn := tc["function"].(map[string]interface{})
+
+		if int(idx) == 0 && !st.inTool {
+			// 关闭 text content block（如果有）
+			if c.hasContent {
+				writeSSE(c.ew, map[string]interface{}{
+					"type":  "content_block_stop",
+					"index": 0,
+				})
+				c.hasContent = false
+			}
+
+			// 开始 tool_use content block
+			if id, ok := tc["id"].(string); ok {
+				st.id = id
+			} else {
+				st.id = "toolu_" + uuid.New().String()[:12]
+			}
+			if hasFn {
+				st.name, _ = fnRaw["name"].(string)
+			}
+			st.input.Reset()
+			st.inTool = true
+
+			c.state = stateTool
+			writeSSE(c.ew, map[string]interface{}{
+				"type":  "content_block_start",
+				"index": 1,
+				"content_block": map[string]interface{}{
+					"type":  "tool_use",
+					"id":    st.id,
+					"name":  st.name,
+					"input": map[string]interface{}{},
+				},
+			})
+		}
+
+		// tool_use input_json_delta
+		if hasFn {
+			if args, ok := fnRaw["arguments"].(string); ok {
+				st.input.WriteString(args)
+				writeSSE(c.ew, map[string]interface{}{
+					"type":  "content_block_delta",
+					"index": 1,
+					"delta": map[string]interface{}{
+						"type":         "input_json_delta",
+						"partial_json": args,
+					},
+				})
+			}
+		}
+	}
+
+	// 如果有 finish_reason，在 tool_calls 行处理结束
+	if finishReason != "" {
+		c.finishTool(st.inTool, st.id, st.name, st.input.String())
+		st.inTool = false
+		return true
+	}
+	return false
+}
+
+// handleContentDelta 处理 delta.content，按需发送 text 的 content_block_start，再发送 text_delta。
+func (c *AnthropicSSEConverter) handleContentDelta(content string) {
+	if content == "" {
+		return
+	}
+	if !c.hasContent {
+		c.hasContent = true
+		// content_block_start（text）
+		writeSSE(c.ew, map[string]interface{}{
+			"type":  "content_block_start",
+			"index": 0,
+			"content_block": map[string]interface{}{
+				"type": "text",
+				"text": "",
+			},
+		})
+	}
+
+	// content_block_delta（text_delta）
+	writeSSE(c.ew, map[string]interface{}{
+		"type":  "content_block_delta",
+		"index": 0,
+		"delta": map[string]interface{}{
+			"type": "text_delta",
+			"text": content,
+		},
+	})
+}
+
+// handleUsage 记录上游返回的 usage（仅首次生效）。
+func (c *AnthropicSSEConverter) handleUsage(promptTokens, completionTokens int) {
+	if c.usageDone {
+		return
+	}
+	c.promptTokens = promptTokens
+	c.completionTokens = completionTokens
+	c.usageDone = true
 }
 
 // finish 关闭所有打开的 block，发送 message_delta 和 message_stop
