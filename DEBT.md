@@ -31,11 +31,11 @@ go tool cover -func=coverage.out
 | 指标 | 当前值 |
 |------|--------|
 | 生产 Go 文件数 | 28 |
-| 函数/方法数 | 388 |
-| 代码行 | 8563 |
-| 平均函数复杂度 | 4.52 |
-| 最大函数复杂度 | 28（`handleAnthropicMessages`） |
-| 最大函数行数 | 222（`handleAnthropicMessages`） |
+| 函数/方法数 | 393 |
+| 代码行 | 8613 |
+| 平均函数复杂度 | 4.48 |
+| 最大函数复杂度 | 25（`handleChatCompletion`） |
+| 最大函数行数 | 219（`handleChatCompletion`） |
 | 测试文件数 | 26 |
 | 总语句覆盖率 | 61.3% |
 
@@ -43,7 +43,6 @@ go tool cover -func=coverage.out
 
 | 函数 | 位置 | 复杂度 | 行数 |
 |------|------|--------|------|
-| `handleAnthropicMessages` | `cmd/gateway/handlers.go` | 28 | 222 |
 | `handleChatCompletion` | `cmd/gateway/handlers.go` | 25 | 219 |
 | `handleCountTokens` | `cmd/gateway/handlers.go` | 20 | 113 |
 | `Normalize` | `internal/toolcall/toolcall.go` | 20 | 92 |
@@ -52,8 +51,9 @@ go tool cover -func=coverage.out
 | `main` | `cmd/gateway/main.go` | 19 | 193 |
 | `AnthropicSSEConverter.convert` | `internal/stream/anthropic_sse.go` | 19 | 92 |
 | `ConvertResponseWithModel` | `internal/provider/anthropic_converter.go` | 19 | 80 |
+| `completeContentBlock` | `internal/provider/anthropic_converter.go` | 19 | 43 |
 
-> 复杂度基线已从阶段 1 的最高值 48 降至 28。`RewriteAndForwardWithToolRepair`（原 C=48）与 `ConvertAnthropicMessagesToOpenAI`（原 C=23）均已拆分，不再进入前 9 名。剩余热点集中在两个 handler 和 `internal/provider` 的 `ConvertResponse` 链路。
+> 复杂度基线已从阶段 1 的最高值 48 降至 25。`RewriteAndForwardWithToolRepair`（原 C=48）、`ConvertAnthropicMessagesToOpenAI`（原 C=23）与 `handleAnthropicMessages`（原 C=28）均已拆分，不再进入前 9 名。剩余热点集中在 `handleChatCompletion`（C=25）和 `internal/provider` 的 `ConvertResponse` 链路。
 
 重点包覆盖率：
 
@@ -119,6 +119,7 @@ go tool cover -func=coverage.out
 | `internal/provider`（`ConvertAnthropicMessagesToOpenAI`） | 拆为 4 个职责单一函数，新增 9 个 characterization tests | C=23 → 15（达成 ≤15 目标），覆盖率 0% → 100% |
 | `internal/storage`（`RedisStorage`） | 新增 9 个 tests（`miniredis` 驱动），修复 `summarizeRecordsByRealModel` 空指针 bug | 包 29.6% → 62.7%，`RedisStorage` 0% → 80% |
 | `internal/storage`（postgres 纯函数） | 新增 `postgres_test.go`（`buildDSN`、`parseTimeRange`、`FileStorage.compact`/`AdminDailyStats`） | `buildDSN` 0% → 100%，`parseTimeRange` 0% → 100%，`compact` 0% → 100% |
+| `cmd/gateway`（`handleAnthropicMessages`） | 拆为 4 个函数（`resolveAnthropicCandidate`、`forwardUpstreamErrorIfPresent`、`forwardStreamResponse`、`forwardNonStreamResponse`），8 个 characterization tests 保持通过 | C=28 → 15（达成 ≤15 目标），222 → 121 行 |
 
 **总语句覆盖率：56.3% → 61.3%**。
 
@@ -155,8 +156,8 @@ P0 表示当前缺少足够回归保护，继续修改可能造成认证、协�
 
 **现状**
 
-- `handleChatCompletion`：C=47、346 行、函数覆盖率 0%。
-- `handleAnthropicMessages`：C=48、314 行、函数覆盖率 0%。
+- `handleChatCompletion`：C=47、346 行、函数覆盖率 0%。**部分完成（阶段 2）**：降至 C=25、219 行，覆盖率 75%+；未达 ≤15 目标，见 3.1。
+- `handleAnthropicMessages`：C=48、314 行、函数覆盖率 0%。**已完成（阶段 2）**：拆为 4 个函数，C=28 → 15，222 → 121 行，8 个 characterization tests 全部通过；见 3.1。
 - `protocol.Resolve`：C=36、259 行、函数覆盖率 0%。**已完成（refactor/resolve）**：拆为薄分发器 + 4 个 case handler，C=36 → 10，覆盖率 0% → 88.5%。
 - 现有 `handlers_test.go` 主要覆盖工具调用辅助函数，没有锁定完整请求行为。
 
@@ -203,14 +204,15 @@ P0 表示当前缺少足够回归保护，继续修改可能造成认证、协�
 
 **现状**
 
-- 2130 LOC、63 个函数。
+- 2120 LOC、76 个函数。
 - 同时包含用户请求、协议适配、工具调用修复、用量统计和管理后台处理逻辑。
 - 主要风险不是单纯文件过长，而是核心请求编排与多种细节逻辑共同变化。
+- **进展**：`handleAnthropicMessages` 已降至 C=15、121 行（达成 ≤15 目标）；`handleChatCompletion` 仍为 C=25、219 行，未达标。
 
 **行动**
 
 - 将公开 API handler 与管理后台 handler 分文件组织；优先保持在同一 package 内，避免一次性改变 API 和依赖方向。
-- 将 `handleChatCompletion` 和 `handleAnthropicMessages` 拆成“解析与校验、路由与调用、响应与记账”三个阶段。
+- 将 `handleChatCompletion` 和 `handleAnthropicMessages` 拆成"解析与校验、路由与调用、响应与记账"三个阶段。
 - 复用 `internal/protocol`、`internal/stream`、`internal/toolcall` 已有职责，避免再创建一套转换逻辑。
 - 只有在依赖边界稳定后，再评估是否迁移到 `internal/handler` package。
 
