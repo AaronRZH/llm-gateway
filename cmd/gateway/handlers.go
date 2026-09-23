@@ -543,6 +543,55 @@ func handleCountTokens(mapper *mapper.Service, routerSvc *router.Service, provid
 	}
 }
 
+// buildAnthropicExtraParams 构建 Anthropic 请求的额外参数（Case 4 专用）。
+// 保持与原内层逻辑完全相同的语义：max_tokens 默认 4096，Temperature/TopP/StopSequences/Tools/ToolChoice 有条件添加。
+func buildAnthropicExtraParams(req protocol.AnthropicRequest) map[string]interface{} {
+	extraParams := map[string]interface{}{
+		"max_tokens": func() int {
+			if req.MaxTokens > 0 {
+				return req.MaxTokens
+			}
+			return 4096
+		}(),
+	}
+	if req.Temperature > 0 {
+		extraParams["temperature"] = req.Temperature
+	}
+	if req.TopP > 0 {
+		extraParams["top_p"] = req.TopP
+	}
+	if len(req.StopSequences) > 0 {
+		extraParams["stop_sequences"] = req.StopSequences
+	}
+	if len(req.Tools) > 0 {
+		extraParams["tools"] = req.Tools
+	}
+	if req.ToolChoice != nil {
+		extraParams["tool_choice"] = req.ToolChoice
+	}
+	return extraParams
+}
+
+// createProtocolRequest 创建 protocol.Request 参数对象，统一 breaker 内外调用。
+// 保持与原代码完全相同的字段填充逻辑。
+func createProtocolRequest(
+	clientProtocol provider.ClientProtocol,
+	target *router.Target,
+	req protocol.AnthropicRequest,
+	extraParams map[string]interface{},
+	reqCtx context.Context,
+) protocol.Request {
+	return protocol.Request{
+		ClientProtocol: clientProtocol,
+		UpstreamTarget: target,
+		AnthropicReq:   &req,
+		ExtraParams:    extraParams,
+		IsStream:       req.Stream,
+		Ctx:            reqCtx,
+		VirtualModel:   req.Model,
+	}
+}
+
 func handleAnthropicMessages(
 	mapper *mapper.Service,
 	routerSvc *router.Service,
@@ -621,29 +670,7 @@ func handleAnthropicMessages(
 			targetProvider = target.ProviderName
 
 			// 构建额外参数（Case 4 专用）
-			extraParams := map[string]interface{}{
-				"max_tokens": func() int {
-					if req.MaxTokens > 0 {
-						return req.MaxTokens
-					}
-					return 4096
-				}(),
-			}
-			if req.Temperature > 0 {
-				extraParams["temperature"] = req.Temperature
-			}
-			if req.TopP > 0 {
-				extraParams["top_p"] = req.TopP
-			}
-			if len(req.StopSequences) > 0 {
-				extraParams["stop_sequences"] = req.StopSequences
-			}
-			if len(req.Tools) > 0 {
-				extraParams["tools"] = req.Tools
-			}
-			if req.ToolChoice != nil {
-				extraParams["tool_choice"] = req.ToolChoice
-			}
+			extraParams := buildAnthropicExtraParams(req)
 
 			// 使用 target 的超时时间设置 context deadline（基于整体预算 reqCtx 派生）
 			var cancel context.CancelFunc
@@ -660,30 +687,26 @@ func handleAnthropicMessages(
 			var resolveErr error
 			if target.Breaker != nil {
 				result, breakerErr := target.Breaker.Execute(func() (interface{}, error) {
-					return protocol.Resolve(protocol.Request{
-						ClientProtocol: clientProtocol,
-						UpstreamTarget: target,
-						AnthropicReq:   &req,
-						ExtraParams:    extraParams,
-						IsStream:       req.Stream,
-						Ctx:            reqCtx,
-						VirtualModel:   req.Model,
-					})
+					return protocol.Resolve(createProtocolRequest(
+						clientProtocol,
+						target,
+						req,
+						extraParams,
+						reqCtx,
+					))
 				})
 				if result != nil {
 					res = result.(*protocol.Result)
 				}
 				resolveErr = breakerErr
 			} else {
-				res, resolveErr = protocol.Resolve(protocol.Request{
-					ClientProtocol: clientProtocol,
-					UpstreamTarget: target,
-					AnthropicReq:   &req,
-					ExtraParams:    extraParams,
-					IsStream:       req.Stream,
-					Ctx:            reqCtx,
-					VirtualModel:   req.Model,
-				})
+				res, resolveErr = protocol.Resolve(createProtocolRequest(
+					clientProtocol,
+					target,
+					req,
+					extraParams,
+					reqCtx,
+				))
 			}
 			if resolveErr != nil {
 				if resolveErr == gobreaker.ErrOpenState || resolveErr == gobreaker.ErrTooManyRequests {
