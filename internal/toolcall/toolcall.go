@@ -303,31 +303,40 @@ func validateArguments(args map[string]interface{}, schema any) error {
 		if expected == "" {
 			continue
 		}
-		valid := false
-		switch expected {
-		case "string":
-			_, valid = value.(string)
-		case "number":
-			_, valid = value.(float64)
-		case "integer":
-			n, numeric := value.(float64)
-			valid = numeric && n == float64(int64(n))
-		case "boolean":
-			_, valid = value.(bool)
-		case "object":
-			_, valid = value.(map[string]interface{})
-		case "array":
-			_, valid = value.([]interface{})
-		case "null":
-			valid = value == nil
-		default:
-			valid = true
-		}
-		if !valid {
+		if !validateType(expected, value) {
 			return fmt.Errorf("property %q must be %s", name, expected)
 		}
 	}
 	return nil
+}
+
+// validateType 校验单个属性值是否符合 schema 声明的类型。
+// 返回 true 表示类型匹配或未知类型（默认放行）。
+func validateType(expected string, value interface{}) bool {
+	switch expected {
+	case "string":
+		_, ok := value.(string)
+		return ok
+	case "number":
+		_, ok := value.(float64)
+		return ok
+	case "integer":
+		n, numeric := value.(float64)
+		return numeric && n == float64(int64(n))
+	case "boolean":
+		_, ok := value.(bool)
+		return ok
+	case "object":
+		_, ok := value.(map[string]interface{})
+		return ok
+	case "array":
+		_, ok := value.([]interface{})
+		return ok
+	case "null":
+		return value == nil
+	default:
+		return true
+	}
 }
 
 func extractPlainWrappers(text string) (string, []OpenAIToolCall) {
