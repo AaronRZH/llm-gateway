@@ -105,31 +105,7 @@ func handleChatCompletion(
 				// 通过 Breaker.Execute() 包裹，使熔断器可统计成功/失败并自动转换状态
 				var res *protocol.Result
 				var resolveErr error
-				if target.Breaker != nil {
-					result, breakerErr := target.Breaker.Execute(func() (interface{}, error) {
-						return protocol.Resolve(protocol.Request{
-							ClientProtocol: provider.ProtocolOpenAI,
-							UpstreamTarget: target,
-							ChatReq:        &req,
-							IsStream:       true,
-							Ctx:            reqCtx,
-							VirtualModel:   req.Model,
-						})
-					})
-					if result != nil {
-						res = result.(*protocol.Result)
-					}
-					resolveErr = breakerErr
-				} else {
-					res, resolveErr = protocol.Resolve(protocol.Request{
-						ClientProtocol: provider.ProtocolOpenAI,
-						UpstreamTarget: target,
-						ChatReq:        &req,
-						IsStream:       true,
-						Ctx:            reqCtx,
-						VirtualModel:   req.Model,
-					})
-				}
+				res, resolveErr = resolveWithBreaker(target, createOpenAIChatRequest(target, req, true, reqCtx))
 				if resolveErr != nil {
 					if resolveErr == gobreaker.ErrOpenState || resolveErr == gobreaker.ErrTooManyRequests {
 						log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
@@ -248,31 +224,7 @@ func handleChatCompletion(
 				// 通过 Breaker.Execute() 包裹，使熔断器可统计成功/失败并自动转换状态
 				var res *protocol.Result
 				var resolveErr error
-				if target.Breaker != nil {
-					result, breakerErr := target.Breaker.Execute(func() (interface{}, error) {
-						return protocol.Resolve(protocol.Request{
-							ClientProtocol: provider.ProtocolOpenAI,
-							UpstreamTarget: target,
-							ChatReq:        &req,
-							IsStream:       false,
-							Ctx:            reqCtx,
-							VirtualModel:   req.Model,
-						})
-					})
-					if result != nil {
-						res = result.(*protocol.Result)
-					}
-					resolveErr = breakerErr
-				} else {
-					res, resolveErr = protocol.Resolve(protocol.Request{
-						ClientProtocol: provider.ProtocolOpenAI,
-						UpstreamTarget: target,
-						ChatReq:        &req,
-						IsStream:       false,
-						Ctx:            reqCtx,
-						VirtualModel:   req.Model,
-					})
-				}
+				res, resolveErr = resolveWithBreaker(target, createOpenAIChatRequest(target, req, false, reqCtx))
 				if resolveErr != nil {
 					if resolveErr == gobreaker.ErrOpenState || resolveErr == gobreaker.ErrTooManyRequests {
 						log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
@@ -543,6 +495,42 @@ func handleCountTokens(mapper *mapper.Service, routerSvc *router.Service, provid
 	}
 }
 
+// createOpenAIChatRequest 创建 OpenAI 客户端路径的 protocol.Request 参数对象。
+// 保持与原代码完全相同的字段填充逻辑（ClientProtocol 固定 OpenAI，无 ExtraParams）。
+func createOpenAIChatRequest(
+	target *router.Target,
+	req protocol.ChatCompletionRequest,
+	isStream bool,
+	reqCtx context.Context,
+) protocol.Request {
+	return protocol.Request{
+		ClientProtocol: provider.ProtocolOpenAI,
+		UpstreamTarget: target,
+		ChatReq:        &req,
+		IsStream:       isStream,
+		Ctx:            reqCtx,
+		VirtualModel:   req.Model,
+	}
+}
+
+// resolveWithBreaker 通过熔断器包裹 protocol.Resolve，统一 breaker 启用/未启用两条路径。
+// 语义与内联写法完全一致：breaker 为 nil 时直接调用 Resolve；
+// 否则在 Breaker.Execute 内调用，并把结果做一次 *protocol.Result 类型断言。
+// breaker 拒绝（ErrOpenState / ErrTooManyRequests）同样通过 error 返回，由调用方决定重试。
+func resolveWithBreaker(target *router.Target, preq protocol.Request) (*protocol.Result, error) {
+	if target.Breaker == nil {
+		return protocol.Resolve(preq)
+	}
+	result, breakerErr := target.Breaker.Execute(func() (interface{}, error) {
+		return protocol.Resolve(preq)
+	})
+	var res *protocol.Result
+	if result != nil {
+		res = result.(*protocol.Result)
+	}
+	return res, breakerErr
+}
+
 // buildAnthropicExtraParams 构建 Anthropic 请求的额外参数（Case 4 专用）。
 // 保持与原内层逻辑完全相同的语义：max_tokens 默认 4096，Temperature/TopP/StopSequences/Tools/ToolChoice 有条件添加。
 func buildAnthropicExtraParams(req protocol.AnthropicRequest) map[string]interface{} {
@@ -685,29 +673,13 @@ func handleAnthropicMessages(
 			// 通过 Breaker.Execute() 包裹，使熔断器可统计成功/失败并自动转换状态
 			var res *protocol.Result
 			var resolveErr error
-			if target.Breaker != nil {
-				result, breakerErr := target.Breaker.Execute(func() (interface{}, error) {
-					return protocol.Resolve(createProtocolRequest(
-						clientProtocol,
-						target,
-						req,
-						extraParams,
-						reqCtx,
-					))
-				})
-				if result != nil {
-					res = result.(*protocol.Result)
-				}
-				resolveErr = breakerErr
-			} else {
-				res, resolveErr = protocol.Resolve(createProtocolRequest(
-					clientProtocol,
-					target,
-					req,
-					extraParams,
-					reqCtx,
-				))
-			}
+			res, resolveErr = resolveWithBreaker(target, createProtocolRequest(
+				clientProtocol,
+				target,
+				req,
+				extraParams,
+				reqCtx,
+			))
 			if resolveErr != nil {
 				if resolveErr == gobreaker.ErrOpenState || resolveErr == gobreaker.ErrTooManyRequests {
 					log.Debug().Str("provider", targetProvider).Msg("breaker rejected, trying next")
