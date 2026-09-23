@@ -31,6 +31,190 @@ import (
 	"llm-gateway/internal/toolcall"
 )
 
+// resolveOpenAICandidate 对单个候选执行 protocol.Resolve，并判定是否需要继续尝试下一个候选。
+// 返回 (结果, 更新后的 lastErr, 是否继续下一个候选)。
+//
+// 注意：本函数不创建也不取消 context。每候选的超时 context 仍由调用方派生并 defer cancel，
+// 以保持「cancel 在 handler 返回时才触发」的既有语义——流式响应依赖该 context 在整个
+// 转发期间存活，若在此处 defer 会提前取消并掐断流。
+func resolveOpenAICandidate(
+	log zerolog.Logger,
+	target *router.Target,
+	req protocol.ChatCompletionRequest,
+	reqCtx context.Context,
+	lastErr error,
+) (*protocol.Result, error, bool) {
+	res, resolveErr := resolveWithBreaker(target, createOpenAIChatRequest(target, req, req.Stream, reqCtx))
+	updatedLastErr, retryNext := classifyResolveError(log, resolveErr, target.ProviderName, "openai upstream request failed, trying next", lastErr)
+	if retryNext {
+		return nil, updatedLastErr, true
+	}
+	if isRateLimited(log, res, target.ProviderName, reqCtx) {
+		return nil, updatedLastErr, true
+	}
+	return res, updatedLastErr, false
+}
+
+// forwardOpenAIStreamResponse OpenAI 流式响应：使用 StreamBody（可能已包装 SSE converter），
+// 转发 SSE 数据流并统计真实 token 用量。
+func forwardOpenAIStreamResponse(
+	c *gin.Context,
+	log zerolog.Logger,
+	routerSvc *router.Service,
+	streamHandler *stream.Handler,
+	tokenService *token.Service,
+	res *protocol.Result,
+	target *router.Target,
+	req protocol.ChatCompletionRequest,
+	reqID, apiKey, upstreamModel, targetProvider string,
+	inputTokens int,
+	start time.Time,
+) {
+	if res.StreamBody == nil {
+		log.Error().Msg("stream body is nil after successful resolve")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "upstream returned empty stream"})
+		return
+	}
+	defer res.StreamBody.Close()
+
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+
+	// 记录延迟（在流开始后记录，而不是结束后）
+	if targetProvider != "" {
+		routerSvc.RecordLatency(targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
+	}
+
+	definitions := openAIToolDefinitions(req.Tools)
+	repair := func(raw string) ([]map[string]interface{}, error) {
+		return repairOpenAIToolCalls(c.Request.Context(), target, req, raw, streamHandler, definitions)
+	}
+	result, streamErr := streamHandler.RewriteAndForwardWithToolRepair(
+		c.Writer, res.StreamBody, req.Model, true, definitions, repair,
+	)
+	// 流异常结束（上游 stall / 超长）回报熔断，避免坏上游不被熔断；客户端断开不惩罚上游
+	if streamErr != nil && target.Breaker != nil {
+		target.Breaker.Execute(func() (interface{}, error) { return nil, streamErr })
+	}
+
+	// 估算输出 token（含 tool_calls）
+	estimatedOutput := tokenService.EstimateOutput(result.AccumulatedContent+result.AccumulatedReasoning, req.Model)
+	toolCalls := streamHandler.ExtractToolCalls(result)
+	estimatedToolCallsTokens := tokenService.EstimateToolCallsOutput(toolCalls, req.Model)
+	estimatedOutput += estimatedToolCallsTokens
+
+	// 记录用量：优先使用从 SSE 提取的真实 token 数，没有则使用本地估算值
+	var realInput, realOutput, realTotal int
+	if result.Usage != nil {
+		realInput = result.Usage.PromptTokens
+		realOutput = result.Usage.CompletionTokens
+		realTotal = result.Usage.TotalTokens
+	}
+	effInput, effOutput, effTotal := computeEffectiveUsage(realInput, realOutput, realTotal, inputTokens, estimatedOutput)
+	go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
+		inputTokens, estimatedOutput, estimatedToolCallsTokens, effInput, effOutput, effTotal, len(toolCalls), apiKey)
+}
+
+// forwardOpenAINonStreamResponse OpenAI 非流式响应：使用 Body（已在 Resolve 中读取并转换），
+// 修复工具调用格式后转发，并统计真实 token 用量。
+func forwardOpenAINonStreamResponse(
+	c *gin.Context,
+	log zerolog.Logger,
+	mapper *mapper.Service,
+	routerSvc *router.Service,
+	streamHandler *stream.Handler,
+	tokenService *token.Service,
+	res *protocol.Result,
+	target *router.Target,
+	req protocol.ChatCompletionRequest,
+	reqID, apiKey, upstreamModel, targetProvider string,
+	inputTokens int,
+	start time.Time,
+) {
+	if res.Response != nil {
+		defer res.Response.Body.Close()
+	}
+
+	body := res.Body
+
+	// 记录延迟
+	if targetProvider != "" {
+		routerSvc.RecordLatency(targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
+	}
+
+	// 解析上游返回的真实 usage，异步记录用量
+	realInput, realOutput, realTotal := parseUsage(body)
+	// 上游未返回 usage 时回退到本地估算，避免 token 统计漏记（与流式路径保持一致）
+	effInput, effOutput, effTotal := computeEffectiveUsage(realInput, realOutput, realTotal, inputTokens, len(body)/4)
+
+	// 重写响应中的 model 字段
+	body = mapper.RewriteResponse(body, req.Model)
+
+	// 将 tool_use 转换为 tool_calls 格式
+	body = rewriteAnthropicToolCalls(body, targetProvider)
+	definitions := openAIToolDefinitions(req.Tools)
+	var malformedRaw string
+	var toolErr error
+	body, malformedRaw, toolErr = rewriteXMLToolCallsChecked(body, definitions)
+	if toolErr != nil {
+		log.Warn().Err(toolErr).Int("malformed_length", len(malformedRaw)).Msg("repairing malformed non-stream tool call")
+		calls, repairErr := repairOpenAIToolCalls(c.Request.Context(), target, req, malformedRaw, streamHandler, definitions)
+		if repairErr != nil {
+			log.Error().Err(repairErr).Msg("tool-call format repair failed")
+			c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{
+				"type": "malformed_tool_call", "message": repairErr.Error(),
+			}})
+			return
+		}
+		body, toolErr = replaceOpenAIToolCalls(body, calls)
+		if toolErr != nil {
+			c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"type": "malformed_tool_call", "message": toolErr.Error()}})
+			return
+		}
+	}
+	go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
+		inputTokens, 0, 0, effInput, effOutput, effTotal, toolCallsCount(body), apiKey)
+	c.Data(res.StatusCode, "application/json", body)
+}
+
+// selectChatStreamCandidate 遍历候选，返回第一个成功的流式连接的 result。
+// 返回 (result, target, upstreamModel, targetProvider, start, lastErr)。
+// 若所有候选失败，result 为 nil，调用方应检查并返回错误。
+func selectChatStreamCandidate(
+	log zerolog.Logger,
+	sel *router.Selection,
+	req protocol.ChatCompletionRequest,
+	reqCtx context.Context,
+	cancelBudget context.CancelFunc,
+) (*protocol.Result, *router.Target, string, string, time.Time, error) {
+	var targetProvider string
+	var target *router.Target
+	var upstreamModel string
+	var start time.Time
+	var lastErr error
+	var res *protocol.Result
+
+	for target = sel.Next(); target != nil; target = sel.Next() {
+		upstreamModel = target.Model
+		targetProvider = target.ProviderName
+		start = time.Now()
+
+		var retryNext bool
+		res, lastErr, retryNext = resolveOpenAICandidate(log, target, req, reqCtx, lastErr)
+		if retryNext {
+			continue
+		}
+		// 流式连接已成功，释放整体预算，避免长连接被预算超时掐断
+		if cancelBudget != nil {
+			cancelBudget()
+		}
+		break
+	}
+
+	return res, target, upstreamModel, targetProvider, start, lastErr
+}
+
 func handleChatCompletion(
 	mapper *mapper.Service,
 	routerSvc *router.Service,
@@ -89,86 +273,23 @@ func handleChatCompletion(
 
 		if req.Stream {
 			// 流式响应 — 遍历候选直到连接成功
-			var upstream io.ReadCloser
-			var targetProvider string
-			var target *router.Target
-			var upstreamModel string
-			var start time.Time
+			res, target, upstreamModel, targetProvider, start, lastErr := selectChatStreamCandidate(
+				log, sel, req, reqCtx, cancelBudget,
+			)
 
-			var lastErr error
-			for target = sel.Next(); target != nil; target = sel.Next() {
-				upstreamModel = target.Model
-				targetProvider = target.ProviderName
-
-				start = time.Now()
-
-				// 协议处理：统一调用 protocol.Resolve 处理 4 种协议组合
-				// 通过 Breaker.Execute() 包裹，使熔断器可统计成功/失败并自动转换状态
-				var res *protocol.Result
-				var resolveErr error
-				res, resolveErr = resolveWithBreaker(target, createOpenAIChatRequest(target, req, true, reqCtx))
-				updatedLastErr, retryNext := classifyResolveError(log, resolveErr, targetProvider, "stream connect failed, trying next", lastErr)
-				lastErr = updatedLastErr
-				if retryNext {
-					continue
-				}
-				if isRateLimited(log, res, targetProvider, reqCtx) {
-					continue
-				}
-				upstream = res.StreamBody
-				// 流式连接已成功，释放整体预算，避免长连接被预算超时掐断
-				if cancelBudget != nil {
-					cancelBudget()
-				}
-				break
-			}
-
-			if upstream == nil {
+			if res == nil || res.StreamBody == nil {
 				handleAllCandidatesFailed(c, log, lastErr, "all upstream models failed for stream",
 					reqID, upstreamModel, req.Model, targetProvider, apiKey, inputTokens, tokenService)
 				return
 			}
 
-			defer upstream.Close()
-
-			c.Header("Content-Type", "text/event-stream")
-			c.Header("Cache-Control", "no-cache")
-			c.Header("Connection", "keep-alive")
-
-			// 记录首字节延迟（用于 latency_optimized 策略），在流开始前记录，与另一 handler 口径一致
-			if targetProvider != "" {
-				routerSvc.RecordLatency(targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
+			// 上游返回错误状态码时，直接转发错误 body
+			if forwardUpstreamErrorIfPresent(c, log, res, targetProvider) {
+				return
 			}
 
-			definitions := openAIToolDefinitions(req.Tools)
-			repair := func(raw string) ([]map[string]interface{}, error) {
-				return repairOpenAIToolCalls(c.Request.Context(), target, req, raw, streamHandler, definitions)
-			}
-			result, streamErr := streamHandler.RewriteAndForwardWithToolRepair(
-				c.Writer, upstream, req.Model, true, definitions, repair,
-			)
-			// 流异常结束（上游 stall / 超长）回报熔断，避免坏上游不被熔断；客户端断开不惩罚上游
-			if streamErr != nil && target.Breaker != nil {
-				target.Breaker.Execute(func() (interface{}, error) { return nil, streamErr })
-			}
-
-			// 5. 流式：根据累计内容估算输出 token，异步记录用量
-			estimatedOutput := tokenService.EstimateOutput(result.AccumulatedContent+result.AccumulatedReasoning, req.Model)
-			toolCalls := streamHandler.ExtractToolCalls(result)
-			// 补充 tool_calls 的 token 开销（JSON 包装 + arguments 文本）
-			estimatedToolCallsTokens := tokenService.EstimateToolCallsOutput(toolCalls, req.Model)
-			estimatedOutput += estimatedToolCallsTokens
-
-			// 优先使用从 SSE 提取的真实 token 数，没有则回退到本地估算值
-			var realInput, realOutput, realTotal int
-			if result.Usage != nil {
-				realInput = result.Usage.PromptTokens
-				realOutput = result.Usage.CompletionTokens
-				realTotal = result.Usage.TotalTokens
-			}
-			effInput, effOutput, effTotal := computeEffectiveUsage(realInput, realOutput, realTotal, inputTokens, estimatedOutput)
-			go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
-				inputTokens, estimatedOutput, estimatedToolCallsTokens, effInput, effOutput, effTotal, len(toolCalls), apiKey)
+			forwardOpenAIStreamResponse(c, log, routerSvc, streamHandler, tokenService, res, target, req,
+				reqID, apiKey, upstreamModel, targetProvider, inputTokens, start)
 
 		} else {
 			// 非流式响应 — 遍历候选直到请求成功
@@ -183,64 +304,20 @@ func handleChatCompletion(
 
 				start = time.Now()
 
-				// 协议处理：统一调用 protocol.Resolve 处理 4 种协议组合
-				// 通过 Breaker.Execute() 包裹，使熔断器可统计成功/失败并自动转换状态
+				var retryNext bool
 				var res *protocol.Result
-				var resolveErr error
-				res, resolveErr = resolveWithBreaker(target, createOpenAIChatRequest(target, req, false, reqCtx))
-				updatedLastErr, retryNext := classifyResolveError(log, resolveErr, targetProvider, "upstream request failed, trying next", lastErr)
-				lastErr = updatedLastErr
+				res, lastErr, retryNext = resolveOpenAICandidate(log, target, req, reqCtx, lastErr)
 				if retryNext {
 					continue
 				}
-				if isRateLimited(log, res, targetProvider, reqCtx) {
-					continue
-				}
-				// Body 已在 protocol.Resolve 中读取并转换，直接使用
-				if res.Response != nil {
-					defer res.Response.Body.Close()
+
+				// 上游返回错误状态码时，直接转发错误 body
+				if forwardUpstreamErrorIfPresent(c, log, res, targetProvider) {
+					return
 				}
 
-				body := res.Body
-
-				// 记录延迟（用于 latency_optimized 策略）
-				if targetProvider != "" {
-					routerSvc.RecordLatency(targetProvider, upstreamModel, float64(time.Since(start).Milliseconds()))
-				}
-
-				// 5. 解析上游返回的真实 usage，异步记录用量
-				realInput, realOutput, realTotal := parseUsage(body)
-				// 上游未返回 usage 时回退到本地估算，避免 token 统计漏记（与流式路径保持一致）
-				effInput, effOutput, effTotal := computeEffectiveUsage(realInput, realOutput, realTotal, inputTokens, len(body)/4)
-
-				// 重写响应中的 model 字段
-				body = mapper.RewriteResponse(body, req.Model)
-
-				// 6. 将 Anthropic tool_use 转换为 OpenAI tool_calls 格式
-				body = rewriteAnthropicToolCalls(body, targetProvider)
-				definitions := openAIToolDefinitions(req.Tools)
-				var malformedRaw string
-				var toolErr error
-				body, malformedRaw, toolErr = rewriteXMLToolCallsChecked(body, definitions)
-				if toolErr != nil {
-					log.Warn().Err(toolErr).Int("malformed_length", len(malformedRaw)).Msg("repairing malformed non-stream tool call")
-					calls, repairErr := repairOpenAIToolCalls(reqCtx, target, req, malformedRaw, streamHandler, definitions)
-					if repairErr != nil {
-						log.Error().Err(repairErr).Msg("tool-call format repair failed")
-						c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{
-							"type": "malformed_tool_call", "message": repairErr.Error(),
-						}})
-						return
-					}
-					body, toolErr = replaceOpenAIToolCalls(body, calls)
-					if toolErr != nil {
-						c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"type": "malformed_tool_call", "message": toolErr.Error()}})
-						return
-					}
-				}
-				go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
-					inputTokens, 0, 0, effInput, effOutput, effTotal, toolCallsCount(body), apiKey)
-				c.Data(res.StatusCode, "application/json", body)
+				forwardOpenAINonStreamResponse(c, log, mapper, routerSvc, streamHandler, tokenService, res, target, req,
+					reqID, apiKey, upstreamModel, targetProvider, inputTokens, start)
 				return
 			}
 
