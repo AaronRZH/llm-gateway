@@ -182,3 +182,171 @@ func TestContentToBlocks_SingleMapNoType(t *testing.T) {
 		t.Errorf("map without type should not have type added, got: %v", result[0])
 	}
 }
+
+// ==================== ConvertAnthropicMessagesToOpenAI ====================
+
+func TestConvertAnthropicMessages_SystemString(t *testing.T) {
+	c := &AnthropicConverter{}
+	messages := []map[string]interface{}{
+		{"role": "user", "content": "hello"},
+	}
+	tools := []map[string]interface{}{}
+
+	result, _ := c.ConvertAnthropicMessagesToOpenAI(messages, "You are helpful.", tools)
+
+	if len(result) != 2 {
+		t.Fatalf("expected 2 messages (system + user), got %d", len(result))
+	}
+	if result[0].Role != "system" || result[0].Content != "You are helpful." {
+		t.Errorf("system message incorrect: %+v", result[0])
+	}
+	if result[1].Role != "user" || result[1].Content != "hello" {
+		t.Errorf("user message incorrect: %+v", result[1])
+	}
+}
+
+func TestConvertAnthropicMessages_SystemBlocks(t *testing.T) {
+	c := &AnthropicConverter{}
+	system := []interface{}{
+		map[string]interface{}{"type": "text", "text": "Be concise."},
+		map[string]interface{}{"type": "text", "text": "Be kind."},
+	}
+	messages := []map[string]interface{}{{"role": "user", "content": "hi"}}
+
+	result, _ := c.ConvertAnthropicMessagesToOpenAI(messages, system, []map[string]interface{}{})
+	if result[0].Content != "Be concise.Be kind." {
+		t.Errorf("expected concatenated text, got %q", result[0].Content)
+	}
+}
+
+func TestConvertAnthropicMessages_NilSystemAndSystemRole(t *testing.T) {
+	c := &AnthropicConverter{}
+	messages := []map[string]interface{}{
+		{"role": "system", "content": "inline system"},
+		{"role": "user", "content": "hi"},
+	}
+	result, _ := c.ConvertAnthropicMessagesToOpenAI(messages, nil, []map[string]interface{}{})
+	// 实现用 "\n\n" 分隔 system 块，无显式 system 时会留下前导空行 —— 锁定现状。
+	if result[0].Role != "system" || result[0].Content != "\n\ninline system" {
+		t.Errorf("system not prepended correctly: %+v", result[0])
+	}
+	if len(result) != 2 {
+		t.Errorf("expected 2 messages, got %d", len(result))
+	}
+}
+
+func TestConvertAnthropicMessages_AssistantToolUse(t *testing.T) {
+	c := &AnthropicConverter{}
+	messages := []map[string]interface{}{
+		{
+			"role": "assistant",
+			"content": []interface{}{
+				map[string]interface{}{"type": "text", "text": "checking"},
+				map[string]interface{}{"type": "tool_use", "id": "tu1", "name": "get_time", "input": map[string]interface{}{"tz": "Asia/Shanghai"}},
+			},
+		},
+	}
+	result, _ := c.ConvertAnthropicMessagesToOpenAI(messages, nil, []map[string]interface{}{})
+	if len(result) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(result))
+	}
+	if result[0].Content != "checking" {
+		t.Errorf("content = %q", result[0].Content)
+	}
+	if len(result[0].ToolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(result[0].ToolCalls))
+	}
+	fn := result[0].ToolCalls[0]["function"].(map[string]interface{})
+	if fn["name"] != "get_time" {
+		t.Errorf("tool name = %v", fn["name"])
+	}
+}
+
+func TestConvertAnthropicMessages_ToolResult(t *testing.T) {
+	c := &AnthropicConverter{}
+	messages := []map[string]interface{}{
+		{
+			"role": "user",
+			"content": []interface{}{
+				map[string]interface{}{"type": "tool_result", "tool_use_id": "tu1", "content": "14:30"},
+			},
+		},
+	}
+	result, _ := c.ConvertAnthropicMessagesToOpenAI(messages, nil, []map[string]interface{}{})
+	if len(result) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(result))
+	}
+	if result[0].Role != "tool" || result[0].Content != "14:30" || result[0].ToolCallID != "tu1" {
+		t.Errorf("tool message incorrect: %+v", result[0])
+	}
+}
+
+func TestConvertAnthropicMessages_ToolResultPlusText(t *testing.T) {
+	c := &AnthropicConverter{}
+	messages := []map[string]interface{}{
+		{
+			"role": "user",
+			"content": []interface{}{
+				map[string]interface{}{"type": "tool_result", "tool_use_id": "tu1", "content": "ok"},
+				map[string]interface{}{"type": "text", "text": "thanks"},
+			},
+		},
+	}
+	result, _ := c.ConvertAnthropicMessagesToOpenAI(messages, nil, []map[string]interface{}{})
+	if len(result) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(result))
+	}
+	if result[0].Role != "tool" || result[1].Role != "user" || result[1].Content != "thanks" {
+		t.Errorf("messages incorrect: %+v / %+v", result[0], result[1])
+	}
+}
+
+func TestConvertAnthropicMessages_EmptyAssistantSkipped(t *testing.T) {
+	c := &AnthropicConverter{}
+	messages := []map[string]interface{}{
+		{"role": "assistant", "content": ""},
+		{"role": "user", "content": "hi"},
+	}
+	result, _ := c.ConvertAnthropicMessagesToOpenAI(messages, nil, []map[string]interface{}{})
+	if len(result) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(result))
+	}
+	if result[0].Role != "user" {
+		t.Errorf("expected user message, got %+v", result[0])
+	}
+}
+
+func TestConvertAnthropicMessages_IgnoreUnknownRole(t *testing.T) {
+	c := &AnthropicConverter{}
+	messages := []map[string]interface{}{
+		{"role": "developer", "content": "ignored"},
+		{"role": "user", "content": "hi"},
+	}
+	result, _ := c.ConvertAnthropicMessagesToOpenAI(messages, nil, []map[string]interface{}{})
+	if len(result) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(result))
+	}
+	if result[0].Content != "hi" {
+		t.Errorf("got %+v", result[0])
+	}
+}
+
+func TestConvertAnthropicMessages_ToolsConversion(t *testing.T) {
+	c := &AnthropicConverter{}
+	tools := []map[string]interface{}{
+		{"name": "get_time", "description": "get current time", "input_schema": map[string]interface{}{"type": "object"}},
+	}
+	result, toolsOut := c.ConvertAnthropicMessagesToOpenAI([]map[string]interface{}{}, nil, tools)
+	if len(result) != 0 {
+		t.Errorf("expected no messages, got %d", len(result))
+	}
+	if len(toolsOut) != 1 {
+		t.Fatalf("expected 1 tool, got %d", len(toolsOut))
+	}
+	if toolsOut[0].Type != "function" || toolsOut[0].Function.Name != "get_time" {
+		t.Errorf("tool incorrect: %+v", toolsOut[0])
+	}
+	if toolsOut[0].Function.Parameters.(map[string]interface{})["type"] != "object" {
+		t.Errorf("parameters incorrect: %+v", toolsOut[0].Function.Parameters)
+	}
+}

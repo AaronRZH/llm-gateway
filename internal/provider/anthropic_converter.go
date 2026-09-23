@@ -482,28 +482,51 @@ func (c *AnthropicConverter) ConvertAnthropicMessagesToOpenAI(
 	system interface{},
 	tools []map[string]interface{},
 ) ([]Message, []Tool) {
-	var result []Message
-
 	// 1. system → 第一条 system message
-	var systemContent string
-	if system != nil {
-		switch v := system.(type) {
-		case string:
-			systemContent = v
-		case []interface{}:
-			for _, block := range v {
-				if b, ok := block.(map[string]interface{}); ok {
-					if b["type"] == "text" {
-						if t, ok := b["text"].(string); ok {
-							systemContent += t
-						}
+	systemContent := c.flattenSystemContent(system)
+
+	// 2. messages: content blocks → OpenAI 格式
+	result := c.convertAnthropicMessages(messages, systemContent)
+
+	// 3. tools: Anthropic → OpenAI 格式
+	return result, c.convertAnthropicTools(tools)
+}
+
+// flattenSystemContent 展平 Anthropic 的 system 参数为纯文本。
+// Anthropic 允许 system 为字符串或 content block 数组（仅取 type=="text" 的块）。
+// 无 text 块时返回空串，由调用方决定是否插入 system 消息。
+func (c *AnthropicConverter) flattenSystemContent(system interface{}) string {
+	switch v := system.(type) {
+	case string:
+		return v
+	case []interface{}:
+		var parts []string
+		for _, block := range v {
+			if b, ok := block.(map[string]interface{}); ok {
+				if b["type"] == "text" {
+					if t, ok := b["text"].(string); ok {
+						parts = append(parts, t)
 					}
 				}
 			}
 		}
+		return strings.Join(parts, "")
+	default:
+		return ""
 	}
+}
 
-	// 2. messages: content blocks → OpenAI 格式
+// convertAnthropicMessages 将 Anthropic 消息列表转换为 OpenAI 消息列表。
+// 规则：
+//   - role=="system" 的块追加进 systemContent（前置两字符空白分隔，保持既有行为）
+//   - 未知 role 跳过
+//   - assistant + tool_use → 单条带 ToolCalls 的 assistant 消息
+//   - user + tool_result → 每条 tool_result 变一条 role:"tool"，尾部文本补一条 user
+//   - 纯文本空 assistant 跳过；其余透传
+//   - 合并后的 systemContent 若非空，插到最前面
+func (c *AnthropicConverter) convertAnthropicMessages(messages []map[string]interface{}, systemContent string) []Message {
+	var result []Message
+
 	for _, msg := range messages {
 		role, _ := msg["role"].(string)
 
@@ -532,13 +555,7 @@ func (c *AnthropicConverter) ConvertAnthropicMessagesToOpenAI(
 		case role == "user" && len(toolResults) > 0:
 			// user 消息带有 tool_result → 每个转为一条 role:"tool" 消息
 			for _, tr := range toolResults {
-				toolCallID, _ := tr["tool_call_id"].(string)
-				content, _ := tr["content"].(string)
-				result = append(result, Message{
-					Role:       "tool",
-					Content:    content,
-					ToolCallID: toolCallID,
-				})
+				result = append(result, c.buildOpenAIToolResult(tr))
 			}
 			// 如果同时还有文本内容，追加一条 user 消息
 			if textContent != "" {
@@ -558,8 +575,22 @@ func (c *AnthropicConverter) ConvertAnthropicMessagesToOpenAI(
 	if systemContent != "" {
 		result = append([]Message{{Role: "system", Content: systemContent}}, result...)
 	}
+	return result
+}
 
-	// 3. tools: Anthropic → OpenAI 格式
+// buildOpenAIToolResult 将 Anthropic 的 tool_result block 转为 OpenAI 的 role:"tool" 消息。
+func (c *AnthropicConverter) buildOpenAIToolResult(tr map[string]interface{}) Message {
+	toolCallID, _ := tr["tool_call_id"].(string)
+	content, _ := tr["content"].(string)
+	return Message{
+		Role:       "tool",
+		Content:    content,
+		ToolCallID: toolCallID,
+	}
+}
+
+// convertAnthropicTools 将 Anthropic 工具定义转为 OpenAI 格式。
+func (c *AnthropicConverter) convertAnthropicTools(tools []map[string]interface{}) []Tool {
 	var openAITools []Tool
 	for _, t := range tools {
 		name, _ := t["name"].(string)
@@ -574,8 +605,7 @@ func (c *AnthropicConverter) ConvertAnthropicMessagesToOpenAI(
 			},
 		})
 	}
-
-	return result, openAITools
+	return openAITools
 }
 
 // FlattenContent 将 Anthropic content blocks 展平为字符串
