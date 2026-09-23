@@ -1,6 +1,6 @@
 # llm-gateway 技术债治理清单
 
-> **最后度量**: 2026-09-23（合并 PR #7-#12，刷新复杂度基线）  
+> **最后度量**: 2026-09-23（合并 PR #7-#14，刷新复杂度基线）  
 > **适用范围**: 生产 Go 代码（排除 `*_test.go` 与 `.tmp/`）  
 > **治理原则**: 先锁定行为，再小步重构；优先级由业务风险、变更频率、测试保护和复杂度共同决定
 
@@ -32,12 +32,12 @@ go tool cover -func=coverage.out
 |------|--------|
 | 生产 Go 文件数 | 28 |
 | 函数/方法数 | 388 |
-| 代码行 | 8562 |
+| 代码行 | 8563 |
 | 平均函数复杂度 | 4.52 |
 | 最大函数复杂度 | 28（`handleAnthropicMessages`） |
 | 最大函数行数 | 222（`handleAnthropicMessages`） |
-| 测试文件数 | 25 |
-| 总语句覆盖率 | 56.3% |
+| 测试文件数 | 26 |
+| 总语句覆盖率 | 61.3% |
 
 复杂度最高的函数：
 
@@ -63,7 +63,7 @@ go tool cover -func=coverage.out
 | `internal/auth` | 98.0% | 已建立完整测试（种子 Key、缓存、Redis 回退） |
 | `internal/protocol` | 88.5% | `Resolve` 拆分后覆盖 97.6% |
 | `internal/provider` | 56.1% | 转换主路径覆盖提升，`ConvertAnthropicMessagesToOpenAI` 达成 100% |
-| `internal/storage` | 29.6% | 文件后端覆盖较好，Redis/PostgreSQL 路径不足 |
+| `internal/storage` | 62.7% | RedisStorage 补充测试 + postgres 纯函数测试，`RedisStorage` 0% → 80%，`postgres.go` 0% → 60% |
 | `internal/stream` | 81.4% | 已有流式和工具调用修复测试 |
 | `internal/middleware` | 93.7% | `AdminAuth` 已有 JWT、Basic Auth 等测试 |
 | `internal/health` | 100.0% | 已补全测试 |
@@ -91,7 +91,7 @@ go tool cover -func=coverage.out
 | `internal/stream` | `stream_test.go`（新增 chunk JSON 合法性校验） | 包 76.5% → 80.1% |
 | `internal/provider`（`ConvertAnthropicMessagesToOpenAI`） | `anthropic_converter_test.go`（新增 9 个 tests） | 包 43.7% → 56.1%，`ConvertAnthropicMessagesToOpenAI` 0% → 100% |
 
-**总语句覆盖率：39.8% → 56.3%**。
+**总语句覆盖率：39.8% → 56.3%**（阶段 1 完成时）。
 
 验证命令（全部通过）：`go test ./...`、`go test -race ./...`、`go vet ./...`。
 
@@ -109,6 +109,20 @@ go tool cover -func=coverage.out
 3. **新发现（本阶段审核，已修复）**：`internal/stream/anthropic_sse.go` 的 `OpenAIStreamConverter.writeChunkPlain` 生成不合法 JSON。模板为 `..."choices":[{"index":0,` + jsonBody + `}]}`，而 7 个调用方返回的 `jsonBody` 形如 `{"delta":...}` 等，拼接结果 `{"index":0,{"delta":...}}` 缺少 `"delta":` 键（`{"index":0,{` 两个相邻 `{` 中间无逗号，不合法）。**影响范围**：`OpenAIStreamConverter` 生成的所有 chunk——`writeDelta`、`writeTextDelta`、`writeToolStart`、`writeToolArgsDelta`、`writeToolFinal`、`writeTextFinal`、`writeUsage` 全部受影响，文本路径与工具路径都产出损坏输出。导致 **Case 2（Anthropic 上游 → OpenAI 客户端）的流式 SSE chunk 全部为非法 JSON**，OpenAI 客户端无法解析。该缺陷自 `36b7864 unified provider sse reverse` 引入，现有 `internal/stream` 测试只做子串匹配、无 `json.Valid` 校验因而未暴露。**已在本阶段修复**：模板改为 `"choices":[{"index":0,` + `jsonBody[1:]` + `]}`——剥离 jsonBody 首个 `{`，由 jsonBody 自带的尾部 `}` 闭合 choice 对象。回归测试见 `TestOpenAIStreamConverter_AllChunkJSONValid`（覆盖 text 与 tool 两条路径）及 `resolve_test.go` 的 `assertSSEJSONValid`。
 
    注：本缺陷的首版记录错误地排除了 `writeToolStart`/`writeToolFinal`，经实测验证二者同样受影响，已更正。
+
+### 1.4 治理进展（阶段 2 / P1 复杂度降低与缺陷修复）
+
+> 最近更新：2026-09-23。本小节记录阶段 1 完成后的增量变更，1.3 保留为阶段 1 快照。
+
+| 范围 | 完成方式 | 结果 |
+|------|----------|------|
+| `internal/provider`（`ConvertAnthropicMessagesToOpenAI`） | 拆为 4 个职责单一函数，新增 9 个 characterization tests | C=23 → 15（达成 ≤15 目标），覆盖率 0% → 100% |
+| `internal/storage`（`RedisStorage`） | 新增 9 个 tests（`miniredis` 驱动），修复 `summarizeRecordsByRealModel` 空指针 bug | 包 29.6% → 62.7%，`RedisStorage` 0% → 80% |
+| `internal/storage`（postgres 纯函数） | 新增 `postgres_test.go`（`buildDSN`、`parseTimeRange`、`FileStorage.compact`/`AdminDailyStats`） | `buildDSN` 0% → 100%，`parseTimeRange` 0% → 100%，`compact` 0% → 100% |
+
+**总语句覆盖率：56.3% → 61.3%**。
+
+**新发现的缺陷（已修复）**：`RedisStorage.summarizeRecordsByRealModel` 创建 bucket 后未把指针赋给循环变量 `b`，首条记录即触发 nil pointer panic。同文件其他三个分桶方法（`summarizeRecordsDaily/Weekly/Monthly`）均有 `b = buckets[key]`，唯独此处缺失——典型的复制粘贴遗留 bug。
 
 ---
 
@@ -275,10 +289,10 @@ P0 表示当前缺少足够回归保护，继续修改可能造成认证、协�
 
 ### 4.1 `internal/storage`：优先验证后端一致性
 
-**现状**
+**现状（进展中）**
 
-- `usage.go`：724 LOC、43 个函数，平均复杂度约 3.79；`filter` 为 C=12、25 行，不是当前主要复杂度热点。
-- 文件存储已有较完整测试；Redis 和 PostgreSQL 路径覆盖不足。
+- 覆盖率已从 29.6% 提升至 62.7%（目标 70%）：RedisStorage 补充测试（`miniredis` 驱动），postgres 纯函数补测，`FileStorage.compact`/`AdminDailyStats` 补齐。
+- 剩余缺口集中在 `PostgresStorage` 的数据库交互方法（`Persist`、`queryRecords`、`aggregateByTimeUnit` 等 21 个函数均为 0%），需要真实 PostgreSQL 或 mock。
 - 存储逻辑会影响计费与统计准确性，风险主要来自不同后端行为不一致。
 
 **行动**
@@ -293,6 +307,7 @@ P0 表示当前缺少足够回归保护，继续修改可能造成认证、协�
 - 各存储实现通过同一组契约测试。
 - 核心统计结果在不同后端保持一致。
 - `internal/storage` 覆盖率达到 70% 以上，并明确未覆盖的外部集成路径。
+- **当前进度**：62.7% / 70%。`FileStorage` 与 `RedisStorage` 已接近全覆盖；剩余缺口为 `PostgresStorage` 的数据库交互路径，需引入测试容器或 pgx mock。
 
 ### 4.2 `cmd/gateway/main.go`：启动流程难测试
 
