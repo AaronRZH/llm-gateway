@@ -134,7 +134,7 @@ P0 表示当前缺少足够回归保护，继续修改可能造成认证、协�
 
 - `handleChatCompletion`：C=47、346 行、函数覆盖率 0%。
 - `handleAnthropicMessages`：C=48、314 行、函数覆盖率 0%。
-- `protocol.Resolve`：C=36、259 行、函数覆盖率 0%。
+- `protocol.Resolve`：C=36、259 行、函数覆盖率 0%。**已完成（refactor/resolve）**：拆为薄分发器 + 4 个 case handler，C=36 → 10，覆盖率 0% → 88.5%。
 - 现有 `handlers_test.go` 主要覆盖工具调用辅助函数，没有锁定完整请求行为。
 
 **行动**
@@ -222,8 +222,8 @@ P0 表示当前缺少足够回归保护，继续修改可能造成认证、协�
 
 **现状**
 
-- `OpenAIStreamConverter.convert`：C=39、163 行，负责 Anthropic → OpenAI。
-- `AnthropicSSEConverter.convert`：C=33、194 行，负责 OpenAI → Anthropic。
+- `OpenAIStreamConverter.convert`：C=39、163 行，负责 Anthropic → OpenAI。**已完成（refactor/openai-converter-events）**：拆为 5 个事件处理器，C=39 → 20、163 → 79 行（详见 `b503f95`）。
+- `AnthropicSSEConverter.convert`：C=33、194 行，负责 OpenAI → Anthropic。**已完成（refactor/anthropic-sse-convert）**：拆为 4 个事件处理器 + 1 个 tool 状态结构体，C=33 → 19、194 → 92 行。
 - 两个方法同名，讨论和度量时必须带接收者名称。
 
 **行动**
