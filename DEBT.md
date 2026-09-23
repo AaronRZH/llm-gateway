@@ -1,6 +1,6 @@
 # llm-gateway 技术债治理清单
 
-> **最后度量**: 2026-09-22  
+> **最后度量**: 2026-09-22（合并 refactor/openai-converter-events、refactor/stream-extract-postprocess，更新复杂度基线）  
 > **适用范围**: 生产 Go 代码（排除 `*_test.go` 与 `.tmp/`）  
 > **治理原则**: 先锁定行为，再小步重构；优先级由业务风险、变更频率、测试保护和复杂度共同决定
 
@@ -44,10 +44,10 @@ go tool cover -func=coverage.out
 | 函数 | 位置 | 复杂度 | 行数 |
 |------|------|--------|------|
 | `handleAnthropicMessages` | `cmd/gateway/handlers.go` | 48 | 314 |
-| `RewriteAndForwardWithToolRepair` | `internal/stream/stream.go` | 34 | 149 |
 | `handleChatCompletion` | `cmd/gateway/handlers.go` | 47 | 346 |
-| `OpenAIStreamConverter.convert` | `internal/stream/anthropic_sse.go` | 39 | 163 |
 | `Resolve` | `internal/protocol/protocol.go` | 36 | 259 |
+| `RewriteAndForwardWithToolRepair` | `internal/stream/stream.go` | 34 | 149 |
+| `OpenAIStreamConverter.convert` | `internal/stream/anthropic_sse.go` | 20 | 163 |
 | `AnthropicSSEConverter.convert` | `internal/stream/anthropic_sse.go` | 33 | 194 |
 | `ContentToBlocks` | `internal/provider/anthropic_converter.go` | 31 | 83 |
 
