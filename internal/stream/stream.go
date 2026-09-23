@@ -83,6 +83,96 @@ func (h *Handler) RewriteAndForward(w http.ResponseWriter, upstream io.ReadClose
 	return h.RewriteAndForwardWithToolRepair(w, upstream, virtualModel, openAIClient, nil, nil)
 }
 
+// scanState holds the mutable state needed during the scan-and-forward loop.
+type scanState struct {
+	result                   *StreamResult
+	xmlSuppressed            bool
+	structuredToolSuppressed bool
+	suppressedOutput         []byte
+	xmlDetectBuf             []byte
+}
+
+// scanAndForward performs the streaming scan loop: reading SSE lines from upstream,
+// forwarding them (or suppressing XML tool call markers), and accumulating state.
+// This method extracts the scan loop from RewriteAndForwardWithToolRepair to reduce
+// its cyclomatic complexity. Post-processing logic remains in the caller to preserve
+// exact error propagation semantics per branch.
+func (h *Handler) scanAndForward(w http.ResponseWriter, flusher http.Flusher, scanner *bufio.Scanner, virtualModel string, definitions []toolcall.Definition, s *scanState) {
+	for scanner.Scan() {
+		line := scanner.Bytes()
+
+		if len(line) == 0 {
+			if s.xmlSuppressed {
+				s.suppressedOutput = append(s.suppressedOutput, '\n')
+			} else {
+				w.Write([]byte("\n"))
+				flusher.Flush()
+			}
+			continue
+		}
+		if bytes.HasPrefix(line, []byte("data: ")) {
+			payload := line[6:]
+
+			if bytes.Equal(payload, []byte("[DONE]")) {
+				continue
+			}
+
+			content, reasoning := extractContent(payload)
+			s.result.AccumulatedContent += content
+			s.result.AccumulatedReasoning += reasoning
+			beforeToolCalls := len(s.result.AccumulatedToolCalls)
+			extractToolCalls(payload, s.result)
+			if s.result.Usage == nil {
+				if usage := extractUsage(payload); usage != nil {
+					s.result.Usage = usage
+				}
+			} else {
+				mergeUsage(s.result.Usage, extractUsage(payload))
+			}
+			if definitions != nil && (s.structuredToolSuppressed || len(s.result.AccumulatedToolCalls) > beforeToolCalls) {
+				s.structuredToolSuppressed = true
+				continue
+			}
+
+			rewritten := h.rewriteModelField(payload, virtualModel)
+
+			if s.xmlSuppressed {
+				s.suppressedOutput = append(s.suppressedOutput, []byte("data: ")...)
+				s.suppressedOutput = append(s.suppressedOutput, rewritten...)
+				s.suppressedOutput = append(s.suppressedOutput, '\n')
+				continue
+			}
+
+			// 滚动缓冲：追加当前 content，保留最近 4KB
+			s.xmlDetectBuf = append(s.xmlDetectBuf, content...)
+			if len(s.xmlDetectBuf) > 4096 {
+				s.xmlDetectBuf = s.xmlDetectBuf[len(s.xmlDetectBuf)-4096:]
+			}
+
+			if containsXMLToolCallStart(string(s.xmlDetectBuf)) {
+				s.xmlSuppressed = true
+				s.suppressedOutput = append(s.suppressedOutput, []byte("data: ")...)
+				s.suppressedOutput = append(s.suppressedOutput, rewritten...)
+				s.suppressedOutput = append(s.suppressedOutput, '\n')
+				continue
+			}
+
+			w.Write([]byte("data: "))
+			w.Write(rewritten)
+			w.Write([]byte("\n"))
+		} else {
+			if s.xmlSuppressed {
+				s.suppressedOutput = append(s.suppressedOutput, line...)
+				s.suppressedOutput = append(s.suppressedOutput, '\n')
+			} else {
+				w.Write(line)
+				w.Write([]byte("\n"))
+			}
+		}
+		flusher.Flush()
+	}
+}
+
 // RewriteAndForwardWithToolRepair behaves like RewriteAndForward, but if an
 // attempted XML tool call cannot be parsed or validated it performs at most
 // one caller-provided format repair. Unknown formats are never replayed as
@@ -114,89 +204,11 @@ func (h *Handler) RewriteAndForwardWithToolRepair(
 	// （如 <invoke name=），进入抑制模式——后续 content 行不再转发，
 	// 流结束后统一转换为结构化的 delta.tool_calls。
 	// 普通文本响应完全不受影响，逐行实时透传（与旧行为一致）。
-	xmlSuppressed := false
-	structuredToolSuppressed := false
-	var suppressedOutput []byte
-
-	// 滚动缓冲：保留最近 4KB content 用于跨 chunk 检测 XML 标签。
-	// 当上游把 <invoke name=add_clarification> 切成多个 SSE chunk
-	// （如 <invoke na + me=add_clarification>）时，单行检测会漏检。
-	// 用缓冲拼接最近内容后再检测，提高命中率。
-	var xmlDetectBuf []byte
-
-	for scanner.Scan() {
-		line := scanner.Bytes()
-
-		if len(line) == 0 {
-			if xmlSuppressed {
-				suppressedOutput = append(suppressedOutput, '\n')
-			} else {
-				w.Write([]byte("\n"))
-				flusher.Flush()
-			}
-			continue
-		}
-		if bytes.HasPrefix(line, []byte("data: ")) {
-			payload := line[6:]
-
-			if bytes.Equal(payload, []byte("[DONE]")) {
-				continue
-			}
-
-			content, reasoning := extractContent(payload)
-			result.AccumulatedContent += content
-			result.AccumulatedReasoning += reasoning
-			beforeToolCalls := len(result.AccumulatedToolCalls)
-			extractToolCalls(payload, result)
-			if result.Usage == nil {
-				if usage := extractUsage(payload); usage != nil {
-					result.Usage = usage
-				}
-			} else {
-				mergeUsage(result.Usage, extractUsage(payload))
-			}
-			if definitions != nil && (structuredToolSuppressed || len(result.AccumulatedToolCalls) > beforeToolCalls) {
-				structuredToolSuppressed = true
-				continue
-			}
-
-			rewritten := h.rewriteModelField(payload, virtualModel)
-
-			if xmlSuppressed {
-				suppressedOutput = append(suppressedOutput, []byte("data: ")...)
-				suppressedOutput = append(suppressedOutput, rewritten...)
-				suppressedOutput = append(suppressedOutput, '\n')
-				continue
-			}
-
-			// 滚动缓冲：追加当前 content，保留最近 4KB
-			xmlDetectBuf = append(xmlDetectBuf, content...)
-			if len(xmlDetectBuf) > 4096 {
-				xmlDetectBuf = xmlDetectBuf[len(xmlDetectBuf)-4096:]
-			}
-
-			if containsXMLToolCallStart(string(xmlDetectBuf)) {
-				xmlSuppressed = true
-				suppressedOutput = append(suppressedOutput, []byte("data: ")...)
-				suppressedOutput = append(suppressedOutput, rewritten...)
-				suppressedOutput = append(suppressedOutput, '\n')
-				continue
-			}
-
-			w.Write([]byte("data: "))
-			w.Write(rewritten)
-			w.Write([]byte("\n"))
-		} else {
-			if xmlSuppressed {
-				suppressedOutput = append(suppressedOutput, line...)
-				suppressedOutput = append(suppressedOutput, '\n')
-			} else {
-				w.Write(line)
-				w.Write([]byte("\n"))
-			}
-		}
-		flusher.Flush()
-	}
+	scan := &scanState{result: result}
+	h.scanAndForward(w, flusher, scanner, virtualModel, definitions, scan)
+	xmlSuppressed := scan.xmlSuppressed
+	structuredToolSuppressed := scan.structuredToolSuppressed
+	suppressedOutput := scan.suppressedOutput
 
 	if err := scanner.Err(); err != nil && err != io.EOF && err != context.Canceled {
 		log.Warn().Err(err).Msg("stream scan ended abnormally")

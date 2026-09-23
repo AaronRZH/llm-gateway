@@ -44,7 +44,7 @@ go tool cover -func=coverage.out
 | 函数 | 位置 | 复杂度 | 行数 |
 |------|------|--------|------|
 | `handleAnthropicMessages` | `cmd/gateway/handlers.go` | 48 | 314 |
-| `RewriteAndForwardWithToolRepair` | `internal/stream/stream.go` | 48 | 227 |
+| `RewriteAndForwardWithToolRepair` | `internal/stream/stream.go` | 34 | 149 |
 | `handleChatCompletion` | `cmd/gateway/handlers.go` | 47 | 346 |
 | `OpenAIStreamConverter.convert` | `internal/stream/anthropic_sse.go` | 39 | 163 |
 | `Resolve` | `internal/protocol/protocol.go` | 36 | 259 |
