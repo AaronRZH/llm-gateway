@@ -124,20 +124,8 @@ func handleChatCompletion(
 			}
 
 			if upstream == nil {
-				if lastErr != nil {
-					if ue, ok := lastErr.(*provider.UpstreamHTTPError); ok {
-						log.Error().Err(lastErr).Str("provider", ue.Provider).Str("body", string(ue.Body)).Msg("all upstream models failed for stream")
-						c.Data(ue.StatusCode, "application/json", ue.Body)
-						return
-					}
-					log.Error().Err(lastErr).Msg("all upstream models failed for stream")
-				} else {
-					log.Error().Msg("all upstream models failed for stream")
-				}
-				// 记录失败请求（仅估算输入），计入请求次数，避免 dashboard 漏算
-				go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
-					inputTokens, 0, 0, 0, 0, 0, 0, apiKey)
-				c.JSON(http.StatusServiceUnavailable, gin.H{"error": upstreamFailedMessage(lastErr)})
+				handleAllCandidatesFailed(c, log, lastErr, "all upstream models failed for stream",
+					reqID, upstreamModel, req.Model, targetProvider, apiKey, inputTokens, tokenService)
 				return
 			}
 
@@ -256,22 +244,8 @@ func handleChatCompletion(
 				return
 			}
 
-			if lastErr != nil {
-				if ue, ok := lastErr.(*provider.UpstreamHTTPError); ok {
-					log.Error().Err(lastErr).Str("provider", ue.Provider).Str("body", string(ue.Body)).Msg("all upstream models failed for non-stream")
-					// SendDirect 路径（Case 4: Anthropic→Anthropic）的 4xx 透传：
-					// 客户端应该收到上游的原始状态码和 body，而不是泛化 503
-					c.Data(ue.StatusCode, "application/json", ue.Body)
-					return
-				}
-				log.Error().Err(lastErr).Msg("all upstream models failed for non-stream")
-			} else {
-				log.Error().Msg("all upstream models failed for non-stream")
-			}
-			// 记录失败请求（仅估算输入），计入请求次数，避免 dashboard 漏算
-			go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
-				inputTokens, 0, 0, 0, 0, 0, 0, apiKey)
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": upstreamFailedMessage(lastErr)})
+			handleAllCandidatesFailed(c, log, lastErr, "all upstream models failed for non-stream",
+				reqID, upstreamModel, req.Model, targetProvider, apiKey, inputTokens, tokenService)
 			return
 		}
 	}
@@ -488,6 +462,38 @@ func isRateLimited(
 	log.Warn().Dur("backoff", backoff).Str("provider", targetProvider).Msg("rate limited (429), backing off")
 	sleepWithContext(reqCtx, backoff)
 	return true
+}
+
+// handleAllCandidatesFailed 处理"所有 fallback 候选均失败"的统一收尾。
+// 语义与原三处内联写法逐行一致：
+//   - lastErr 为 *UpstreamHTTPError 时记录含 body 的错误日志，并直接转发上游状态码与 body（4xx 透传，不泛化为 503）
+//   - 否则记录普通错误日志（lastErr 为 nil 时不附带 Err）
+//   - 随后记录一次仅含输入 token 的失败请求用量，避免 dashboard 漏算
+//
+// 该函数总是写出响应，调用方应在其后 return。
+func handleAllCandidatesFailed(
+	c *gin.Context,
+	log zerolog.Logger,
+	lastErr error,
+	logMsg string,
+	reqID, upstreamModel, model, targetProvider, apiKey string,
+	inputTokens int,
+	tokenService *token.Service,
+) {
+	if lastErr != nil {
+		if ue, ok := lastErr.(*provider.UpstreamHTTPError); ok {
+			log.Error().Err(lastErr).Str("provider", ue.Provider).Str("body", string(ue.Body)).Msg(logMsg)
+			c.Data(ue.StatusCode, "application/json", ue.Body)
+			return
+		}
+		log.Error().Err(lastErr).Msg(logMsg)
+	} else {
+		log.Error().Msg(logMsg)
+	}
+	// 记录失败请求（仅估算输入），计入请求次数，避免 dashboard 漏算
+	go tokenService.RecordUsageNow(reqID, upstreamModel, model, targetProvider,
+		inputTokens, 0, 0, 0, 0, 0, 0, apiKey)
+	c.JSON(http.StatusServiceUnavailable, gin.H{"error": upstreamFailedMessage(lastErr)})
 }
 
 // computeEffectiveUsage 统一计算最终记录的 token 用量，返回 effInput/effOutput/effTotal。
@@ -712,20 +718,8 @@ func handleAnthropicMessages(
 		}
 
 		if protocolResult == nil {
-			if lastErr != nil {
-				if ue, ok := lastErr.(*provider.UpstreamHTTPError); ok {
-					log.Error().Err(lastErr).Str("provider", ue.Provider).Str("body", string(ue.Body)).Msg("all upstream models failed for anthropic /messages")
-					c.Data(ue.StatusCode, "application/json", ue.Body)
-					return
-				}
-				log.Error().Err(lastErr).Msg("all upstream models failed for anthropic /messages")
-			} else {
-				log.Error().Msg("all upstream models failed for anthropic /messages")
-			}
-			// 记录失败请求（仅估算输入），计入请求次数，避免 dashboard 漏算
-			go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
-				inputTokens, 0, 0, 0, 0, 0, 0, apiKey)
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": upstreamFailedMessage(lastErr)})
+			handleAllCandidatesFailed(c, log, lastErr, "all upstream models failed for anthropic /messages",
+				reqID, upstreamModel, req.Model, targetProvider, apiKey, inputTokens, tokenService)
 			return
 		}
 
