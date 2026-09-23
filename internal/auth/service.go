@@ -2,7 +2,6 @@ package auth
 
 import (
 	"context"
-	"strings"
 	"sync"
 	"time"
 
@@ -102,7 +101,6 @@ func (s *Service) CreateSeedKey(key string, name string) bool {
 		pipe := s.rdb.Pipeline()
 		pipe.HSet(ctx, apikeyPrefix+key, "name", name)
 		pipe.HSet(ctx, apikeyPrefix+key, "created_at", info.CreatedAt.Format(time.RFC3339))
-		pipe.Expire(ctx, apikeyPrefix+key, 0)
 		if _, err := pipe.Exec(ctx); err != nil {
 			log.Warn().Err(err).Str("key_prefix", key[:min(8, len(key))]+"...").Msg("create key sync to redis failed")
 		}
@@ -121,12 +119,8 @@ func (s *Service) DeleteSeedKey(key string) bool {
 		return false // 不存在
 	}
 	delete(s.seedKeys, key)
-	// 从本地缓存中清除
-	for k := range s.cache {
-		if strings.HasPrefix(k, key) {
-			delete(s.cache, k)
-		}
-	}
+	// 从本地缓存中清除（精确匹配，避免前缀匹配误删其他 key）
+	delete(s.cache, key)
 	// 从 Redis 中删除
 	if s.rdb != nil {
 		ctx := context.Background()
@@ -239,7 +233,6 @@ func (s *Service) syncSeedKeysToRedis() {
 		pipe := s.rdb.Pipeline()
 		pipe.HSet(ctx, apikeyPrefix+k, "name", v.Name)
 		pipe.HSet(ctx, apikeyPrefix+k, "created_at", v.CreatedAt.Format(time.RFC3339))
-		pipe.Expire(ctx, apikeyPrefix+k, 0) // 永不过期
 		if _, err := pipe.Exec(ctx); err != nil {
 			log.Warn().Err(err).Str("key_prefix", k[:min(8, len(k))]+"...").Msg("sync seed key to redis failed")
 		}
