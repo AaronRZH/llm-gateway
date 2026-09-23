@@ -1,10 +1,15 @@
 package storage
 
 import (
+	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
 )
 
 // ==================== parseTime / inTimeRange ====================
@@ -75,7 +80,7 @@ func newFileStorage(t *testing.T) *FileStorage {
 
 func sampleRecord(apiKey, model, provider string, created time.Time) UsageRecord {
 	return UsageRecord{
-		RequestID:   "req-" + apiKey + "-" + model,
+		RequestID:    "req-" + apiKey + "-" + model,
 		VirtualModel: "vm",
 		RealModel:    model,
 		Provider:     provider,
@@ -314,5 +319,336 @@ func TestFileStorage_Close(t *testing.T) {
 	fs := newFileStorage(t)
 	if err := fs.Close(); err != nil {
 		t.Errorf("Close returned error: %v", err)
+	}
+}
+
+// ==================== RedisStorage ====================
+
+func TestRedisStorage_NewRedisStorage(t *testing.T) {
+	// nil client → 降级到文件存储
+	fileStorage := NewRedisStorage(nil)
+	if _, ok := fileStorage.(*FileStorage); !ok {
+		t.Fatalf("expected FileStorage fallback, got %T", fileStorage)
+	}
+
+	// miniredis 测试实例
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mr.Close()
+
+	redisClient := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer redisClient.Close()
+
+	// 可用 Redis → RedisStorage
+	redisStorage := NewRedisStorage(redisClient)
+	if _, ok := redisStorage.(*RedisStorage); !ok {
+		t.Fatalf("expected RedisStorage, got %T", redisStorage)
+	}
+}
+
+func TestRedisStorage_Persist(t *testing.T) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mr.Close()
+
+	redisClient := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer redisClient.Close()
+
+	ctx := context.Background()
+	storage := NewRedisStorage(redisClient)
+	record := UsageRecord{
+		RequestID:    "req-123",
+		APIKey:       "test-key",
+		RealModel:    "gpt-3.5-turbo",
+		Provider:     "openai",
+		InputTokens:  100,
+		OutputTokens: 50,
+		TotalTokens:  150,
+	}
+
+	// Persist
+	if err := storage.Persist(record); err != nil {
+		t.Fatalf("persist failed: %v", err)
+	}
+
+	// 验证数据写入（通过 miniredis 直接查询）
+	rawList, err := redisClient.LRange(ctx, "usage:recent:test-key", 0, -1).Result()
+	if err != nil {
+		t.Fatalf("failed to get recent data: %v", err)
+	}
+	if len(rawList) != 1 {
+		t.Fatalf("expected 1 record in list, got %d", len(rawList))
+	}
+
+	var stored UsageRecord
+	if err := json.Unmarshal([]byte(rawList[0]), &stored); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+
+	if stored.APIKey != "test-key" {
+		t.Errorf("APIKey mismatch, got %q", stored.APIKey)
+	}
+	if stored.InputTokens != 100 {
+		t.Errorf("InputTokens mismatch, got %d", stored.InputTokens)
+	}
+	if stored.TotalTokens != 150 {
+		t.Errorf("TotalTokens mismatch, got %d", stored.TotalTokens)
+	}
+
+	// 验证 global list
+	globalList, err := redisClient.LRange(ctx, "usage:recent:all", 0, -1).Result()
+	if err != nil {
+		t.Fatalf("failed to get global data: %v", err)
+	}
+	if len(globalList) != 1 {
+		t.Fatalf("expected 1 record in global list, got %d", len(globalList))
+	}
+}
+
+// newRedisStorageForTest 启动一个 miniredis 实例并返回可直接使用的 RedisStorage。
+func newRedisStorageForTest(t *testing.T) (UsageStorage, *redis.Client, *miniredis.Miniredis) {
+	t.Helper()
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	redisClient := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() {
+		redisClient.Close()
+		mr.Close()
+	})
+	storage := NewRedisStorage(redisClient)
+	if _, ok := storage.(*RedisStorage); !ok {
+		t.Fatalf("expected RedisStorage, got %T", storage)
+	}
+	return storage, redisClient, mr
+}
+
+// seedRedisRecords 写入一批带固定时间戳的记录，便于断言时间范围过滤。
+func seedRedisRecords(t *testing.T, storage UsageStorage, records []UsageRecord) {
+	t.Helper()
+	for _, r := range records {
+		if r.CreatedAt.IsZero() {
+			r.CreatedAt = time.Date(2024, 1, 15, 10, 0, 0, 0, time.UTC)
+		}
+		if err := storage.Persist(r); err != nil {
+			t.Fatalf("persist failed: %v", err)
+		}
+	}
+}
+
+func TestRedisStorage_QueryByAPIKey(t *testing.T) {
+	storage, _, _ := newRedisStorageForTest(t)
+	seedRedisRecords(t, storage, []UsageRecord{
+		{RequestID: "r1", APIKey: "k1", RealModel: "m-a", Provider: "p1", InputTokens: 10, OutputTokens: 20, TotalTokens: 30},
+		{RequestID: "r2", APIKey: "k2", RealModel: "m-b", Provider: "p1", InputTokens: 5, OutputTokens: 5, TotalTokens: 10},
+		{RequestID: "r3", APIKey: "k1", RealModel: "m-b", Provider: "p2", InputTokens: 1, OutputTokens: 1, TotalTokens: 2},
+	})
+
+	records, err := storage.QueryByAPIKey("k1", "", "", "")
+	if err != nil {
+		t.Fatalf("query failed: %v", err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("expected 2 records for k1, got %d", len(records))
+	}
+
+	// 模型过滤
+	filtered, err := storage.QueryByAPIKey("k1", "m-a", "", "")
+	if err != nil {
+		t.Fatalf("filtered query failed: %v", err)
+	}
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 record after model filter, got %d", len(filtered))
+	}
+
+	// 不存在的 key
+	empty, err := storage.QueryByAPIKey("missing", "", "", "")
+	if err != nil {
+		t.Fatalf("empty query failed: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("expected 0 records for missing key, got %d", len(empty))
+	}
+}
+
+func TestRedisStorage_QueryByTimeRange(t *testing.T) {
+	storage, _, _ := newRedisStorageForTest(t)
+	seedRedisRecords(t, storage, []UsageRecord{
+		{RequestID: "early", APIKey: "k1", TotalTokens: 1, CreatedAt: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)},
+		{RequestID: "mid", APIKey: "k1", TotalTokens: 2, CreatedAt: time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)},
+		{RequestID: "late", APIKey: "k1", TotalTokens: 4, CreatedAt: time.Date(2024, 2, 1, 0, 0, 0, 0, time.UTC)},
+	})
+
+	records, err := storage.QueryByTimeRange("2024-01-10", "2024-01-20")
+	if err != nil {
+		t.Fatalf("query failed: %v", err)
+	}
+	if len(records) != 1 || records[0].RequestID != "mid" {
+		t.Fatalf("expected only 'mid' record, got %+v", records)
+	}
+}
+
+func TestRedisStorage_QueryByRequestID(t *testing.T) {
+	storage, _, _ := newRedisStorageForTest(t)
+	seedRedisRecords(t, storage, []UsageRecord{
+		{RequestID: "find-me", APIKey: "k1", InputTokens: 7, TotalTokens: 7},
+		{RequestID: "other", APIKey: "k2", InputTokens: 8, TotalTokens: 8},
+	})
+
+	found, err := storage.QueryByRequestID("find-me")
+	if err != nil {
+		t.Fatalf("query failed: %v", err)
+	}
+	if found == nil || found.APIKey != "k1" || found.InputTokens != 7 {
+		t.Fatalf("unexpected record: %+v", found)
+	}
+
+	missing, err := storage.QueryByRequestID("nope")
+	if err != nil {
+		t.Fatalf("missing query failed: %v", err)
+	}
+	if missing != nil {
+		t.Fatalf("expected nil for missing id, got %+v", missing)
+	}
+}
+
+func TestRedisStorage_SumTokensByAPIKey(t *testing.T) {
+	storage, _, _ := newRedisStorageForTest(t)
+	seedRedisRecords(t, storage, []UsageRecord{
+		{RequestID: "a1", APIKey: "k1", RealModel: "m-a", InputTokens: 10, OutputTokens: 20, TotalTokens: 30},
+		{RequestID: "a2", APIKey: "k1", RealModel: "m-b", InputTokens: 1, OutputTokens: 1, TotalTokens: 2},
+		{RequestID: "a3", APIKey: "k2", RealModel: "m-a", InputTokens: 99, OutputTokens: 99, TotalTokens: 198},
+	})
+
+	inTok, outTok, totalTok, count, err := storage.SumTokensByAPIKey("k1", "", "", "")
+	if err != nil {
+		t.Fatalf("sum failed: %v", err)
+	}
+	if inTok != 11 || outTok != 21 || totalTok != 32 || count != 2 {
+		t.Errorf("unexpected sums: in=%d out=%d total=%d count=%d", inTok, outTok, totalTok, count)
+	}
+
+	inTok, outTok, totalTok, count, err = storage.SumTokensByAPIKey("k1", "m-a", "", "")
+	if err != nil {
+		t.Fatalf("filtered sum failed: %v", err)
+	}
+	if totalTok != 30 || count != 1 {
+		t.Errorf("filtered sums wrong: total=%d count=%d", totalTok, count)
+	}
+}
+
+func TestRedisStorage_SumTokensByTimeRange(t *testing.T) {
+	storage, _, _ := newRedisStorageForTest(t)
+	seedRedisRecords(t, storage, []UsageRecord{
+		{RequestID: "t1", TotalTokens: 10, CreatedAt: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)},
+		{RequestID: "t2", TotalTokens: 20, CreatedAt: time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)},
+	})
+
+	inTok, outTok, totalTok, count, err := storage.SumTokensByTimeRange("2024-01-10", "2024-01-20")
+	if err != nil {
+		t.Fatalf("sum failed: %v", err)
+	}
+	if totalTok != 20 || count != 1 {
+		t.Errorf("unexpected: total=%d count=%d", totalTok, count)
+	}
+	_ = inTok
+	_ = outTok
+}
+
+func TestRedisStorage_AggregateByGranularity(t *testing.T) {
+	storage, _, _ := newRedisStorageForTest(t)
+	seedRedisRecords(t, storage, []UsageRecord{
+		{RequestID: "g1", APIKey: "k1", RealModel: "m-a", Provider: "p1", InputTokens: 1, OutputTokens: 1, TotalTokens: 2,
+			CreatedAt: time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)},
+		{RequestID: "g2", APIKey: "k1", RealModel: "m-a", Provider: "p1", InputTokens: 2, OutputTokens: 2, TotalTokens: 4,
+			CreatedAt: time.Date(2024, 1, 16, 0, 0, 0, 0, time.UTC)},
+		{RequestID: "g3", APIKey: "k1", RealModel: "m-a", Provider: "p1", InputTokens: 4, OutputTokens: 4, TotalTokens: 8,
+			CreatedAt: time.Date(2024, 1, 22, 0, 0, 0, 0, time.UTC)},
+	})
+
+	daily, err := storage.AggregateByAPIKey("k1", "daily", "", "")
+	if err != nil {
+		t.Fatalf("daily aggregate failed: %v", err)
+	}
+	if len(daily) != 3 {
+		t.Fatalf("expected 3 daily buckets (3 distinct dates), got %d", len(daily))
+	}
+
+	// Jan 15/16 同属 ISO week 3，Jan 22 进入 week 4 → 2 个周桶
+	weekly, err := storage.AggregateByAPIKey("k1", "weekly", "", "")
+	if err != nil {
+		t.Fatalf("weekly aggregate failed: %v", err)
+	}
+	if len(weekly) != 2 {
+		t.Fatalf("expected 2 weekly buckets, got %d: %+v", len(weekly), weekly)
+	}
+	var weeklyTotal int
+	for _, w := range weekly {
+		weeklyTotal += w.TotalTokens
+	}
+	if weeklyTotal != 14 {
+		t.Fatalf("expected weekly total 14, got %d", weeklyTotal)
+	}
+
+	// 三条记录同属 2024-01 → 1 个月桶
+	monthly, err := storage.AggregateByAPIKey("k1", "monthly", "", "")
+	if err != nil {
+		t.Fatalf("monthly aggregate failed: %v", err)
+	}
+	if len(monthly) != 1 || monthly[0].TotalTokens != 14 {
+		t.Fatalf("unexpected monthly result: %+v", monthly)
+	}
+}
+
+func TestRedisStorage_AggregateAndAdmin(t *testing.T) {
+	storage, _, _ := newRedisStorageForTest(t)
+	seedRedisRecords(t, storage, []UsageRecord{
+		{RequestID: "s1", APIKey: "k1", RealModel: "m-a", Provider: "p1", InputTokens: 10, OutputTokens: 5, TotalTokens: 15,
+			CreatedAt: time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)},
+		{RequestID: "s2", APIKey: "k2", RealModel: "m-b", Provider: "p2", InputTokens: 20, OutputTokens: 10, TotalTokens: 30,
+			CreatedAt: time.Date(2024, 1, 16, 0, 0, 0, 0, time.UTC)},
+	})
+
+	if _, err := storage.AggregateDaily("", ""); err != nil {
+		t.Fatalf("AggregateDaily failed: %v", err)
+	}
+	if _, err := storage.AggregateWeekly("", ""); err != nil {
+		t.Fatalf("AggregateWeekly failed: %v", err)
+	}
+	if _, err := storage.AggregateMonthly("", ""); err != nil {
+		t.Fatalf("AggregateMonthly failed: %v", err)
+	}
+
+	models, err := storage.AggregateByRealModel("", "")
+	if err != nil {
+		t.Fatalf("AggregateByRealModel failed: %v", err)
+	}
+	if len(models) != 2 {
+		t.Fatalf("expected 2 model buckets, got %d", len(models))
+	}
+
+	stats, err := storage.AdminTotalStats("", "")
+	if err != nil {
+		t.Fatalf("AdminTotalStats failed: %v", err)
+	}
+	if stats["total_requests"] != 2 || stats["total_tokens"] != 45 {
+		t.Fatalf("unexpected stats: %+v", stats)
+	}
+
+	daily, err := storage.AdminDailyStats("", "")
+	if err != nil {
+		t.Fatalf("AdminDailyStats failed: %v", err)
+	}
+	if len(daily) != 2 {
+		t.Fatalf("expected 2 daily buckets, got %d", len(daily))
+	}
+
+	if err := storage.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
 	}
 }
