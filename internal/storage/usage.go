@@ -769,7 +769,8 @@ func (s *RedisStorage) summarizeRecordsByRealModel(raw []string, startTime, endT
 		key := rk{rec.RealModel, rec.Provider}
 		b, ok := buckets[key]
 		if !ok {
-			buckets[key] = &UsageSummary{Model: key.Model, Provider: key.Provider}
+			b = &UsageSummary{Model: key.Model, Provider: key.Provider}
+			buckets[key] = b
 		}
 		b.TotalInput += rec.InputTokens
 		b.TotalOutput += rec.OutputTokens
