@@ -178,19 +178,7 @@ func handleChatCompletion(
 				realOutput = result.Usage.CompletionTokens
 				realTotal = result.Usage.TotalTokens
 			}
-			// 记录用量：优先使用 upstream 返回的真实 token 数，没有则使用本地估算值
-			effInput := realInput
-			if effInput == 0 {
-				effInput = inputTokens
-			}
-			effOutput := realOutput
-			if effOutput == 0 {
-				effOutput = estimatedOutput
-			}
-			effTotal := effInput + effOutput
-			if realTotal > 0 {
-				effTotal = realTotal
-			}
+			effInput, effOutput, effTotal := computeEffectiveUsage(realInput, realOutput, realTotal, inputTokens, estimatedOutput)
 			go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
 				inputTokens, estimatedOutput, estimatedToolCallsTokens, effInput, effOutput, effTotal, len(toolCalls), apiKey)
 
@@ -234,21 +222,8 @@ func handleChatCompletion(
 
 				// 5. 解析上游返回的真实 usage，异步记录用量
 				realInput, realOutput, realTotal := parseUsage(body)
-				// 解析 tool_calls
-				_ = realTotal // 保留用于未来的扩展
 				// 上游未返回 usage 时回退到本地估算，避免 token 统计漏记（与流式路径保持一致）
-				effInput := realInput
-				if effInput == 0 {
-					effInput = inputTokens
-				}
-				effOutput := realOutput
-				if effOutput == 0 {
-					effOutput = len(body) / 4 // 粗略估算输出 token
-				}
-				effTotal := effInput + effOutput
-				if realTotal > 0 {
-					effTotal = realTotal
-				}
+				effInput, effOutput, effTotal := computeEffectiveUsage(realInput, realOutput, realTotal, inputTokens, len(body)/4)
 
 				// 重写响应中的 model 字段
 				body = mapper.RewriteResponse(body, req.Model)
@@ -513,6 +488,26 @@ func isRateLimited(
 	log.Warn().Dur("backoff", backoff).Str("provider", targetProvider).Msg("rate limited (429), backing off")
 	sleepWithContext(reqCtx, backoff)
 	return true
+}
+
+// computeEffectiveUsage 统一计算最终记录的 token 用量，返回 effInput/effOutput/effTotal。
+// 语义与原内联写法逐行一致：
+//   - 上游返回的真实 token 优先；为 0 时回退到本地估算（effInput 用 inputTokens，effOutput 用 fallbackOutput）
+//   - effTotal 优先使用上游 realTotal，否则为 effInput + effOutput
+func computeEffectiveUsage(realInput, realOutput, realTotal, inputTokens, fallbackOutput int) (int, int, int) {
+	effInput := realInput
+	if effInput == 0 {
+		effInput = inputTokens
+	}
+	effOutput := realOutput
+	if effOutput == 0 {
+		effOutput = fallbackOutput
+	}
+	effTotal := effInput + effOutput
+	if realTotal > 0 {
+		effTotal = realTotal
+	}
+	return effInput, effOutput, effTotal
 }
 
 // createOpenAIChatRequest 创建 OpenAI 客户端路径的 protocol.Request 参数对象。
@@ -790,19 +785,7 @@ func handleAnthropicMessages(
 				realOutput = result.Usage.CompletionTokens
 				realTotal = result.Usage.TotalTokens
 			}
-			// 优先使用 upstream 返回的真实 token 数，没有则使用本地估算值
-			effInput := realInput
-			if effInput == 0 {
-				effInput = inputTokens
-			}
-			effOutput := realOutput
-			if effOutput == 0 {
-				effOutput = estimatedOutput
-			}
-			effTotal := effInput + effOutput
-			if realTotal > 0 {
-				effTotal = realTotal
-			}
+			effInput, effOutput, effTotal := computeEffectiveUsage(realInput, realOutput, realTotal, inputTokens, estimatedOutput)
 			go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
 				inputTokens, estimatedOutput, estimatedToolCallsTokens, effInput, effOutput, effTotal, len(toolCalls), apiKey)
 		} else {
@@ -837,20 +820,8 @@ func handleAnthropicMessages(
 			// 记录用量
 			realInput, realOutput, realTotal := parseUsage(protocolResult.Body)
 			toolCalls := parseToolCalls(protocolResult.Body, targetProvider)
-			_ = realTotal
 			// 上游未返回 usage 时回退到本地估算，避免 token 统计漏记（与流式路径保持一致）
-			effInput := realInput
-			if effInput == 0 {
-				effInput = inputTokens
-			}
-			effOutput := realOutput
-			if effOutput == 0 {
-				effOutput = len(protocolResult.Body) / 4 // 粗略估算输出 token
-			}
-			effTotal := effInput + effOutput
-			if realTotal > 0 {
-				effTotal = realTotal
-			}
+			effInput, effOutput, effTotal := computeEffectiveUsage(realInput, realOutput, realTotal, inputTokens, len(protocolResult.Body)/4)
 			go tokenService.RecordUsageNow(reqID, upstreamModel, req.Model, targetProvider,
 				inputTokens, 0, 0, effInput, effOutput, effTotal, len(toolCalls), apiKey)
 
