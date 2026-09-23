@@ -31,11 +31,11 @@ go tool cover -func=coverage.out
 | 指标 | 当前值 |
 |------|--------|
 | 生产 Go 文件数 | 28 |
-| 函数/方法数 | 393 |
-| 代码行 | 8613 |
-| 平均函数复杂度 | 4.48 |
-| 最大函数复杂度 | 25（`handleChatCompletion`） |
-| 最大函数行数 | 219（`handleChatCompletion`） |
+| 函数/方法数 | 397 |
+| 代码行 | 8674 |
+| 平均函数复杂度 | 4.45 |
+| 最大函数复杂度 | 20（`handleCountTokens`） |
+| 最大函数行数 | 113（`handleCountTokens`） |
 | 测试文件数 | 26 |
 | 总语句覆盖率 | 61.3% |
 
@@ -43,7 +43,6 @@ go tool cover -func=coverage.out
 
 | 函数 | 位置 | 复杂度 | 行数 |
 |------|------|--------|------|
-| `handleChatCompletion` | `cmd/gateway/handlers.go` | 25 | 219 |
 | `handleCountTokens` | `cmd/gateway/handlers.go` | 20 | 113 |
 | `Normalize` | `internal/toolcall/toolcall.go` | 20 | 92 |
 | `ConvertResponse` | `internal/provider/anthropic_converter.go` | 20 | 86 |
@@ -52,8 +51,9 @@ go tool cover -func=coverage.out
 | `AnthropicSSEConverter.convert` | `internal/stream/anthropic_sse.go` | 19 | 92 |
 | `ConvertResponseWithModel` | `internal/provider/anthropic_converter.go` | 19 | 80 |
 | `completeContentBlock` | `internal/provider/anthropic_converter.go` | 19 | 43 |
+| `AdminAuth` | `internal/middleware/adminauth.go` | 18 | 70 |
 
-> 复杂度基线已从阶段 1 的最高值 48 降至 25。`RewriteAndForwardWithToolRepair`（原 C=48）、`ConvertAnthropicMessagesToOpenAI`（原 C=23）与 `handleAnthropicMessages`（原 C=28）均已拆分，不再进入前 9 名。剩余热点集中在 `handleChatCompletion`（C=25）和 `internal/provider` 的 `ConvertResponse` 链路。
+> 复杂度基线已从阶段 1 的最高值 48 降至 20。`RewriteAndForwardWithToolRepair`（原 C=48）、`ConvertAnthropicMessagesToOpenAI`（原 C=23）、`handleAnthropicMessages`（原 C=28）与 `handleChatCompletion`（原 C=25）均已拆分，不再进入前 9 名。剩余热点集中在 `handleCountTokens`（C=20）和 `internal/provider` 的 `ConvertResponse` 链路。
 
 重点包覆盖率：
 
@@ -120,6 +120,7 @@ go tool cover -func=coverage.out
 | `internal/storage`（`RedisStorage`） | 新增 9 个 tests（`miniredis` 驱动），修复 `summarizeRecordsByRealModel` 空指针 bug | 包 29.6% → 62.7%，`RedisStorage` 0% → 80% |
 | `internal/storage`（postgres 纯函数） | 新增 `postgres_test.go`（`buildDSN`、`parseTimeRange`、`FileStorage.compact`/`AdminDailyStats`） | `buildDSN` 0% → 100%，`parseTimeRange` 0% → 100%，`compact` 0% → 100% |
 | `cmd/gateway`（`handleAnthropicMessages`） | 拆为 4 个函数（`resolveAnthropicCandidate`、`forwardUpstreamErrorIfPresent`、`forwardStreamResponse`、`forwardNonStreamResponse`），8 个 characterization tests 保持通过 | C=28 → 15（达成 ≤15 目标），222 → 121 行 |
+| `cmd/gateway`（`handleChatCompletion`） | 拆为 4 个函数（`resolveOpenAICandidate`、`forwardOpenAIStreamResponse`、`forwardOpenAINonStreamResponse`、`selectChatStreamCandidate`），10 个 characterization tests 保持通过 | C=25 → 14（达成 ≤15 目标），219 → 112 行 |
 
 **总语句覆盖率：56.3% → 61.3%**。
 
@@ -156,7 +157,7 @@ P0 表示当前缺少足够回归保护，继续修改可能造成认证、协�
 
 **现状**
 
-- `handleChatCompletion`：C=47、346 行、函数覆盖率 0%。**部分完成（阶段 2）**：降至 C=25、219 行，覆盖率 75%+；未达 ≤15 目标，见 3.1。
+- `handleChatCompletion`：C=47、346 行、函数覆盖率 0%。**已完成（阶段 2）**：拆为 4 个函数，C=47 → 14，346 → 112 行，10 个 characterization tests 全部通过；见 3.1。
 - `handleAnthropicMessages`：C=48、314 行、函数覆盖率 0%。**已完成（阶段 2）**：拆为 4 个函数，C=28 → 15，222 → 121 行，8 个 characterization tests 全部通过；见 3.1。
 - `protocol.Resolve`：C=36、259 行、函数覆盖率 0%。**已完成（refactor/resolve）**：拆为薄分发器 + 4 个 case handler，C=36 → 10，覆盖率 0% → 88.5%。
 - 现有 `handlers_test.go` 主要覆盖工具调用辅助函数，没有锁定完整请求行为。
@@ -204,10 +205,10 @@ P0 表示当前缺少足够回归保护，继续修改可能造成认证、协�
 
 **现状**
 
-- 2120 LOC、76 个函数。
+- 2181 LOC、80 个函数。
 - 同时包含用户请求、协议适配、工具调用修复、用量统计和管理后台处理逻辑。
 - 主要风险不是单纯文件过长，而是核心请求编排与多种细节逻辑共同变化。
-- **进展**：`handleAnthropicMessages` 已降至 C=15、121 行（达成 ≤15 目标）；`handleChatCompletion` 仍为 C=25、219 行，未达标。
+- **进展**：两个核心 handler 均已达成 ≤15 复杂度目标——`handleChatCompletion` C=14、112 行；`handleAnthropicMessages` C=15、121 行。编排行数略超 100 行目标（特殊说明：含大量 error 处理和注释，实际逻辑行数约 80）。
 
 **行动**
 
@@ -218,9 +219,9 @@ P0 表示当前缺少足够回归保护，继续修改可能造成认证、协�
 
 **完成标准**
 
-- 两个核心 handler 圈复杂度分别降到 15 以下。
-- 编排函数控制在约 100 行以内；特殊情况需在 PR 中说明。
-- 不改变现有 HTTP 状态码、响应格式、fallback 和用量记录行为。
+- ✅ 两个核心 handler 圈复杂度分别降到 15 以下。
+- ⚠️ 编排函数控制在约 100 行以内（实际 112/121 行，略超；特殊说明：含大量 error 处理和注释，实际逻辑行数约 80）。
+- ✅ 不改变现有 HTTP 状态码、响应格式、fallback 和用量记录行为（18 个 characterization tests 全部通过）。
 
 ### 3.2 `internal/stream/stream.go`：转发、缓存和工具修复耦合
 
