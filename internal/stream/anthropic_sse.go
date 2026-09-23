@@ -665,9 +665,18 @@ func writeSSE(w io.Writer, event map[string]interface{}) {
 	fmt.Fprintf(w, "data: %s\n\n", string(data))
 }
 
-// writeChunkPlain 将 JSON 主体以 OpenAI SSE 格式写入
+// writeChunkPlain 将 choice 级 JSON 片段包成完整的 OpenAI SSE chunk。
+// 契约：jsonBody 必须是形如 {"delta":{...}} / {"role":...,"content":...} / {"finish_reason":"stop"} /
+// {"usage":{...}} 的完整 JSON 对象——其外层花括号即 choice 对象自身的边界。模板在 "index":0, 之后
+// 嵌入 jsonBody 时剥离其首字符 "{"，由 jsonBody 自带的尾部 "}" 闭合 choice 对象，
+// 避免产生 {"index":0,{...}} 这类非法 JSON（该缺陷曾导致所有 OpenAI SSE chunk 损坏，见 DEBT.md 2.3）。
 func (c *OpenAIStreamConverter) writeChunkPlain(jsonBody string) {
-	chunk := `{"id":"msg_` + c.streamID + `","object":"chat.completion.chunk","created":` + fmt.Sprintf("%d", c.created) + `,"model":"` + c.model + `","choices":[{"index":0,` + jsonBody + `}]}`
+	// 防御：契约违反时不 panic，改由调用方排查。当前 7 个调用方均传入以 "{" 开头的完整对象。
+	if len(jsonBody) == 0 || jsonBody[0] != '{' {
+		log.Warn().Str("body_prefix", jsonBody[:min(32, len(jsonBody))]).Msg("writeChunkPlain: unexpected jsonBody, chunk dropped")
+		return
+	}
+	chunk := `{"id":"msg_` + c.streamID + `","object":"chat.completion.chunk","created":` + fmt.Sprintf("%d", c.created) + `,"model":"` + c.model + `","choices":[{"index":0,` + jsonBody[1:] + `]}`
 	fmt.Fprintf(c.ew, "data: %s\n\n", chunk)
 }
 
