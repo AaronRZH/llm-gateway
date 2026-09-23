@@ -1,6 +1,6 @@
 # llm-gateway 技术债治理清单
 
-> **最后度量**: 2026-09-23（合并 PR #7-#10：stream-scan-forward、docs/refresh-debt-baseline、handle-chat-completion、anthropic-sse-convert，刷新复杂度基线）  
+> **最后度量**: 2026-09-23（合并 PR #7-#12，刷新复杂度基线）  
 > **适用范围**: 生产 Go 代码（排除 `*_test.go` 与 `.tmp/`）  
 > **治理原则**: 先锁定行为，再小步重构；优先级由业务风险、变更频率、测试保护和复杂度共同决定
 
@@ -31,13 +31,13 @@ go tool cover -func=coverage.out
 | 指标 | 当前值 |
 |------|--------|
 | 生产 Go 文件数 | 28 |
-| 函数/方法数 | 384 |
-| 代码行 | 8548 |
-| 平均函数复杂度 | 4.55 |
+| 函数/方法数 | 388 |
+| 代码行 | 8562 |
+| 平均函数复杂度 | 4.52 |
 | 最大函数复杂度 | 28（`handleAnthropicMessages`） |
 | 最大函数行数 | 222（`handleAnthropicMessages`） |
 | 测试文件数 | 25 |
-| 总语句覆盖率 | 54.8% |
+| 总语句覆盖率 | 56.3% |
 
 复杂度最高的函数：
 
@@ -45,15 +45,15 @@ go tool cover -func=coverage.out
 |------|------|--------|------|
 | `handleAnthropicMessages` | `cmd/gateway/handlers.go` | 28 | 222 |
 | `handleChatCompletion` | `cmd/gateway/handlers.go` | 25 | 219 |
-| `ConvertAnthropicMessagesToOpenAI` | `internal/provider/anthropic_converter.go` | 23 | 100 |
 | `handleCountTokens` | `cmd/gateway/handlers.go` | 20 | 113 |
 | `Normalize` | `internal/toolcall/toolcall.go` | 20 | 92 |
 | `ConvertResponse` | `internal/provider/anthropic_converter.go` | 20 | 86 |
 | `OpenAIStreamConverter.convert` | `internal/stream/anthropic_sse.go` | 20 | 79 |
 | `main` | `cmd/gateway/main.go` | 19 | 193 |
 | `AnthropicSSEConverter.convert` | `internal/stream/anthropic_sse.go` | 19 | 92 |
+| `ConvertResponseWithModel` | `internal/provider/anthropic_converter.go` | 19 | 80 |
 
-> 复杂度基线已从阶段 1 的最高值 48 降至 28。`RewriteAndForwardWithToolRepair`（原 C=48）与两个 handler（原 C=47/48）均已拆分，不再进入前 9 名。剩余热点集中在两个 handler 和 `internal/provider` 的 Anthropic 转换链路。
+> 复杂度基线已从阶段 1 的最高值 48 降至 28。`RewriteAndForwardWithToolRepair`（原 C=48）与 `ConvertAnthropicMessagesToOpenAI`（原 C=23）均已拆分，不再进入前 9 名。剩余热点集中在两个 handler 和 `internal/provider` 的 `ConvertResponse` 链路。
 
 重点包覆盖率：
 
@@ -62,7 +62,7 @@ go tool cover -func=coverage.out
 | `cmd/gateway` | 34.1% | 两个核心 handler 已有 characterization tests，但分支覆盖不足 |
 | `internal/auth` | 98.0% | 已建立完整测试（种子 Key、缓存、Redis 回退） |
 | `internal/protocol` | 88.5% | `Resolve` 拆分后覆盖 97.6% |
-| `internal/provider` | 43.7% | 转换主路径覆盖不足，是下一个重点 |
+| `internal/provider` | 56.1% | 转换主路径覆盖提升，`ConvertAnthropicMessagesToOpenAI` 达成 100% |
 | `internal/storage` | 29.6% | 文件后端覆盖较好，Redis/PostgreSQL 路径不足 |
 | `internal/stream` | 81.4% | 已有流式和工具调用修复测试 |
 | `internal/middleware` | 93.7% | `AdminAuth` 已有 JWT、Basic Auth 等测试 |
@@ -77,7 +77,7 @@ go tool cover -func=coverage.out
 
 ### 1.3 治理进展（阶段 1 / P0 行为锁定）
 
-> 最近更新：2026-09-22。本小节记录相对 1.2 基线的变更，1.2 保留为历史基线。
+> 最近更新：2026-09-23。本小节记录相对 1.2 基线的变更，1.2 保留为历史基线。
 
 已完成 P0「先建立安全网」，新增测试，并修复审核阶段发现的 2 个缺陷：
 
@@ -89,8 +89,9 @@ go tool cover -func=coverage.out
 | `internal/health` | `health_test.go` | 0.0% → 100% |
 | `pkg/redis` | `client_test.go` | 0.0% → 100% |
 | `internal/stream` | `stream_test.go`（新增 chunk JSON 合法性校验） | 包 76.5% → 80.1% |
+| `internal/provider`（`ConvertAnthropicMessagesToOpenAI`） | `anthropic_converter_test.go`（新增 9 个 tests） | 包 43.7% → 56.1%，`ConvertAnthropicMessagesToOpenAI` 0% → 100% |
 
-**总语句覆盖率：39.8% → 53.2%**。
+**总语句覆盖率：39.8% → 56.3%**。
 
 验证命令（全部通过）：`go test ./...`、`go test -race ./...`、`go vet ./...`。
 
@@ -252,7 +253,7 @@ P0 表示当前缺少足够回归保护，继续修改可能造成认证、协�
 
 - `protocol.Resolve`：C=36、259 行。
 - `ContentToBlocks`：C=31、83 行。
-- `ConvertAnthropicMessagesToOpenAI`：C=23、100 行。
+- `ConvertAnthropicMessagesToOpenAI`：C=23、100 行。**已完成（refactor/convert-anthropic-messages）**：拆为 4 个职责单一函数，C=23 → 15，覆盖率 0% → 100%。
 - `Normalize` 属于 `internal/toolcall`，不属于 provider 债务。
 
 **行动**
