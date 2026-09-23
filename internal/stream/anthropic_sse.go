@@ -487,104 +487,20 @@ func (c *OpenAIStreamConverter) convert() {
 
 		switch eventType {
 		case "message_start":
-			c.state = oaiStateStarted
-			// Anthropic 的 input_tokens 在 message_start.message.usage 中，需在此提取
-			if msg, ok := event["message"].(map[string]interface{}); ok {
-				if u, ok := msg["usage"].(map[string]interface{}); ok {
-					if v, ok := u["input_tokens"].(float64); ok {
-						c.promptTokens = int(v)
-					}
-				}
-			}
-
+			c.handleMessageStart(event)
 		case "content_block_start":
-			index, _ := event["index"].(float64)
-			switch int(index) {
-			case 0:
-				c.state = oaiStateStreaming
-				c.writeDelta(`{"role":"assistant","content":""}`)
-			case 1:
-				c.state = oaiStateTool
-				c.inTool = true
-				cb, _ := event["content_block"].(map[string]interface{})
-				if id, ok := cb["id"].(string); ok {
-					c.toolID = id
-				} else {
-					c.toolID = "call_" + uuid.New().String()[:8]
-				}
-				if name, ok := cb["name"].(string); ok {
-					c.toolName = name
-				}
-				c.toolInput.Reset()
-				c.writeToolStart()
-			}
-
+			c.handleContentBlockStart(event)
 		case "content_block_delta":
-			idx, _ := event["index"].(float64)
-			d, _ := event["delta"].(map[string]interface{})
-
-			switch int(idx) {
-			case 0:
-				c.state = oaiStateStreaming
-				c.inTool = false
-				if text, ok := d["text"].(string); ok {
-					c.writeTextDelta(text)
-				}
-			case 1:
-				c.state = oaiStateTool
-				c.inTool = true
-				if pj, ok := d["partial_json"].(string); ok {
-					c.toolInput.WriteString(pj)
-					c.writeToolArgsDelta(pj)
-				}
-			}
-
+			c.handleContentBlockDelta(event)
 		case "content_block_stop":
-			idx, _ := event["index"].(float64)
-			switch int(idx) {
-			case 0:
-				c.state = oaiStateStarted
-			case 1:
-				c.inTool = false
-			}
-
+			c.handleContentBlockStop(event)
 		case "message_delta":
-			if c.state == oaiStateDone {
-				break
-			}
-			c.state = oaiStateDone
-
-			d, _ := event["delta"].(map[string]interface{})
-			stopReason, _ := d["stop_reason"].(string)
-			usage, _ := event["usage"].(map[string]interface{})
-
-			finishReason := "stop"
-			if stopReason == "tool_use" {
-				finishReason = "tool_calls"
-			}
-
-			var outputTokens int
-			// output_tokens 在 message_delta.usage 中；input_tokens 已在 message_start 提取
-			if usage != nil {
-				if v, ok := usage["output_tokens"].(float64); ok {
-					outputTokens = int(v)
-				}
-			}
-
-			if c.inTool && c.toolName != "" {
-				argsBytes, _ := json.Marshal(c.toolInput.String())
-				c.writeToolFinal(string(argsBytes), finishReason)
-			} else {
-				c.writeTextFinal(finishReason)
-			}
-			c.writeUsage(outputTokens)
-
+			c.handleMessageDelta(event)
 		case "message_stop":
 			if !c.doneWritten {
 				c.writeDone()
 			}
 			c.state = oaiStateDone
-
 		case "ping":
 			// Anthropic 空闲保活事件。原样丢弃会导致跨协议长生成时空窗期
 			// 网关→客户端连接静默，被中间代理（如 nginx proxy_read_timeout）断开。
@@ -601,6 +517,109 @@ func (c *OpenAIStreamConverter) convert() {
 	if !c.doneWritten {
 		c.writeDone()
 	}
+}
+
+// handleMessageStart 处理 message_start：提取 input_tokens。
+func (c *OpenAIStreamConverter) handleMessageStart(event map[string]interface{}) {
+	c.state = oaiStateStarted
+	// Anthropic 的 input_tokens 在 message_start.message.usage 中，需在此提取
+	if msg, ok := event["message"].(map[string]interface{}); ok {
+		if u, ok := msg["usage"].(map[string]interface{}); ok {
+			if v, ok := u["input_tokens"].(float64); ok {
+				c.promptTokens = int(v)
+			}
+		}
+	}
+}
+
+// handleContentBlockStart 处理 content_block_start：index=0 为文本块，index=1 为工具块。
+func (c *OpenAIStreamConverter) handleContentBlockStart(event map[string]interface{}) {
+	index, _ := event["index"].(float64)
+	switch int(index) {
+	case 0:
+		c.state = oaiStateStreaming
+		c.writeDelta(`{"role":"assistant","content":""}`)
+	case 1:
+		c.state = oaiStateTool
+		c.inTool = true
+		cb, _ := event["content_block"].(map[string]interface{})
+		if id, ok := cb["id"].(string); ok {
+			c.toolID = id
+		} else {
+			c.toolID = "call_" + uuid.New().String()[:8]
+		}
+		if name, ok := cb["name"].(string); ok {
+			c.toolName = name
+		}
+		c.toolInput.Reset()
+		c.writeToolStart()
+	}
+}
+
+// handleContentBlockDelta 处理 content_block_delta：index=0 为文本增量，index=1 为工具参数增量。
+func (c *OpenAIStreamConverter) handleContentBlockDelta(event map[string]interface{}) {
+	idx, _ := event["index"].(float64)
+	d, _ := event["delta"].(map[string]interface{})
+
+	switch int(idx) {
+	case 0:
+		c.state = oaiStateStreaming
+		c.inTool = false
+		if text, ok := d["text"].(string); ok {
+			c.writeTextDelta(text)
+		}
+	case 1:
+		c.state = oaiStateTool
+		c.inTool = true
+		if pj, ok := d["partial_json"].(string); ok {
+			c.toolInput.WriteString(pj)
+			c.writeToolArgsDelta(pj)
+		}
+	}
+}
+
+// handleContentBlockStop 处理 content_block_stop。
+func (c *OpenAIStreamConverter) handleContentBlockStop(event map[string]interface{}) {
+	idx, _ := event["index"].(float64)
+	switch int(idx) {
+	case 0:
+		c.state = oaiStateStarted
+	case 1:
+		c.inTool = false
+	}
+}
+
+// handleMessageDelta 处理 message_delta：发出最终 chunk 与 usage。
+func (c *OpenAIStreamConverter) handleMessageDelta(event map[string]interface{}) {
+	if c.state == oaiStateDone {
+		return
+	}
+	c.state = oaiStateDone
+
+	d, _ := event["delta"].(map[string]interface{})
+	stopReason, _ := d["stop_reason"].(string)
+	usage, _ := event["usage"].(map[string]interface{})
+
+	finishReason := "stop"
+	if stopReason == "tool_use" {
+		finishReason = "tool_calls"
+	}
+
+	var outputTokens int
+	// output_tokens 在 message_delta.usage 中；input_tokens 已在 message_start 提取
+	if usage != nil {
+		if v, ok := usage["output_tokens"].(float64); ok {
+			outputTokens = int(v)
+		}
+	}
+
+	if c.inTool && c.toolName != "" {
+		argsBytes, _ := json.Marshal(c.toolInput.String())
+		c.writeToolFinal(string(argsBytes), finishReason)
+	} else {
+		c.writeTextFinal(finishReason)
+	}
+	c.writeUsage(outputTokens)
 }
 
 // helpers — 每种输出封装为独立方法
