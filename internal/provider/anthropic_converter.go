@@ -305,6 +305,55 @@ func (c *AnthropicConverter) ConvertRequest(req *AnthropicRequest) (map[string]i
 }
 
 // ConvertResponse 将后端返回的 ChatCompletionResponse 转为 Anthropic 格式的响应
+// filterAnthropicContent 从上游响应中提取 content 字段，
+// 过滤掉 proxy 特有的 thinking / cache_control 块（客户端无法解析 {type:"thinking"}）。
+// 返回适合直接赋给 anthropicResp["content"] 的值。
+func filterAnthropicContent(respBody map[string]interface{}) interface{} {
+	if content, ok := respBody["content"].([]interface{}); ok && len(content) > 0 {
+		filteredContent := make([]map[string]interface{}, 0, len(content))
+		for _, block := range content {
+			if blockMap, ok := block.(map[string]interface{}); ok {
+				if blockType, ok := blockMap["type"].(string); ok {
+					if blockType == "thinking" || blockType == "cache_control" {
+						continue
+					}
+				}
+				filteredContent = append(filteredContent, blockMap)
+			}
+		}
+		return filteredContent
+	}
+	if content, ok := respBody["content"].(string); ok {
+		return content
+	}
+	return ""
+}
+
+// buildAnthropicUsage 从上游响应中提取 usage，
+// 兼容 Anthropic 格式（input_tokens/output_tokens）与 OpenAI 格式（prompt_tokens/completion_tokens）。
+func buildAnthropicUsage(respBody map[string]interface{}) map[string]interface{} {
+	var inputTokens, outputTokens, totalTokens float64
+	if usage, ok := respBody["usage"].(map[string]interface{}); ok {
+		inputTokens, _ = usage["input_tokens"].(float64)
+		outputTokens, _ = usage["output_tokens"].(float64)
+		if inputTokens == 0 {
+			inputTokens, _ = usage["prompt_tokens"].(float64)
+		}
+		if outputTokens == 0 {
+			outputTokens, _ = usage["completion_tokens"].(float64)
+		}
+		totalTokens, _ = usage["total_tokens"].(float64)
+		if totalTokens == 0 {
+			totalTokens = inputTokens + outputTokens
+		}
+	}
+	return map[string]interface{}{
+		"input_tokens":  int(inputTokens),
+		"output_tokens": int(outputTokens),
+		"total_tokens":  int(totalTokens),
+	}
+}
+
 func (c *AnthropicConverter) ConvertResponse(resp *http.Response) ([]byte, error) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -340,49 +389,10 @@ func (c *AnthropicConverter) ConvertResponse(resp *http.Response) ([]byte, error
 	anthropicResp["finish_reason"] = finishReason
 
 	// content：直接从响应中获取（后端已返回 Anthropic 格式）
-	if content, ok := respBody["content"].([]interface{}); ok && len(content) > 0 {
-		// 过滤掉 proxy 特有的字段（thinking, cache_control 等）
-		filteredContent := make([]map[string]interface{}, 0, len(content))
-		for _, block := range content {
-			if blockMap, ok := block.(map[string]interface{}); ok {
-				// 跳过 thinking 和 cache_control 整个块，而非仅删除字段
-				// 否则客户端解析到 {type: "thinking"} 会尝试访问 s.thinking.length → undefined
-				if blockType, ok := blockMap["type"].(string); ok {
-					if blockType == "thinking" || blockType == "cache_control" {
-						continue
-					}
-				}
-				filteredContent = append(filteredContent, blockMap)
-			}
-		}
-		anthropicResp["content"] = filteredContent
-	} else if content, ok := respBody["content"].(string); ok {
-		anthropicResp["content"] = content
-	} else {
-		anthropicResp["content"] = ""
-	}
+	anthropicResp["content"] = filterAnthropicContent(respBody)
 
-	// usage：支持 Anthropic 格式（input_tokens/output_tokens）和后端代理的 OpenAI 格式（prompt_tokens/completion_tokens）
-	var inputTokens, outputTokens, totalTokens float64
-	if usage, ok := respBody["usage"].(map[string]interface{}); ok {
-		inputTokens, _ = usage["input_tokens"].(float64)
-		outputTokens, _ = usage["output_tokens"].(float64)
-		if inputTokens == 0 {
-			inputTokens, _ = usage["prompt_tokens"].(float64)
-		}
-		if outputTokens == 0 {
-			outputTokens, _ = usage["completion_tokens"].(float64)
-		}
-		totalTokens, _ = usage["total_tokens"].(float64)
-		if totalTokens == 0 {
-			totalTokens = inputTokens + outputTokens
-		}
-	}
-	anthropicResp["usage"] = map[string]interface{}{
-		"input_tokens":  int(inputTokens),
-		"output_tokens": int(outputTokens),
-		"total_tokens":  int(totalTokens),
-	}
+	// usage：支持 Anthropic 格式和 OpenAI 格式
+	anthropicResp["usage"] = buildAnthropicUsage(respBody)
 
 	jsonBody, err := json.Marshal(anthropicResp)
 	if err != nil {
@@ -422,49 +432,11 @@ func (c *AnthropicConverter) ConvertResponseWithModel(resp *http.Response, virtu
 	}
 	anthropicResp["finish_reason"] = finishReason
 
-	// content：过滤掉 proxy 特有字段（thinking, cache_control 等）
-	if content, ok := respBody["content"].([]interface{}); ok && len(content) > 0 {
-		filteredContent := make([]map[string]interface{}, 0, len(content))
-		for _, block := range content {
-			if blockMap, ok := block.(map[string]interface{}); ok {
-				// 跳过 thinking 和 cache_control 整个块，而非仅删除字段
-				// 否则客户端解析到 {type: "thinking"} 会尝试访问 s.thinking.length → undefined
-				if blockType, ok := blockMap["type"].(string); ok {
-					if blockType == "thinking" || blockType == "cache_control" {
-						continue
-					}
-				}
-				filteredContent = append(filteredContent, blockMap)
-			}
-		}
-		anthropicResp["content"] = filteredContent
-	} else if content, ok := respBody["content"].(string); ok {
-		anthropicResp["content"] = content
-	} else {
-		anthropicResp["content"] = ""
-	}
+	// content：过滤掉 proxy 特有字段
+	anthropicResp["content"] = filterAnthropicContent(respBody)
 
-	// usage：支持 Anthropic 格式（input_tokens/output_tokens）和后端代理的 OpenAI 格式（prompt_tokens/completion_tokens）
-	var inputTokens, outputTokens, totalTokens float64
-	if usage, ok := respBody["usage"].(map[string]interface{}); ok {
-		inputTokens, _ = usage["input_tokens"].(float64)
-		outputTokens, _ = usage["output_tokens"].(float64)
-		if inputTokens == 0 {
-			inputTokens, _ = usage["prompt_tokens"].(float64)
-		}
-		if outputTokens == 0 {
-			outputTokens, _ = usage["completion_tokens"].(float64)
-		}
-		totalTokens, _ = usage["total_tokens"].(float64)
-		if totalTokens == 0 {
-			totalTokens = inputTokens + outputTokens
-		}
-	}
-	anthropicResp["usage"] = map[string]interface{}{
-		"input_tokens":  int(inputTokens),
-		"output_tokens": int(outputTokens),
-		"total_tokens":  int(totalTokens),
-	}
+	// usage：支持 Anthropic 格式和 OpenAI 格式
+	anthropicResp["usage"] = buildAnthropicUsage(respBody)
 
 	jsonBody, err := json.Marshal(anthropicResp)
 	if err != nil {
