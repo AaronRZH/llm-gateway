@@ -31,11 +31,11 @@ go tool cover -func=coverage.out
 | 指标 | 当前值 |
 |------|--------|
 | 生产 Go 文件数 | 28 |
-| 函数/方法数 | 401 |
-| 代码行 | 8634 |
-| 平均函数复杂度 | 4.38 |
-| 最大函数复杂度 | 20（`Normalize` / `OpenAIStreamConverter.convert`） |
-| 最大函数行数 | 92（`Normalize` / `AnthropicSSEConverter.convert`） |
+| 函数/方法数 | 404 |
+| 代码行 | 8638 |
+| 平均函数复杂度 | 4.37 |
+| 最大函数复杂度 | 20（`OpenAIStreamConverter.convert`） |
+| 最大函数行数 | 92（`AnthropicSSEConverter.convert`） |
 | 测试文件数 | 26 |
 | 总语句覆盖率 | 61.3% |
 
@@ -43,7 +43,6 @@ go tool cover -func=coverage.out
 
 | 函数 | 位置 | 复杂度 | 行数 |
 |------|------|--------|------|
-| `Normalize` | `internal/toolcall/toolcall.go` | 20 | 92 |
 | `OpenAIStreamConverter.convert` | `internal/stream/anthropic_sse.go` | 20 | 79 |
 | `main` | `cmd/gateway/main.go` | 19 | 193 |
 | `AnthropicSSEConverter.convert` | `internal/stream/anthropic_sse.go` | 19 | 92 |
@@ -52,8 +51,9 @@ go tool cover -func=coverage.out
 | `rewriteXMLToolCallsChecked` | `cmd/gateway/handlers.go` | 17 | 58 |
 | `extractUsage` | `internal/stream/stream.go` | 16 | 63 |
 | `handleAnthropicMessages` | `cmd/gateway/handlers.go` | 15 | 121 |
+| `ConvertAnthropicToOpenAIResponse` | `internal/provider/anthropic_converter.go` | 15 | 102 |
 
-> 复杂度基线已从阶段 1 的最高值 48 降至 20。`RewriteAndForwardWithToolRepair`（原 C=48）、`ConvertAnthropicMessagesToOpenAI`（原 C=23）、`handleAnthropicMessages`（原 C=28）、`handleChatCompletion`（原 C=25）、`handleCountTokens`（原 C=20）、`ConvertResponse`（原 C=20）与 `ConvertResponseWithModel`（原 C=19）均已拆分，不再进入前 9 名。剩余热点集中在 `internal/toolcall` 的 `Normalize`（C=20）和 `internal/stream` 的 `OpenAIStreamConverter.convert`（C=20）。
+> 复杂度基线已从阶段 1 的最高值 48 降至 20。`RewriteAndForwardWithToolRepair`（原 C=48）、`ConvertAnthropicMessagesToOpenAI`（原 C=23）、`handleAnthropicMessages`（原 C=28）、`handleChatCompletion`（原 C=25）、`handleCountTokens`（原 C=20）、`ConvertResponse`（原 C=20）、`ConvertResponseWithModel`（原 C=19）与 `Normalize`（原 C=20）均已拆分，不再进入前 9 名。剩余热点集中在 `internal/stream` 的 `OpenAIStreamConverter.convert`（C=20）和 `AnthropicSSEConverter.convert`（C=19）。
 
 重点包覆盖率：
 
@@ -123,6 +123,7 @@ go tool cover -func=coverage.out
 | `cmd/gateway`（`handleChatCompletion`） | 拆为 4 个函数（`resolveOpenAICandidate`、`forwardOpenAIStreamResponse`、`forwardOpenAINonStreamResponse`、`selectChatStreamCandidate`），10 个 characterization tests 保持通过 | C=25 → 14（达成 ≤15 目标），219 → 112 行 |
 | `cmd/gateway`（`handleCountTokens`） | 拆为 2 个函数（`resolveCountTokensTarget`、`proxyCountTokensResponse`），消除两条 CountTokens 路径的重复调用/解析/转发逻辑（~60 行 → 1 个函数），既有测试保持通过 | C=20 → <12（跌破 metrics 显示阈值），113 → 33 行 |
 | `internal/provider`（`ConvertResponse` + `ConvertResponseWithModel`） | 提取 2 个纯函数（`filterAnthropicContent`、`buildAnthropicUsage`），消除两个方法间约 50 行重复的 content 过滤和 usage 提取逻辑，既有测试保持通过 | C=20/19 → <12（均跌破 metrics 显示阈值），86/80 → 46/42 行 |
+| `internal/toolcall`（`Normalize`） | 提取 3 个纯函数（`matchFamilyTag`、`findToolCallEnd`、`buildToolCallEntry`），将 tag 匹配、结束位置查找、条目构建从主循环中分离，既有测试保持通过 | C=20 → <12（跌破 metrics 显示阈值），92 → 58 行 |
 
 **总语句覆盖率：56.3% → 61.3%**。
 
