@@ -42,20 +42,9 @@ func AdminAuth(cfg *config.Config) gin.HandlerFunc {
 
 		// 1. 尝试 JWT Bearer token
 		if strings.HasPrefix(authHeader, "Bearer ") {
-			tokenStr := strings.TrimSpace(authHeader[7:])
-			token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
-				if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-					return nil, jwt.ErrSignatureInvalid
-				}
-				return []byte(jwtSecret), nil
-			})
-			if err == nil && token.Valid {
-				if claims, ok := token.Claims.(jwt.MapClaims); ok {
-					if claims["sub"] == "admin" {
-						c.Next()
-						return
-					}
-				}
+			if validateJWTToken(authHeader[7:], jwtSecret) {
+				c.Next()
+				return
 			}
 			c.Header("WWW-Authenticate", `Bearer realm="Admin", error="invalid_token"`)
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired token"})
@@ -64,24 +53,47 @@ func AdminAuth(cfg *config.Config) gin.HandlerFunc {
 
 		// 2. 兼容 Basic Auth（仅当配置了密码时）
 		if password != "" && strings.HasPrefix(authHeader, "Basic ") {
-			authStr := strings.TrimSpace(authHeader[6:])
-			if authStr == expectedBasic {
+			if validateBasicAuth(authHeader[6:], expectedBasic, plainPass) {
 				c.Next()
 				return
-			}
-			decoded, err := base64.StdEncoding.DecodeString(authStr)
-			if err == nil {
-				parts := strings.SplitN(string(decoded), ":", 2)
-				if len(parts) == 2 && parts[0] == "admin" && parts[1] == plainPass {
-					c.Next()
-					return
-				}
 			}
 		}
 
 		c.Header("WWW-Authenticate", `Bearer realm="Admin"`)
 		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid authorization format"})
 	}
+}
+
+// validateJWTToken 校验 JWT Bearer token 是否为有效的 admin token。
+func validateJWTToken(tokenStr string, jwtSecret string) bool {
+	token, err := jwt.Parse(strings.TrimSpace(tokenStr), func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, jwt.ErrSignatureInvalid
+		}
+		return []byte(jwtSecret), nil
+	})
+	if err != nil || !token.Valid {
+		return false
+	}
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return false
+	}
+	return claims["sub"] == "admin"
+}
+
+// validateBasicAuth 校验 Basic Auth 凭据是否匹配预计算的值或可解码的明文。
+func validateBasicAuth(authStr string, expectedBasic string, plainPass string) bool {
+	authStr = strings.TrimSpace(authStr)
+	if authStr == expectedBasic {
+		return true
+	}
+	decoded, err := base64.StdEncoding.DecodeString(authStr)
+	if err != nil {
+		return false
+	}
+	parts := strings.SplitN(string(decoded), ":", 2)
+	return len(parts) == 2 && parts[0] == "admin" && parts[1] == plainPass
 }
 
 // GenerateAdminToken 生成管理后台 JWT token
