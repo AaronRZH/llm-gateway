@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -30,17 +31,6 @@ import (
 )
 
 func main() {
-	// 加载 .env 文件（优先配置文件所在目录的父目录，再回退到当前工作目录）
-	configDir := filepath.Dir("configs/config.yaml")
-	envFile := filepath.Join(configDir, "..", ".env")
-	if _, err := os.Stat(envFile); err == nil {
-		if err := godotenv.Load(envFile); err != nil {
-			log.Warn().Err(err).Msg("failed to load .env file")
-		}
-	} else if err := godotenv.Load(); err != nil {
-		log.Warn().Err(err).Msg("failed to load .env file, using system environment variables")
-	}
-
 	// 加载配置
 	cfg, err := config.Load("configs/config.yaml")
 	if err != nil {
@@ -67,7 +57,7 @@ func main() {
 	// 初始化各模块
 	mapperService := mapper.New(cfg.Models)
 	tokenService := token.New(cfg.Token)
-	providerManager := provider.NewManager(cfg.Providers)
+	providerManager := provider.NewManager(cfg.Providers, cfg.Debug)
 	routerService := router.New(cfg.RealModels, providerManager, tokenService, cfg.CircuitBreaker, modelTiers)
 	streamHandler := stream.New(cfg.Stream.IdleTimeout)
 
@@ -161,19 +151,7 @@ func main() {
 	})
 
 	// 启动 pprof 调试端口（默认关闭，仅绑定 127.0.0.1，避免生产暴露）
-	if cfg.Debug.PprofEnabled {
-		pprofPort := cfg.Debug.PprofPort
-		if pprofPort == 0 {
-			pprofPort = 6060
-		}
-		go func() {
-			addr := fmt.Sprintf("127.0.0.1:%d", pprofPort)
-			log.Info().Str("addr", addr).Msg("pprof debug server enabled")
-			if err := http.ListenAndServe(addr, nil); err != nil && err != http.ErrServerClosed {
-				log.Error().Err(err).Msg("pprof debug server failed")
-			}
-		}()
-	}
+	startPprofServer(cfg.Debug)
 
 	// 启动 HTTP 服务
 	srv := &http.Server{
@@ -193,6 +171,40 @@ func main() {
 	log.Info().Int("port", cfg.App.Port).Msg("server started")
 
 	// 优雅关闭
+	shutdownServer(srv, redisClient, usageStorage)
+}
+
+func loadEnvFile() {
+	// 加载 .env 文件（优先配置文件所在目录的父目录，再回退到当前工作目录）
+	configDir := filepath.Dir("configs/config.yaml")
+	envFile := filepath.Join(configDir, "..", ".env")
+	if _, err := os.Stat(envFile); err == nil {
+		if err := godotenv.Load(envFile); err != nil {
+			log.Warn().Err(err).Msg("failed to load .env file")
+		}
+	} else if err := godotenv.Load(); err != nil {
+		log.Warn().Err(err).Msg("failed to load .env file, using system environment variables")
+	}
+}
+
+func startPprofServer(debug config.DebugConfig) {
+	if !debug.PprofEnabled {
+		return
+	}
+	pprofPort := debug.PprofPort
+	if pprofPort == 0 {
+		pprofPort = 6060
+	}
+	go func() {
+		addr := fmt.Sprintf("127.0.0.1:%d", pprofPort)
+		log.Info().Str("addr", addr).Msg("pprof debug server enabled")
+		if err := http.ListenAndServe(addr, nil); err != nil && err != http.ErrServerClosed {
+			log.Error().Err(err).Msg("pprof debug server failed")
+		}
+	}()
+}
+
+func shutdownServer(srv *http.Server, redisClient io.Closer, usageStorage storage.UsageStorage) {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
