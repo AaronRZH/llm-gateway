@@ -31,11 +31,11 @@ go tool cover -func=coverage.out
 | 指标 | 当前值 |
 |------|--------|
 | 生产 Go 文件数 | 28 |
-| 函数/方法数 | 412 |
-| 代码行 | 8769 |
-| 平均函数复杂度 | 4.33 |
-| 最大函数复杂度 | 19（`main` / `completeContentBlock`） |
-| 最大函数行数 | 193（`main`） |
+| 函数/方法数 | 422 |
+| 代码行 | 8816 |
+| 平均函数复杂度 | 4.23 |
+| 最大函数复杂度 | 15（`handleAnthropicMessages` / `ConvertAnthropicToOpenAIResponse` / `scanAndForward` / `postProcessToolCalls` / `convertAnthropicMessages`） |
+| 最大函数行数 | 121（`handleAnthropicMessages`） |
 | 测试文件数 | 26 |
 | 总语句覆盖率 | 61.3% |
 
@@ -43,17 +43,17 @@ go tool cover -func=coverage.out
 
 | 函数 | 位置 | 复杂度 | 行数 |
 |------|------|--------|------|
-| `main` | `cmd/gateway/main.go` | 19 | 193 |
-| `completeContentBlock` | `internal/provider/anthropic_converter.go` | 19 | 43 |
-| `AdminAuth` | `internal/middleware/adminauth.go` | 18 | 70 |
-| `rewriteXMLToolCallsChecked` | `cmd/gateway/handlers.go` | 17 | 58 |
-| `extractUsage` | `internal/stream/stream.go` | 16 | 63 |
 | `handleAnthropicMessages` | `cmd/gateway/handlers.go` | 15 | 121 |
 | `ConvertAnthropicToOpenAIResponse` | `internal/provider/anthropic_converter.go` | 15 | 102 |
 | `scanAndForward` | `internal/stream/stream.go` | 15 | 75 |
 | `postProcessToolCalls` | `internal/stream/stream.go` | 15 | 70 |
+| `convertAnthropicMessages` | `internal/provider/anthropic_converter.go` | 15 | 53 |
+| `handleChatCompletion` | `cmd/gateway/handlers.go` | 14 | 112 |
+| `handleAdminUpdateProvider` | `cmd/gateway/handlers.go` | 14 | 77 |
+| `parseContentBlocks` | `internal/provider/anthropic_converter.go` | 14 | 64 |
+| `OpenAIStreamConverter.processLine` | `internal/stream/anthropic_sse.go` | 14 | 50 |
 
-> 复杂度基线已从阶段 1 的最高值 48 降至 19。`RewriteAndForwardWithToolRepair`（原 C=48）、`OpenAIStreamConverter.convert`（原 C=39→20→<12）、`AnthropicSSEConverter.convert`（原 C=33→19→<12）、`ConvertAnthropicMessagesToOpenAI`（原 C=23）、`handleAnthropicMessages`（原 C=28）、`handleChatCompletion`（原 C=25）、`handleCountTokens`（原 C=20）、`ConvertResponse`（原 C=20）、`ConvertResponseWithModel`（原 C=19）与 `Normalize`（原 C=20）均已拆分，不再进入前 9 名。剩余热点集中在 `main`（C=19）、`completeContentBlock`（C=19）与 `AdminAuth`（C=18）。
+> **所有函数复杂度已降至 ≤15，达成阶段 1.5 目标。** 复杂度基线从阶段 1 的最高值 48 降至 15。已拆分的函数：`RewriteAndForwardWithToolRepair`（C=48→<12）、`OpenAIStreamConverter.convert`（C=39→<12）、`AnthropicSSEConverter.convert`（C=33→<12）、`ConvertAnthropicMessagesToOpenAI``（C=23→15）、`handleAnthropicMessages`（C=28→15）、`handleChatCompletion`（C=25→14）、`handleCountTokens`（C=20→<12）、`ConvertResponse`（C=20→<12）、`ConvertResponseWithModel`（C=19→<12）、`Normalize`（C=20→<12）、`main`（C=19→7）、`completeContentBlock`（C=19→<12）、`AdminAuth`（C=18→10）、`rewriteXMLToolCallsChecked`（C=17→<12）、`extractUsage`（C=16→<12）。
 
 重点包覆盖率：
 
@@ -126,8 +126,13 @@ go tool cover -func=coverage.out
 | `internal/toolcall`（`Normalize`） | 提取 3 个纯函数（`matchFamilyTag`、`findToolCallEnd`、`buildToolCallEntry`），将 tag 匹配、结束位置查找、条目构建从主循环中分离，既有测试保持通过 | C=20 → <12（跌破 metrics 显示阈值），92 → 58 行 |
 | `internal/stream`（`OpenAIStreamConverter.convert`） | 提取 `processLine` 方法封装循环体（空行跳过、注释保活转发、payload 解析、7 类事件分发），`convert` 仅保留 scanner 设置、循环调度和收尾，既有测试保持通过 | C=20 → <12（跌破 metrics 显示阈值），79 → 31 行 |
 | `internal/stream`（`AnthropicSSEConverter.convert`） | 提取 `processLine` 方法封装循环体（空行跳过、注释保活转发、[DONE] 处理、payload 解析、role/tool_calls/content/finish_reason/usage 事件分发），`convert` 仅保留 scanner 设置、循环调度和收尾，既有测试保持通过 | C=19 → <12（跌破 metrics 显示阈值），92 → 34 行 |
+| `cmd/gateway`（`main`） | 提取 3 个函数（`loadEnvFile`、`startPprofServer`、`shutdownServer`），将 .env 加载、pprof 启动、优雅关闭从 main 中分离 | C=19 → 7（远超 ≤15 目标），193 → 143 行 |
+| `internal/provider`（`completeContentBlock`） | 用表驱动替代 7-case switch，提取 `blockDefaults` 映射表和遍历循环 | C=19 → <12（跌破 metrics 显示阈值），43 → 26 行 |
+| `internal/middleware`（`AdminAuth`） | 提取 2 个纯函数（`validateJWTToken`、`validateBasicAuth`），将 JWT 校验和 Basic Auth 校验从闭包中分离 | C=18 → 10（远超 ≤15 目标），70 → 55 行 |
+| `cmd/gateway`（`rewriteXMLToolCallsChecked`） | 提取 2 个函数（`extractMessageFromResp`、`rewriteXMLToolCallsInMessage`），将 JSON 解析、message 提取、XML 重写分离 | C=17 → <12（跌破 metrics 显示阈值），58 → 24 行 |
+| `internal/stream`（`extractUsage`） | 提取 3 个纯函数（`extractOpenAIUsage`、`extractAnthropicStartUsage`、`extractAnthropicDeltaUsage`），将三种格式的解析分离 | C=16 → <12（跌破 metrics 显示阈值），63 → 7 行 |
 
-**总语句覆盖率：56.3% → 61.3%**。
+**所有函数复杂度已降至 ≤15，达成阶段 1.5 目标。** 总语句覆盖率：56.3% → 61.3%。
 
 **新发现的缺陷（已修复）**：`RedisStorage.summarizeRecordsByRealModel` 创建 bucket 后未把指针赋给循环变量 `b`，首条记录即触发 nil pointer panic。同文件其他三个分桶方法（`summarizeRecordsDaily/Weekly/Monthly`）均有 `b = buckets[key]`，唯独此处缺失——典型的复制粘贴遗留 bug。
 
