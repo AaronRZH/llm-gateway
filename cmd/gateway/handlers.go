@@ -380,6 +380,81 @@ func handleListModels(mapper *mapper.Service) gin.HandlerFunc {
 }
 
 // handleCountTokens 代理 /v1/messages/count_tokens 请求到上游 Anthropic 端点
+// proxyCountTokensResponse 调用 provider 的 CountTokens，解析响应中的 usage 字段并转发。
+// 若上游返回 200 且 body 中包含 usage，则提取 usage 返回；否则原样转发上游状态码与 body。
+// 两处调用（通过路由解析 target 和 anthropic 兜底）共用此逻辑以消除重复。
+func proxyCountTokensResponse(c *gin.Context, ctx context.Context, providerName string, body []byte, callCountTokens func(ctx context.Context, body []byte) (*http.Response, error)) {
+	resp, err := callCountTokens(ctx, body)
+	if err != nil {
+		log.Error().Err(err).Str("provider", providerName).Msg("count_tokens upstream request failed")
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+
+	// 如果上游返回了 usage 字段，提取并返回 token 统计
+	if resp.StatusCode == http.StatusOK {
+		var parsedResp map[string]interface{}
+		if json.Unmarshal(respBody, &parsedResp) == nil {
+			if u, ok := parsedResp["usage"].(map[string]interface{}); ok {
+				c.JSON(http.StatusOK, gin.H{"usage": u})
+				return
+			}
+		}
+	}
+
+	// 没有 usage（上游可能返回 error），原样转发
+	c.Data(resp.StatusCode, "application/json", respBody)
+}
+
+// resolveCountTokensTarget 解析请求 body 中的 model 字段，校验模型并路由选择，
+// 将 body 中的 model 替换为真实模型名后返回更新后的 body 与目标。
+// 返回 (body, target, ok)；ok 为 false 时已向客户端写入错误响应，调用方应 return。
+func resolveCountTokensTarget(
+	c *gin.Context,
+	mapper *mapper.Service,
+	routerSvc *router.Service,
+	body []byte,
+) ([]byte, *router.Target, bool) {
+	var parseReq struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(body, &parseReq); err != nil || parseReq.Model == "" {
+		// 没有 model 字段或 model 为空，由调用方走 anthropic 兜底路径
+		return body, nil, false
+	}
+
+	// 模型未配置则直接 404
+	if err := mapper.Validate(parseReq.Model); err != nil {
+		log.Warn().Str("model", parseReq.Model).Msg("count_tokens model not found in mapping")
+		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("model '%s' not found in mapping", parseReq.Model)})
+		return body, nil, false
+	}
+
+	// 通过路由获取真实模型（支持 fallback chain）
+	sel, err := routerSvc.SelectCandidates(c.Request.Context(), parseReq.Model, 0)
+	if err != nil {
+		log.Warn().Str("model", parseReq.Model).Msg("count_tokens router selection failed")
+		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("model '%s' has no available target", parseReq.Model)})
+		return body, nil, false
+	}
+	target := sel.Next()
+	if target == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("model '%s' has no available target", parseReq.Model)})
+		return body, nil, false
+	}
+
+	// 将请求体中的 model 字段替换为真实模型名
+	var reqMap map[string]interface{}
+	if json.Unmarshal(body, &reqMap) == nil {
+		reqMap["model"] = target.Model
+		body, _ = json.Marshal(reqMap)
+	}
+	return body, target, true
+}
+
 func handleCountTokens(mapper *mapper.Service, routerSvc *router.Service, providerManager *provider.Manager) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		body, err := io.ReadAll(c.Request.Body)
@@ -389,37 +464,8 @@ func handleCountTokens(mapper *mapper.Service, routerSvc *router.Service, provid
 		}
 
 		// 解析虚拟模型名，解析到真实模型名并注入请求体
-		var parseReq struct {
-			Model string `json:"model"`
-		}
-		if err := json.Unmarshal(body, &parseReq); err == nil && parseReq.Model != "" {
-			// 模型未配置则直接 404
-			if err := mapper.Validate(parseReq.Model); err != nil {
-				log.Warn().Str("model", parseReq.Model).Msg("count_tokens model not found in mapping")
-				c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("model '%s' not found in mapping", parseReq.Model)})
-				return
-			}
-
-			// 通过路由获取真实模型（支持 fallback chain）
-			sel, err := routerSvc.SelectCandidates(c.Request.Context(), parseReq.Model, 0)
-			if err != nil {
-				log.Warn().Str("model", parseReq.Model).Msg("count_tokens router selection failed")
-				c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("model '%s' has no available target", parseReq.Model)})
-				return
-			}
-			target := sel.Next()
-			if target == nil {
-				c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("model '%s' has no available target", parseReq.Model)})
-				return
-			}
-
-			// 将请求体中的 model 字段替换为真实模型名
-			var reqMap map[string]interface{}
-			if json.Unmarshal(body, &reqMap) == nil {
-				reqMap["model"] = target.Model
-				body, _ = json.Marshal(reqMap)
-			}
-
+		body, target, ok := resolveCountTokensTarget(c, mapper, routerSvc, body)
+		if ok {
 			// 非 Anthropic 上游不支持 /count_tokens，本地粗略估算
 			if target.Provider.GetProtocol() != provider.ProtocolAnthropic {
 				estimatedInput := len(body) / 4 // 简单字符估算
@@ -430,67 +476,17 @@ func handleCountTokens(mapper *mapper.Service, routerSvc *router.Service, provid
 			}
 
 			// 使用路由解析到的 provider 发送 count_tokens 请求
-			resp, err := target.Provider.CountTokens(c.Request.Context(), body)
-			if err != nil {
-				log.Error().Err(err).Str("provider", target.ProviderName).Msg("count_tokens upstream request failed")
-				c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
-				return
-			}
-			defer resp.Body.Close()
-
-			respBody, _ := io.ReadAll(resp.Body)
-
-			// 如果上游返回了 usage 字段，提取并返回 token 统计
-			if resp.StatusCode == http.StatusOK {
-				var usageData map[string]interface{}
-				var parsedResp map[string]interface{}
-				if json.Unmarshal(respBody, &parsedResp) == nil {
-					if u, ok := parsedResp["usage"].(map[string]interface{}); ok {
-						usageData = u
-					}
-				}
-				if usageData != nil {
-					c.JSON(http.StatusOK, gin.H{"usage": usageData})
-					return
-				}
-			}
-
-			// 没有 usage（上游可能返回 error），原样转发
-			c.Data(resp.StatusCode, "application/json", respBody)
+			proxyCountTokensResponse(c, c.Request.Context(), target.ProviderName, body, target.Provider.CountTokens)
 			return
 		}
 
 		// 没有 model 字段或 model 为空时，尝试直接调用 anthropic provider 兜底
-		p, ok := providerManager.Get("anthropic")
-		if !ok {
+		p, found := providerManager.Get("anthropic")
+		if !found {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "anthropic provider not available"})
 			return
 		}
-		resp, err := p.CountTokens(c.Request.Context(), body)
-		if err != nil {
-			log.Error().Err(err).Msg("count_tokens upstream request failed")
-			c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
-			return
-		}
-		defer resp.Body.Close()
-
-		respBody, _ := io.ReadAll(resp.Body)
-
-		if resp.StatusCode == http.StatusOK {
-			var usageData map[string]interface{}
-			var parsedResp map[string]interface{}
-			if json.Unmarshal(respBody, &parsedResp) == nil {
-				if u, ok := parsedResp["usage"].(map[string]interface{}); ok {
-					usageData = u
-				}
-			}
-			if usageData != nil {
-				c.JSON(http.StatusOK, gin.H{"usage": usageData})
-				return
-			}
-		}
-
-		c.Data(resp.StatusCode, "application/json", respBody)
+		proxyCountTokensResponse(c, c.Request.Context(), "anthropic", body, p.CountTokens)
 	}
 }
 
