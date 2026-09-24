@@ -94,6 +94,58 @@ func paramRe() *regexp.Regexp {
 //  2. Nested parameters: <parameter=a>1</parameter>
 //
 // Missing close tags are tolerated: the next sibling open tag terminates the block.
+// matchFamilyTag matches an open tag against all supported families and
+// returns the tool name and close tag, or empty strings if no family matches.
+func matchFamilyTag(openTag string) (name string, closeTag string) {
+	for _, f := range families {
+		fr := regexp.MustCompile(f.open)
+		if m := fr.FindStringSubmatch(openTag); m != nil {
+			return m[1], f.close
+		}
+	}
+	return "", ""
+}
+
+// findToolCallEnd determines where a tool call ends by searching for the
+// close tag and the next sibling open tag, returning the earliest end offset
+// and which was found first (0 = close tag, 1 = sibling open tag, -1 = neither).
+func findToolCallEnd(rest string, closeTag string, name string, sibRe *regexp.Regexp) (end int, chosen int, effectiveCloseTag string) {
+	closeIdx := strings.Index(rest, closeTag)
+	if closeIdx < 0 {
+		closeIdx = strings.Index(rest, LT_SL+name+GT)
+		closeTag = LT_SL + name + GT
+	}
+	sibIdx := -1
+	if sibLoc := sibRe.FindStringIndex(rest); sibLoc != nil {
+		sibIdx = sibLoc[0]
+	}
+	end = -1
+	chosen = -1
+	if closeIdx >= 0 && (end < 0 || closeIdx < end) {
+		end = closeIdx
+		chosen = 0
+	}
+	if sibIdx >= 0 && (end < 0 || sibIdx < end) {
+		end = sibIdx
+		chosen = 1
+	}
+	return end, chosen, closeTag
+}
+
+// buildToolCallEntry constructs an OpenAIToolCall from a parsed tool name and payload.
+func buildToolCallEntry(name, payload string, pRe *regexp.Regexp) OpenAIToolCall {
+	args := extractArgs(payload, pRe)
+	argsJSON, _ := json.Marshal(args)
+	return OpenAIToolCall{
+		ID:   "call_" + uuid.New().String()[:8],
+		Type: "function",
+		Function: map[string]interface{}{
+			"name":      name,
+			"arguments": string(argsJSON),
+		},
+	}
+}
+
 func Normalize(text string) Result {
 	r := Result{}
 	if text == "" {
@@ -121,47 +173,22 @@ func Normalize(text string) Result {
 		absStart := searchFrom + loc[0]
 		absEnd := searchFrom + loc[1]
 		openTag := remaining[loc[0]:loc[1]]
-		var name, closeTag string
-		for _, f := range families {
-			fr := regexp.MustCompile(f.open)
-			if m := fr.FindStringSubmatch(openTag); m != nil {
-				name = m[1]
-				closeTag = f.close
-				break
-			}
-		}
+		name, closeTag := matchFamilyTag(openTag)
 		if name == "" {
 			searchFrom = absEnd
 			continue
 		}
 		cleanParts = append(cleanParts, text[pos:absStart])
 		rest := text[absEnd:]
-		closeIdx := strings.Index(rest, closeTag)
-		if closeIdx < 0 {
-			closeIdx = strings.Index(rest, LT_SL+name+GT)
-			closeTag = LT_SL + name + GT
-		}
-		sibIdx := -1
-		if sibLoc := sibRe.FindStringIndex(rest); sibLoc != nil {
-			sibIdx = sibLoc[0]
-		}
-		end := -1
-		chosen := -1
-		if closeIdx >= 0 && (end < 0 || closeIdx < end) {
-			end = closeIdx
-			chosen = 0
-		}
-		if sibIdx >= 0 && (end < 0 || sibIdx < end) {
-			end = sibIdx
-			chosen = 1
-		}
+		end, chosen, effectiveCloseTag := findToolCallEnd(rest, closeTag, name, sibRe)
 		var payload string
-		if end >= 0 && chosen == 0 {
+		if end >= 0 {
 			payload = rest[:end]
-			pos = absEnd + end + len(closeTag)
-		} else if end >= 0 && chosen == 1 {
-			payload = rest[:end]
-			pos = absEnd
+			if chosen == 0 {
+				pos = absEnd + end + len(effectiveCloseTag)
+			} else {
+				pos = absEnd
+			}
 		} else {
 			payload = rest
 			pos = len(text)
@@ -171,16 +198,7 @@ func Normalize(text string) Result {
 		if payload == "" {
 			continue
 		}
-		args := extractArgs(payload, pRe)
-		argsJSON, _ := json.Marshal(args)
-		r.ToolCalls = append(r.ToolCalls, OpenAIToolCall{
-			ID:   "call_" + uuid.New().String()[:8],
-			Type: "function",
-			Function: map[string]interface{}{
-				"name":      name,
-				"arguments": string(argsJSON),
-			},
-		})
+		r.ToolCalls = append(r.ToolCalls, buildToolCallEntry(name, payload, pRe))
 	}
 	cleanParts = append(cleanParts, text[pos:])
 	r.CleanContent = strings.TrimSpace(strings.Join(cleanParts, ""))
