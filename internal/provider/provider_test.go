@@ -8,6 +8,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
+
 	"llm-gateway/internal/config"
 )
 
@@ -323,5 +326,45 @@ func TestNewBaseProvider_ResponseHeaderTimeout(t *testing.T) {
 	}
 	if tr.ResponseHeaderTimeout.Seconds() != 5 {
 		t.Errorf("expected 5s response header timeout, got %v", tr.ResponseHeaderTimeout)
+	}
+}
+
+func TestUpstreamSSELogReader_IsTransparentAndLogsRawLines(t *testing.T) {
+	var logs bytes.Buffer
+	previousLogger := log.Logger
+	log.Logger = zerolog.New(&logs)
+	t.Cleanup(func() { log.Logger = previousLogger })
+
+	p := NewProvider(config.ProviderConfig{}, config.DebugConfig{
+		UpstreamSSELog:         true,
+		UpstreamSSELogMaxBytes: 1024,
+	})
+	p.SetName("test-provider")
+	raw := "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"<tool_call>read\"}}]}\n\ndata: [DONE]\n\n"
+	wrapped := p.wrapUpstreamSSE(io.NopCloser(strings.NewReader(raw)), "test-model")
+
+	got, err := io.ReadAll(wrapped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != raw {
+		t.Fatalf("wrapped stream changed: got %q want %q", got, raw)
+	}
+	if err := wrapped.Close(); err != nil {
+		t.Fatal(err)
+	}
+	logged := logs.String()
+	for _, want := range []string{"upstream SSE capture started", "upstream SSE raw", "reasoning_content", "<tool_call>read", "upstream SSE capture finished", "test-provider", "test-model"} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("expected logs to contain %q, got %s", want, logged)
+		}
+	}
+}
+
+func TestWrapUpstreamSSE_DisabledReturnsOriginal(t *testing.T) {
+	p := NewProvider(config.ProviderConfig{})
+	body := io.NopCloser(strings.NewReader("data: [DONE]\n\n"))
+	if got := p.wrapUpstreamSSE(body, "model"); got != body {
+		t.Fatal("disabled capture should return the original body")
 	}
 }

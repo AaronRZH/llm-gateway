@@ -7,7 +7,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/rs/zerolog/log"
 
 	"llm-gateway/internal/config"
 )
@@ -135,6 +139,7 @@ type Provider struct {
 	apiKey     string
 	protocol   ClientProtocol // 上游协议类型（openai / anthropic）
 	httpClient *http.Client
+	debug      config.DebugConfig
 
 	converter *AnthropicConverter
 }
@@ -142,16 +147,22 @@ type Provider struct {
 // Manager Provider 管理器
 type Manager struct {
 	providers map[string]Provider
+	debug     config.DebugConfig
 }
 
 // NewManager 创建 Provider 管理器
-func NewManager(cfg map[string]config.ProviderConfig) *Manager {
+func NewManager(cfg map[string]config.ProviderConfig, debug ...config.DebugConfig) *Manager {
+	var debugCfg config.DebugConfig
+	if len(debug) > 0 {
+		debugCfg = debug[0]
+	}
 	m := &Manager{
 		providers: make(map[string]Provider),
+		debug:     debugCfg,
 	}
 
 	for name, pcfg := range cfg {
-		p := NewProvider(pcfg)
+		p := NewProvider(pcfg, debugCfg)
 		p.SetName(name)
 		m.providers[name] = p
 	}
@@ -167,7 +178,7 @@ func (m *Manager) Get(name string) (Provider, bool) {
 
 // UpdateProvider 更新或新增 Provider 配置（运行时生效）
 func (m *Manager) UpdateProvider(name string, cfg config.ProviderConfig) {
-	p := NewProvider(cfg)
+	p := NewProvider(cfg, m.debug)
 	p.SetName(name)
 	m.providers[name] = p
 }
@@ -208,14 +219,127 @@ func newBaseProvider(cfg config.ProviderConfig) (string, string, ClientProtocol,
 }
 
 // NewProvider 创建统一 Provider
-func NewProvider(cfg config.ProviderConfig) Provider {
+func NewProvider(cfg config.ProviderConfig, debug ...config.DebugConfig) Provider {
 	baseURL, apiKey, proto, httpClient := newBaseProvider(cfg)
+	var debugCfg config.DebugConfig
+	if len(debug) > 0 {
+		debugCfg = debug[0]
+	}
 	return Provider{
 		baseURL:    baseURL,
 		apiKey:     apiKey,
 		protocol:   proto,
 		httpClient: httpClient,
+		debug:      debugCfg,
 	}
+}
+
+// wrapUpstreamSSE 在任何协议转换之前旁路记录原始上游 SSE。
+// reader 会原样返回读到的字节，不改变分片、时序或 Close 语义。
+func (p *Provider) wrapUpstreamSSE(body io.ReadCloser, model string) io.ReadCloser {
+	if body == nil || !p.debug.UpstreamSSELog {
+		return body
+	}
+	maxBytes := p.debug.UpstreamSSELogMaxBytes
+	if maxBytes <= 0 {
+		maxBytes = 4 * 1024 * 1024
+	}
+	streamID := uuid.New().String()
+	log.Info().
+		Str("stream_id", streamID).
+		Str("provider", p.name).
+		Str("model", model).
+		Int("max_bytes", maxBytes).
+		Msg("upstream SSE capture started")
+	return &upstreamSSELogReader{
+		ReadCloser: body,
+		streamID:   streamID,
+		provider:   p.name,
+		model:      model,
+		remaining:  maxBytes,
+	}
+}
+
+type upstreamSSELogReader struct {
+	io.ReadCloser
+	mu        sync.Mutex
+	streamID  string
+	provider  string
+	model     string
+	remaining int
+	line      []byte
+	truncated bool
+	finished  bool
+}
+
+func (r *upstreamSSELogReader) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	if n > 0 {
+		r.capture(p[:n])
+	}
+	if err != nil {
+		r.finish(err)
+	}
+	return n, err
+}
+
+func (r *upstreamSSELogReader) Close() error {
+	r.finish(nil)
+	return r.ReadCloser.Close()
+}
+
+func (r *upstreamSSELogReader) capture(data []byte) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.finished || r.remaining <= 0 {
+		return
+	}
+	if len(data) > r.remaining {
+		data = data[:r.remaining]
+		r.truncated = true
+	}
+	r.remaining -= len(data)
+	for _, b := range data {
+		if b == '\n' {
+			r.logLineLocked()
+			continue
+		}
+		r.line = append(r.line, b)
+	}
+	if r.remaining == 0 {
+		r.logLineLocked()
+		if !r.truncated {
+			r.truncated = true
+		}
+		log.Warn().Str("stream_id", r.streamID).Str("provider", r.provider).Str("model", r.model).
+			Msg("upstream SSE capture reached byte limit; further events omitted")
+	}
+}
+
+func (r *upstreamSSELogReader) logLineLocked() {
+	if len(r.line) == 0 {
+		return
+	}
+	line := string(r.line)
+	r.line = r.line[:0]
+	log.Info().Str("stream_id", r.streamID).Str("provider", r.provider).Str("model", r.model).
+		Str("sse_line", line).Msg("upstream SSE raw")
+}
+
+func (r *upstreamSSELogReader) finish(readErr error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.finished {
+		return
+	}
+	r.finished = true
+	r.logLineLocked()
+	event := log.Info().Str("stream_id", r.streamID).Str("provider", r.provider).Str("model", r.model).
+		Bool("truncated", r.truncated)
+	if readErr != nil && readErr != io.EOF {
+		event = event.Err(readErr)
+	}
+	event.Msg("upstream SSE capture finished")
 }
 
 // ==================== 内部方法 ====================
@@ -427,7 +551,7 @@ func (p *Provider) StreamChat(ctx context.Context, model string, messages []Mess
 	if err != nil {
 		return nil, err
 	}
-	return resp.Body, nil
+	return p.wrapUpstreamSSE(resp.Body, model), nil
 }
 
 // ChatWithProtocol 带协议信息的 Chat
@@ -487,6 +611,9 @@ func (p *Provider) doSendAnthropic(ctx context.Context, model string, messages [
 	if err != nil {
 		return nil, err
 	}
+	if stream {
+		resp.Body = p.wrapUpstreamSSE(resp.Body, model)
+	}
 	return resp, nil
 }
 
@@ -505,7 +632,7 @@ func (p *Provider) doSendAnthropicStream(ctx context.Context, model string, mess
 	if err != nil {
 		return nil, err
 	}
-	return resp.Body, nil
+	return p.wrapUpstreamSSE(resp.Body, model), nil
 }
 
 // CountTokens 调用上游的 /count_tokens 端点

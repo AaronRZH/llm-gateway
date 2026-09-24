@@ -7,6 +7,8 @@ app:
 debug:
   pprof_enabled: false
   pprof_port: 6060
+  upstream_sse_log: false
+  upstream_sse_log_max_bytes: 4194304
 
 # 流式转发配置
 stream:

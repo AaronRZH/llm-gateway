@@ -359,6 +359,12 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.App.WriteTimeout != 0 {
 		t.Errorf("expected streaming-safe write_timeout 0, got %v", cfg.App.WriteTimeout)
 	}
+	if cfg.Debug.UpstreamSSELog {
+		t.Error("expected upstream SSE logging to default to disabled")
+	}
+	if cfg.Debug.UpstreamSSELogMaxBytes != 4*1024*1024 {
+		t.Errorf("expected upstream SSE log limit 4 MiB, got %d", cfg.Debug.UpstreamSSELogMaxBytes)
+	}
 	if cfg.Admin.JWTSecret == "" {
 		t.Error("expected auto-generated JWT secret")
 	}

@@ -62,6 +62,10 @@ type DebugConfig struct {
 	PprofEnabled bool `mapstructure:"pprof_enabled" yaml:"pprof_enabled"`
 	// PprofPort pprof 监听端口，默认 6060；仅绑定 127.0.0.1，仅本机可访问
 	PprofPort int `mapstructure:"pprof_port" yaml:"pprof_port"`
+	// UpstreamSSELog 记录协议转换前的原始上游 SSE。内容可能包含对话、文件路径和工具参数，仅用于临时诊断。
+	UpstreamSSELog bool `mapstructure:"upstream_sse_log" yaml:"upstream_sse_log"`
+	// UpstreamSSELogMaxBytes 单个上游流最多记录的原始字节数。
+	UpstreamSSELogMaxBytes int `mapstructure:"upstream_sse_log_max_bytes" yaml:"upstream_sse_log_max_bytes"`
 }
 
 type LogConfig struct {
@@ -183,6 +187,8 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("app::idle_timeout", 120*time.Second)
 	v.SetDefault("app::request_timeout", 0*time.Second)
 	v.SetDefault("stream::idle_timeout", 120*time.Second)
+	v.SetDefault("debug::upstream_sse_log", false)
+	v.SetDefault("debug::upstream_sse_log_max_bytes", 4*1024*1024)
 	v.SetDefault("log::level", "info")
 	v.SetDefault("redis::addr", "localhost:6379")
 	v.SetDefault("postgres::host", "localhost")
