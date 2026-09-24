@@ -31,11 +31,11 @@ go tool cover -func=coverage.out
 | 指标 | 当前值 |
 |------|--------|
 | 生产 Go 文件数 | 28 |
-| 函数/方法数 | 404 |
-| 代码行 | 8638 |
-| 平均函数复杂度 | 4.37 |
-| 最大函数复杂度 | 20（`OpenAIStreamConverter.convert`） |
-| 最大函数行数 | 92（`AnthropicSSEConverter.convert`） |
+| 函数/方法数 | 405 |
+| 代码行 | 8646 |
+| 平均函数复杂度 | 4.34 |
+| 最大函数复杂度 | 19（`main` / `AnthropicSSEConverter.convert` / `completeContentBlock`） |
+| 最大函数行数 | 193（`main`） |
 | 测试文件数 | 26 |
 | 总语句覆盖率 | 61.3% |
 
@@ -43,7 +43,6 @@ go tool cover -func=coverage.out
 
 | 函数 | 位置 | 复杂度 | 行数 |
 |------|------|--------|------|
-| `OpenAIStreamConverter.convert` | `internal/stream/anthropic_sse.go` | 20 | 79 |
 | `main` | `cmd/gateway/main.go` | 19 | 193 |
 | `AnthropicSSEConverter.convert` | `internal/stream/anthropic_sse.go` | 19 | 92 |
 | `completeContentBlock` | `internal/provider/anthropic_converter.go` | 19 | 43 |
@@ -52,8 +51,9 @@ go tool cover -func=coverage.out
 | `extractUsage` | `internal/stream/stream.go` | 16 | 63 |
 | `handleAnthropicMessages` | `cmd/gateway/handlers.go` | 15 | 121 |
 | `ConvertAnthropicToOpenAIResponse` | `internal/provider/anthropic_converter.go` | 15 | 102 |
+| `scanAndForward` | `internal/stream/stream.go` | 15 | 75 |
 
-> 复杂度基线已从阶段 1 的最高值 48 降至 20。`RewriteAndForwardWithToolRepair`（原 C=48）、`ConvertAnthropicMessagesToOpenAI`（原 C=23）、`handleAnthropicMessages`（原 C=28）、`handleChatCompletion`（原 C=25）、`handleCountTokens`（原 C=20）、`ConvertResponse`（原 C=20）、`ConvertResponseWithModel`（原 C=19）与 `Normalize`（原 C=20）均已拆分，不再进入前 9 名。剩余热点集中在 `internal/stream` 的 `OpenAIStreamConverter.convert`（C=20）和 `AnthropicSSEConverter.convert`（C=19）。
+> 复杂度基线已从阶段 1 的最高值 48 降至 19。`RewriteAndForwardWithToolRepair`（原 C=48）、`ConvertAnthropicMessagesToOpenAI`（原 C=23）、`handleAnthropicMessages`（原 C=28）、`handleChatCompletion`（原 C=25）、`handleCountTokens`（原 C=20）、`ConvertResponse`（原 C=20）、`ConvertResponseWithModel`（原 C=19）、`Normalize`（原 C=20）与 `OpenAIStreamConverter.convert`（原 C=20）均已拆分，不再进入前 9 名。剩余热点集中在 `main`（C=19）、`AnthropicSSEConverter.convert`（C=19）与 `completeContentBlock`（C=19）。
 
 重点包覆盖率：
 
@@ -124,6 +124,7 @@ go tool cover -func=coverage.out
 | `cmd/gateway`（`handleCountTokens`） | 拆为 2 个函数（`resolveCountTokensTarget`、`proxyCountTokensResponse`），消除两条 CountTokens 路径的重复调用/解析/转发逻辑（~60 行 → 1 个函数），既有测试保持通过 | C=20 → <12（跌破 metrics 显示阈值），113 → 33 行 |
 | `internal/provider`（`ConvertResponse` + `ConvertResponseWithModel`） | 提取 2 个纯函数（`filterAnthropicContent`、`buildAnthropicUsage`），消除两个方法间约 50 行重复的 content 过滤和 usage 提取逻辑，既有测试保持通过 | C=20/19 → <12（均跌破 metrics 显示阈值），86/80 → 46/42 行 |
 | `internal/toolcall`（`Normalize`） | 提取 3 个纯函数（`matchFamilyTag`、`findToolCallEnd`、`buildToolCallEntry`），将 tag 匹配、结束位置查找、条目构建从主循环中分离，既有测试保持通过 | C=20 → <12（跌破 metrics 显示阈值），92 → 58 行 |
+| `internal/stream`（`OpenAIStreamConverter.convert`） | 提取 `processLine` 方法封装循环体（空行跳过、注释保活转发、payload 解析、7 类事件分发），`convert` 仅保留 scanner 设置、循环调度和收尾，既有测试保持通过 | C=20 → <12（跌破 metrics 显示阈值），79 → 33 行 |
 
 **总语句覆盖率：56.3% → 61.3%**。
 
@@ -251,7 +252,7 @@ P0 表示当前缺少足够回归保护，继续修改可能造成认证、协�
 
 **现状**
 
-- `OpenAIStreamConverter.convert`：C=39、163 行，负责 Anthropic → OpenAI。**已完成（refactor/openai-converter-events）**：拆为 5 个事件处理器，C=39 → 20、163 → 79 行（详见 `b503f95`）。
+- `OpenAIStreamConverter.convert`：C=39、163 行，负责 Anthropic → OpenAI。**已完成（refactor/openai-converter-events）**：拆为 5 个事件处理器，C=39 → 20、163 → 79 行（详见 `b503f95`）。**进一步拆分**：提取 `processLine` 方法封装循环体，C=20 → <12、79 → 33 行。
 - `AnthropicSSEConverter.convert`：C=33、194 行，负责 OpenAI → Anthropic。**已完成（refactor/anthropic-sse-convert）**：拆为 4 个事件处理器 + 1 个 tool 状态结构体，C=33 → 19、194 → 92 行。
 - 两个方法同名，讨论和度量时必须带接收者名称。
 

@@ -480,6 +480,59 @@ func (c *OpenAIStreamConverter) Close() error {
 }
 
 // convert 在 goroutine 中运行，读取上游 Anthropic SSE 并转换为 OpenAI SSE
+// processLine 处理一行上游 SSE 输入。封装空行跳过、非 data: 行的注释保活转发、
+// payload 解析和 7 类事件分发。客户端断开检查由调用方在循环开头完成。
+func (c *OpenAIStreamConverter) processLine(line []byte) {
+	// SSE 分隔符，忽略
+	if len(line) == 0 {
+		return
+	}
+
+	// 非 data: 行
+	if !bytes.HasPrefix(line, []byte("data: ")) {
+		// SSE 注释行（如 OpenAI 保活 ": ping" / ": OPENAI-KEEP-ALIVE"）原样转发为保活，
+		// 避免长生成空闲期网关→Anthropic 客户端连接静默被代理超时断开。
+		if len(line) > 0 && line[0] == ':' {
+			fmt.Fprintf(c.pw, "%s\n\n", string(line))
+		}
+		return
+	}
+
+	payload := line[6:] // 去掉 "data: "
+
+	// 解析 Anthropic SSE event
+	var event map[string]interface{}
+	if err := json.Unmarshal(payload, &event); err != nil {
+		return
+	}
+
+	eventType, _ := event["type"].(string)
+
+	switch eventType {
+	case "message_start":
+		c.handleMessageStart(event)
+	case "content_block_start":
+		c.handleContentBlockStart(event)
+	case "content_block_delta":
+		c.handleContentBlockDelta(event)
+	case "content_block_stop":
+		c.handleContentBlockStop(event)
+	case "message_delta":
+		c.handleMessageDelta(event)
+	case "message_stop":
+		if !c.doneWritten {
+			c.writeDone()
+		}
+		c.state = oaiStateDone
+	case "ping":
+		// Anthropic 空闲保活事件。原样丢弃会导致跨协议长生成时空窗期
+		// 网关→客户端连接静默，被中间代理（如 nginx proxy_read_timeout）断开。
+		// 翻译为 OpenAI 客户端可识别的 SSE 注释保活。
+		c.writePing()
+	}
+	return
+}
+
 func (c *OpenAIStreamConverter) convert() {
 	defer c.pw.Close()
 	defer c.upstream.Close()
@@ -499,55 +552,7 @@ func (c *OpenAIStreamConverter) convert() {
 		if c.ew.err != nil {
 			break
 		}
-		line := scanner.Bytes()
-
-		// SSE 分隔符，忽略
-		if len(line) == 0 {
-			continue
-		}
-
-		// 非 data: 行
-		if !bytes.HasPrefix(line, []byte("data: ")) {
-			// SSE 注释行（如 OpenAI 保活 ": ping" / ": OPENAI-KEEP-ALIVE"）原样转发为保活，
-			// 避免长生成空闲期网关→Anthropic 客户端连接静默被代理超时断开。
-			if len(line) > 0 && line[0] == ':' {
-				fmt.Fprintf(c.pw, "%s\n\n", string(line))
-			}
-			continue
-		}
-
-		payload := line[6:] // 去掉 "data: "
-
-		// 解析 Anthropic SSE event
-		var event map[string]interface{}
-		if err := json.Unmarshal(payload, &event); err != nil {
-			continue
-		}
-
-		eventType, _ := event["type"].(string)
-
-		switch eventType {
-		case "message_start":
-			c.handleMessageStart(event)
-		case "content_block_start":
-			c.handleContentBlockStart(event)
-		case "content_block_delta":
-			c.handleContentBlockDelta(event)
-		case "content_block_stop":
-			c.handleContentBlockStop(event)
-		case "message_delta":
-			c.handleMessageDelta(event)
-		case "message_stop":
-			if !c.doneWritten {
-				c.writeDone()
-			}
-			c.state = oaiStateDone
-		case "ping":
-			// Anthropic 空闲保活事件。原样丢弃会导致跨协议长生成时空窗期
-			// 网关→客户端连接静默，被中间代理（如 nginx proxy_read_timeout）断开。
-			// 翻译为 OpenAI 客户端可识别的 SSE 注释保活。
-			c.writePing()
-		}
+		c.processLine(scanner.Bytes())
 	}
 
 	if err := scanner.Err(); err != nil && err != io.EOF && err != context.Canceled {
