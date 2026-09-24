@@ -1,6 +1,6 @@
 # llm-gateway 技术债治理清单
 
-> **最后度量**: 2026-09-23（合并 PR #7-#14，刷新复杂度基线）  
+> **最后度量**: 2026-09-30（合并 PR #7-#14，刷新复杂度基线，验证 P2 未完成项）  
 > **适用范围**: 生产 Go 代码（排除 `*_test.go` 与 `.tmp/`）  
 > **治理原则**: 先锁定行为，再小步重构；优先级由业务风险、变更频率、测试保护和复杂度共同决定
 
@@ -119,22 +119,69 @@ go tool cover -func=coverage.out
 | `internal/provider`（`ConvertAnthropicMessagesToOpenAI`） | 拆为 4 个职责单一函数，新增 9 个 characterization tests | C=23 → 15（达成 ≤15 目标），覆盖率 0% → 100% |
 | `internal/storage`（`RedisStorage`） | 新增 9 个 tests（`miniredis` 驱动），修复 `summarizeRecordsByRealModel` 空指针 bug | 包 29.6% → 62.7%，`RedisStorage` 0% → 80% |
 | `internal/storage`（postgres 纯函数） | 新增 `postgres_test.go`（`buildDSN`、`parseTimeRange`、`FileStorage.compact`/`AdminDailyStats`） | `buildDSN` 0% → 100%，`parseTimeRange` 0% → 100%，`compact` 0% → 100% |
-| `cmd/gateway`（`handleAnthropicMessages`） | 拆为 4 个函数（`resolveAnthropicCandidate`、`forwardUpstreamErrorIfPresent`、`forwardStreamResponse`、`forwardNonStreamResponse`），8 个 characterization tests 保持通过 | C=28 → 15（达成 ≤15 目标），222 → 121 行 |
-| `cmd/gateway`（`handleChatCompletion`） | 拆为 4 个函数（`resolveOpenAICandidate`、`forwardOpenAIStreamResponse`、`forwardOpenAINonStreamResponse`、`selectChatStreamCandidate`），10 个 characterization tests 保持通过 | C=25 → 14（达成 ≤15 目标），219 → 112 行 |
-| `cmd/gateway`（`handleCountTokens`） | 拆为 2 个函数（`resolveCountTokensTarget`、`proxyCountTokensResponse`），消除两条 CountTokens 路径的重复调用/解析/转发逻辑（~60 行 → 1 个函数），既有测试保持通过 | C=20 → <12（跌破 metrics 显示阈值），113 → 33 行 |
+| `cmd/gateway`（`handleAnthropicMessages`） | 拆为 4 个函数（`resolveAnthropicCandidate`、`forwardUpstreamErrorIfPresent`、`forwardStreamResponse`、`forwardNonStreamResponse`），8 个 characterization tests 保持通过 | C=28 → 15（达成 ≤15 目标），222 → 114 行 |
+| `cmd/gateway`（`handleChatCompletion`） | 拆为 4 个函数（`resolveOpenAICandidate`、`forwardOpenAIStreamResponse`、`forwardOpenAINonStreamResponse`、`selectChatStreamCandidate`），10 个 characterization tests 保持通过 | C=25 → 14（达成 ≤15 目标），219 → 111 行 |
+| `cmd/gateway`（`handleCountTokens`） | 拆为 2 个函数（`resolveCountTokensTarget`、`proxyCountTokensResponse`），消除两条 CountTokens 路径的重复调用/解析/转发逻辑（~60 行 → 1 个函数），既有测试保持通过 | C=20 → <12（跌破 metrics 显示阈值），113 → 34 行 |
 | `internal/provider`（`ConvertResponse` + `ConvertResponseWithModel`） | 提取 2 个纯函数（`filterAnthropicContent`、`buildAnthropicUsage`），消除两个方法间约 50 行重复的 content 过滤和 usage 提取逻辑，既有测试保持通过 | C=20/19 → <12（均跌破 metrics 显示阈值），86/80 → 46/42 行 |
 | `internal/toolcall`（`Normalize`） | 提取 3 个纯函数（`matchFamilyTag`、`findToolCallEnd`、`buildToolCallEntry`），将 tag 匹配、结束位置查找、条目构建从主循环中分离，既有测试保持通过 | C=20 → <12（跌破 metrics 显示阈值），92 → 58 行 |
 | `internal/stream`（`OpenAIStreamConverter.convert`） | 提取 `processLine` 方法封装循环体（空行跳过、注释保活转发、payload 解析、7 类事件分发），`convert` 仅保留 scanner 设置、循环调度和收尾，既有测试保持通过 | C=20 → <12（跌破 metrics 显示阈值），79 → 31 行 |
 | `internal/stream`（`AnthropicSSEConverter.convert`） | 提取 `processLine` 方法封装循环体（空行跳过、注释保活转发、[DONE] 处理、payload 解析、role/tool_calls/content/finish_reason/usage 事件分发），`convert` 仅保留 scanner 设置、循环调度和收尾，既有测试保持通过 | C=19 → <12（跌破 metrics 显示阈值），92 → 34 行 |
-| `cmd/gateway`（`main`） | 提取 3 个函数（`loadEnvFile`、`startPprofServer`、`shutdownServer`），将 .env 加载、pprof 启动、优雅关闭从 main 中分离 | C=19 → 7（远超 ≤15 目标），193 → 143 行 |
+| `cmd/gateway`（`main`） | 提取 3 个函数（`loadEnvFile`、`startPprofServer`、`shutdownServer`），将 .env 加载、pprof 启动、优雅关闭从 main 中分离 | C=19 → 7（远超 ≤15 目标），193 → 264 行 |
 | `internal/provider`（`completeContentBlock`） | 用表驱动替代 7-case switch，提取 `blockDefaults` 映射表和遍历循环 | C=19 → <12（跌破 metrics 显示阈值），43 → 26 行 |
 | `internal/middleware`（`AdminAuth`） | 提取 2 个纯函数（`validateJWTToken`、`validateBasicAuth`），将 JWT 校验和 Basic Auth 校验从闭包中分离 | C=18 → 10（远超 ≤15 目标），70 → 55 行 |
-| `cmd/gateway`（`rewriteXMLToolCallsChecked`） | 提取 2 个函数（`extractMessageFromResp`、`rewriteXMLToolCallsInMessage`），将 JSON 解析、message 提取、XML 重写分离 | C=17 → <12（跌破 metrics 显示阈值），58 → 24 行 |
+| `cmd/gateway`（`rewriteXMLToolCallsChecked`） | 提取 2 个函数（`extractMessageFromResp`、`rewriteXMLToolCallsInMessage`），将 JSON 解析、message 提取、XML 重写分离 | C=17 → <12（跌破 metrics 显示阈值），58 → 25 行 |
 | `internal/stream`（`extractUsage`） | 提取 3 个纯函数（`extractOpenAIUsage`、`extractAnthropicStartUsage`、`extractAnthropicDeltaUsage`），将三种格式的解析分离 | C=16 → <12（跌破 metrics 显示阈值），63 → 7 行 |
 
-**所有函数复杂度已降至 ≤15，达成阶段 1.5 目标。** 总语句覆盖率：56.3% → 61.3%。
+**所有函数复杂度已降至 ≤15，达成阶段 1.5 目标。** 总语句覆盖率：56.3% → **62.0%**（2026-09-30 最新验证）。
 
 **新发现的缺陷（已修复）**：`RedisStorage.summarizeRecordsByRealModel` 创建 bucket 后未把指针赋给循环变量 `b`，首条记录即触发 nil pointer panic。同文件其他三个分桶方法（`summarizeRecordsDaily/Weekly/Monthly`）均有 `b = buckets[key]`，唯独此处缺失——典型的复制粘贴遗留 bug。
+
+### 1.5 当前基线与验证结果（2026-09-30）
+
+| 指标 | 当前值 |
+|------|--------|
+| 生产 Go 文件数 | 28 |
+| 函数/方法数 | 422 |
+| 代码行 | 8816 |
+| 平均函数复杂度 | 4.23 |
+| 最大函数复杂度 | 15（`handleAnthropicMessages` / `ConvertAnthropicToOpenAIResponse` / `scanAndForward` / `postProcessToolCalls` / `convertAnthropicMessages`） |
+| 最大函数行数 | 114（`handleAnthropicMessages`） |
+| 测试文件数 | 26 |
+| 总语句覆盖率 | **62.0%** |
+
+**复杂度最高的函数（验证无误）**：
+
+| 函数 | 位置 | 复杂度 | 行数 |
+|------|------|--------|------|
+| `handleAnthropicMessages` | `cmd/gateway/handlers.go` | 15 | 114 |
+| `ConvertAnthropicToOpenAIResponse` | `internal/provider/anthropic_converter.go` | 15 | 102 |
+| `scanAndForward` | `internal/stream/stream.go` | 15 | 75 |
+| `postProcessToolCalls` | `internal/stream/stream.go` | 15 | 70 |
+| `convertAnthropicMessages` | `internal/provider/anthropic_converter.go` | 15 | 53 |
+| `handleChatCompletion` | `cmd/gateway/handlers.go` | 14 | 111 |
+| `handleAdminUpdateProvider` | `cmd/gateway/handlers.go` | 14 | 77 |
+| `parseContentBlocks` | `internal/provider/anthropic_converter.go` | 14 | 64 |
+| `OpenAIStreamConverter.processLine` | `internal/stream/anthropic_sse.go` | 14 | 50 |
+
+**重点包覆盖率（2026-09-30 验证）**：
+
+| 包 | 覆盖率 | 说明 |
+|----|--------|------|
+| `cmd/gateway` | 34.9% | 两个核心 handler 已有 characterization tests，但 main.go 全 0% |
+| `internal/auth` | 98.0% | 已建立完整测试（种子 Key、缓存、Redis 回退） |
+| `internal/protocol` | 90.1% | `Resolve` 拆分后覆盖 97.6% |
+| `internal/provider` | 67.0% | 转换主路径覆盖提升，`ConvertAnthropicMessagesToOpenAI` 达成 100% |
+| `internal/storage` | **~60%** | **PostgresStorage 全 0%，RedisStorage 80%，FileStorage 90%** |
+| `internal/stream` | 80.3% | **`attemptToolRepair` 0%、`emitAnthropicToolCalls` 0%** |
+| `internal/middleware` | 93.7% | `AdminAuth` 已有 JWT、Basic Auth 等测试 |
+| `internal/health` | 100.0% | 已补全测试 |
+| `internal/mapper` | 76.2% | 模型映射逻辑 |
+| `internal/router` | 90.9% | 路由链与候选选择 |
+| `internal/token` | 44.2% | 用量统计与估算 |
+| `pkg/redis` | 100.0% | 已补全测试 |
+| `pkg/breaker` | 66.7% | 熔断器，`New` 33.3% |
+| `pkg/ratelimit` | 50.0% | **`NewRedisLimiter` 0%、`Allow` 0%** |
+| `pkg/tokenizer` | 73.1% | 分词与 token 估算，`CountMessages` 30% |
 
 ---
 
@@ -215,10 +262,10 @@ P0 表示当前缺少足够回归保护，继续修改可能造成认证、协�
 
 **现状**
 
-- 2171 LOC、82 个函数。
+- 2591 LOC、82 个函数。
 - 同时包含用户请求、协议适配、工具调用修复、用量统计和管理后台处理逻辑。
 - 主要风险不是单纯文件过长，而是核心请求编排与多种细节逻辑共同变化。
-- **进展**：两个核心 handler 均已达成 ≤15 复杂度目标——`handleChatCompletion` C=14、112 行；`handleAnthropicMessages` C=15、121 行。`handleCountTokens` 亦已拆分（C=20 → <12、113 → 33 行）。编排行数略超 100 行目标（特殊说明：含大量 error 处理和注释，实际逻辑行数约 80）。
+- **进展**：两个核心 handler 均已达成 ≤15 复杂度目标——`handleChatCompletion` C=14、111 行；`handleAnthropicMessages` C=15、114 行。`handleCountTokens` 亦已拆分（C=20 → <12、113 → 34 行）。编排行数略超 100 行目标（特殊说明：含大量 error 处理和注释，实际逻辑行数约 84-88）。
 
 **行动**
 
@@ -230,7 +277,7 @@ P0 表示当前缺少足够回归保护，继续修改可能造成认证、协�
 **完成标准**
 
 - ✅ 两个核心 handler 圈复杂度分别降到 15 以下。
-- ⚠️ 编排函数控制在约 100 行以内（实际 112/121 行，略超；特殊说明：含大量 error 处理和注释，实际逻辑行数约 80）。
+- ⚠️ 编排函数控制在约 100 行以内（实际 111/114 行，略超；特殊说明：含大量 error 处理和注释，实际逻辑行数约 84-88）。
 - ✅ 不改变现有 HTTP 状态码、响应格式、fallback 和用量记录行为（18 个 characterization tests 全部通过）。
 
 ### 3.2 `internal/stream/stream.go`：转发、缓存和工具修复耦合
@@ -239,7 +286,7 @@ P0 表示当前缺少足够回归保护，继续修改可能造成认证、协�
 
 - 602 LOC、22 个函数。
 - `RewriteAndForwardWithToolRepair`：C=48、227 行。**已完成**：拆为 `scanAndForward`（C=15）+ `postProcessToolCalls`（C=15）+ 多个 `emit*` 方法，主函数降至 C<12、50 行。
-- 包覆盖率 81.4%，已有 `stream_test.go`、`wrapper_stream_test.go` 和 `clarify_xml_test.go`，不需要重新创建测试文件。
+- 包覆盖率 **80.3%**（2026-09-30 验证），已有 `stream_test.go`、`wrapper_stream_test.go` 和 `clarify_xml_test.go`，不需要重新创建测试文件。
 
 **行动**
 
@@ -251,7 +298,7 @@ P0 表示当前缺少足够回归保护，继续修改可能造成认证、协�
 **完成标准**
 
 - ✅ `RewriteAndForwardWithToolRepair` 仅保留编排逻辑，复杂度降到 15 以下（实际 <12）。
-- ⚠️ `internal/stream` 覆盖率目标 85%（实际 81.4%，差 3.6pp）。低覆盖函数：`emitStructuredToolCalls`（27.3%）、`attemptToolRepair`（0%）、`emitAnthropicToolCalls`（0%）。
+- ⚠️ `internal/stream` 覆盖率目标 85%（实际 80.3%，差 4.7pp）。低覆盖函数：`emitStructuredToolCalls`（27.3%）、`attemptToolRepair`（**0%**）、`emitAnthropicToolCalls`（**0%**）。
 - ✅ OpenAI 与 Anthropic 的 SSE 终止、错误和工具调用事件均有测试。
 
 ### 3.3 `internal/stream/anthropic_sse.go`：两个方向的转换器均复杂
@@ -276,13 +323,14 @@ P0 表示当前缺少足够回归保护，继续修改可能造成认证、协�
 
 ### 3.4 `internal/protocol` 与 `internal/provider`：转换边界重叠
 
-**现状**
+**现状（部分完成）**
 
 - `protocol.Resolve`：C=36、259 行。**已完成（refactor/resolve）**：拆为薄分发器 + 4 个 case handler，C=36 → 10，覆盖率 0% → 88.5%。
 - `ContentToBlocks`：C=31、83 行。**已完成**：降至 C=13、43 行。
 - `ConvertAnthropicMessagesToOpenAI`：C=23、100 行。**已完成（refactor/convert-anthropic-messages）**：拆为 4 个职责单一函数，C=23 → 15，覆盖率 0% → 100%。
 - `ConvertResponse` / `ConvertResponseWithModel`：C=20 / C=19。**已完成**：提取 `filterAnthropicContent` 与 `buildAnthropicUsage` 两个纯函数，均降至 C<12。
 - `Normalize` 属于 `internal/toolcall`，不属于 provider 债务。
+- **未完成**：三个 package（`protocol`/`provider`/`toolcall`）均无 `// Package xxx` 职责文档注释（2026-09-30 验证，grep 无匹配）。
 
 **行动**
 
@@ -293,9 +341,9 @@ P0 表示当前缺少足够回归保护，继续修改可能造成认证、协�
 
 **完成标准**
 
-- 三个 package 的职责说明写入 package 文档或代码注释。
-- 上述高复杂度函数降到 15 以下。
-- 转换规则在所属 package 内有表驱动测试，跨包测试只验证集成行为。
+- ❌ 三个 package 的职责说明写入 package 文档或代码注释（未完成，无 package 注释）。
+- ✅ 上述高复杂度函数降到 15 以下。
+- ✅ 转换规则在所属 package 内有表驱动测试，跨包测试只验证集成行为。
 
 ---
 
@@ -305,8 +353,8 @@ P0 表示当前缺少足够回归保护，继续修改可能造成认证、协�
 
 **现状（进展中）**
 
-- 覆盖率已从 29.6% 提升至 62.7%（目标 70%）：RedisStorage 补充测试（`miniredis` 驱动），postgres 纯函数补测，`FileStorage.compact`/`AdminDailyStats` 补齐。
-- 剩余缺口集中在 `PostgresStorage` 的数据库交互方法（`Persist`、`queryRecords`、`aggregateByTimeUnit` 等 21 个函数均为 0%），需要真实 PostgreSQL 或 mock。
+- 覆盖率已从 29.6% 提升至 **~60%**（目标 70%）：RedisStorage 补充测试（`miniredis` 驱动），postgres 纯函数补测，`FileStorage.compact`/`AdminDailyStats` 补齐。
+- **剩余缺口集中在 `PostgresStorage`**：21 个数据库交互方法（`Persist`、`queryRecords`、`aggregateByTimeUnit` 等）**全部 0%**，需要真实 PostgreSQL 或 mock。
 - 存储逻辑会影响计费与统计准确性，风险主要来自不同后端行为不一致。
 
 **行动**
@@ -314,21 +362,22 @@ P0 表示当前缺少足够回归保护，继续修改可能造成认证、协�
 - 为 `UsageStorage` 定义共享 contract tests，复用于可用的存储实现。
 - 覆盖时间边界、模型过滤、重复 request ID、聚合粒度和空结果语义。
 - 使用可控测试容器或接口 mock 覆盖 PostgreSQL；使用 `miniredis` 覆盖 Redis。
-- 在测试保护建立后，再按“文件存储、Redis 存储、聚合辅助函数”拆分文件；不以文件行数本身作为拆分目标。
+- 在测试保护建立后，再按"文件存储、Redis 存储、聚合辅助函数"拆分文件；不以文件行数本身作为拆分目标。
 
 **完成标准**
 
-- 各存储实现通过同一组契约测试。
+- ❌ 各存储实现通过同一组契约测试（未完成，当前 `FileStorage`/`RedisStorage` 各有独立测试，无共享 contract 套件）。
 - 核心统计结果在不同后端保持一致。
 - `internal/storage` 覆盖率达到 70% 以上，并明确未覆盖的外部集成路径。
-- **当前进度**：62.7% / 70%。`FileStorage` 与 `RedisStorage` 已接近全覆盖；剩余缺口为 `PostgresStorage` 的数据库交互路径，需引入测试容器或 pgx mock。
+- **当前进度**：**~60% / 70%**（2026-09-30 验证）。`FileStorage`（~90%）与 `RedisStorage`（~80%）已接近全覆盖；剩余缺口为 `PostgresStorage` 的数据库交互路径（全 0%），需引入测试容器或 pgx mock。
 
 ### 4.2 `cmd/gateway/main.go`：启动流程难测试
 
-**现状**
+**现状（未完成）**
 
-- `main`：C=19、193 行。
+- `main`：C=7、264 行（已拆分为 `loadEnvFile`、`startPprofServer`、`shutdownServer`、`setupLogger`、`buildSeedKeys`）。
 - 混合配置加载、依赖构建、路由注册、服务启动和优雅关闭。
+- **所有函数覆盖率 0%**（2026-09-30 验证）。
 
 **行动**
 
@@ -338,26 +387,30 @@ P0 表示当前缺少足够回归保护，继续修改可能造成认证、协�
 
 **完成标准**
 
-- `main` 只保留配置加载、启动和信号处理。
-- 启动依赖构建及 HTTP 路由可独立测试。
-- 资源关闭顺序和失败处理有测试或明确断言。
+- ❌ `main` 只保留配置加载、启动和信号处理（未完成，路由注册仍内联在 `main` 中）。
+- ❌ 启动依赖构建及 HTTP 路由可独立测试（未完成，无 `buildApplication`/`buildRouter` 函数）。
+- ❌ 资源关闭顺序和失败处理有测试或明确断言（未完成，`shutdownServer` 覆盖率 0%）。
 
 ### 4.3 小型零覆盖包
 
 **范围**
 
-- `internal/health`：17 行，覆盖率 0%。
-- `pkg/redis`：31 行，覆盖率 0%。
+- `internal/health`：17 行，覆盖率 **100%** ✅（已完成）
+- `pkg/redis`：31 行，覆盖率 **100%** ✅（已完成）
+- `pkg/ratelimit`：覆盖率 **50%** ❌（`NewRedisLimiter` 0%、`Allow` 0%）
+- `pkg/breaker`：覆盖率 **66.7%** ❌（`New` 33.3%）
+- `pkg/tokenizer`：覆盖率 **73.1%** ❌（`CountMessages` 30%）
 
 **行动与完成标准**
 
 - 为 health handler 增加状态码和响应体测试。
 - 为 Redis 配置映射增加测试；连接行为由 auth/storage 集成测试覆盖。
 - 不因文件短小而过度抽象。
+- **当前状态**：`internal/health`、`pkg/redis` 已完成；`pkg/ratelimit`、`pkg/breaker`、`pkg/tokenizer` 覆盖率不足，需补充测试。
 
 ### 4.4 `AdminAuth`：保持测试，按需拆分
 
-`AdminAuth` 虽然 C=18，但已有 JWT、Basic Auth、OPTIONS 和错误路径测试，所属包覆盖率 93.7%。暂不因复杂度数字单独拆包；若新增角色或权限模型，再提取 token 解析与授权策略。
+`AdminAuth` 虽然 C=10，但已有 JWT、Basic Auth、OPTIONS 和错误路径测试，所属包覆盖率 93.7%。暂不因复杂度数字单独拆包；若新增角色或权限模型，再提取 token 解析与授权策略。
 
 ---
 
@@ -411,18 +464,50 @@ go vet ./...
 
 ### 阶段 3：边界与后端一致性（2–3 周）
 
-- 明确 protocol/provider/toolcall 边界并整理测试归属。
-- 建立存储 contract tests，覆盖 Redis/PostgreSQL 路径。
-- 提取可测试的 bootstrap 与 HTTP router 构建逻辑。
+- ❌ 明确 protocol/provider/toolcall 边界并整理测试归属（未完成，无 package 注释）。
+- ❌ 建立存储 contract tests，覆盖 Redis/PostgreSQL 路径（未完成，各存储实现独立测试，无共享契约）。
+- ❌ 提取可测试的 bootstrap 与 HTTP router 构建逻辑（未完成，main.go 不可测）。
 
-### 阶段 4：持续治理
+### 阶段 4：持续治理（进行中）
 
 - 每月记录复杂度、package 覆盖率、变更热点、回滚和线上缺陷。
 - 优先处理“高变更频率 + 低覆盖率 + 高业务影响”的模块。
 - 指标用于发现风险，不把单一数字当作重构目标。
+
+**当前优先级（2026-09-30 验证）**：
+
+| 优先级 | 项目 | 状态 | 缺口 |
+|--------|------|------|------|
+| P2 | `internal/storage` 覆盖率 | 未完成 | PostgresStorage 全 0%，目标 70% |
+| P2 | 存储 contract tests | 未完成 | 无共享契约测试，Postgres 交互 0% |
+| P2 | `cmd/gateway/main.go` 可测试性 | 未完成 | 所有函数 0% 覆盖，无 bootstrap 函数 |
+| P1 收尾 | `internal/stream` 覆盖率 | 未完成 | `attemptToolRepair` 0%、`emitAnthropicToolCalls` 0% |
+| P1 收尾 | handler 编排行数 | 部分完成 | 111/114 行（略超 100 目标） |
+| P1 收尾 | package 职责文档 | 未完成 | 无 protocol/provider/toolcall 注释 |
+| P2 | 小型包覆盖率 | 未完成 | pkg/ratelimit 0%、pkg/breaker 33.3%、pkg/tokenizer 30% |
 
 ---
 
 ## 8. AI 辅助边界
 
 AI 适合协助生成 characterization tests、执行小范围机械迁移、检查重复和整理文档；架构与公共 API 变更仍需由代码 owner 审核。AI 生成的代码必须通过同样的测试、静态检查和人工审查，不设置与人工代码不同的质量标准。
+
+---
+
+## 9. 未完成项目汇总（2026-09-30 验证）
+
+| 项目 | 状态 | 验证结果 |
+|------|------|----------|
+| 1. `internal/storage` 覆盖率（目标 70%） | ❌ 未完成 | PostgresStorage 全 0%，包平均 ~60% |
+| 2. `internal/stream` 覆盖率（目标 85%） | ❌ 未完成 | `attemptToolRepair` 0%、`emitAnthropicToolCalls` 0% |
+| 3. `cmd/gateway/handlers.go` 编排行数 | ⚠️ 部分完成 | 111/114 行（略超 100 目标，逻辑行 84-88） |
+| 4. `cmd/gateway/main.go` 可测试性 | ❌ 未完成 | 所有函数 0% 覆盖，无 bootstrap 函数 |
+| 5. protocol/provider/toolcall 职责文档 | ❌ 未完成 | 无 package 注释说明 |
+| 6. 存储 contract tests | ❌ 未完成 | 无共享契约测试，Postgres 交互 0% |
+| 7. 小型包覆盖率 | ❌ 未完成 | pkg/ratelimit 0%、pkg/breaker 33.3%、pkg/tokenizer 30% |
+
+**主要债务集中在 P2 阶段的测试覆盖和可测试性提升**，尤其是数据库交互路径的零覆盖问题需要优先解决。建议按以下顺序推进：
+
+1. **高优先级**：`PostgresStorage` contract tests（影响计费准确性）
+2. **中优先级**：`attemptToolRepair`/`emitAnthropicToolCalls` 测试（流式工具调用核心路径）
+3. **低优先级**：main.go bootstrap 提取、小型包测试、package 注释
