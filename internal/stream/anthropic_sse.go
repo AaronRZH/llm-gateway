@@ -114,6 +114,69 @@ type anthropicToolState struct {
 	inTool bool
 }
 
+// processLine 处理一行上游 SSE 输入。封装空行跳过、注释保活转发、[DONE] 处理、
+// payload 解析和事件分发（role / tool_calls / content / finish_reason / usage）。
+// 客户端断开检查由调用方在循环开头完成。
+func (c *AnthropicSSEConverter) processLine(line []byte, st *anthropicToolState) {
+	// SSE 分隔符，忽略
+	if len(line) == 0 {
+		return
+	}
+
+	// 非 data: 行
+	if !bytes.HasPrefix(line, []byte("data: ")) {
+		// SSE 注释行（如 OpenAI 保活 ": ping" / ": OPENAI-KEEP-ALIVE"）原样转发为保活，
+		// 避免长生成空闲期网关→Anthropic 客户端连接静默被代理超时断开。
+		if len(line) > 0 && line[0] == ':' {
+			fmt.Fprintf(c.ew, "%s\n\n", string(line))
+		}
+		return
+	}
+
+	payload := line[6:] // 去掉 "data: "
+
+	// [DONE] 标记
+	if bytes.Equal(payload, []byte("[DONE]")) {
+		c.finish(true, st.inTool, st.id, st.name, st.input.String())
+		return
+	}
+
+	// 解析 OpenAI SSE chunk
+	var event OpenAIStreamEvent
+	if err := json.Unmarshal(payload, &event); err != nil {
+		return
+	}
+
+	if len(event.Choices) == 0 {
+		return
+	}
+
+	choice := event.Choices[0]
+	delta := choice.Delta
+
+	// === 处理 role 字段：message_start + content_block_start ===
+	c.handleRoleStart(delta.Role)
+
+	// === 处理 tool_calls ===
+	// 返回 true 表示已在 tool_calls 分支内收尾（含 finish_reason），应跳过本 chunk 后续处理
+	if c.handleToolCalls(delta.ToolCalls, choice.FinishReason, st) {
+		return
+	}
+
+	// === 处理 content delta ===
+	c.handleContentDelta(delta.Content)
+
+	// === 处理 finish_reason ===
+	if choice.FinishReason != "" {
+		c.finish(c.hasContent || st.inTool, st.inTool, st.id, st.name, st.input.String())
+	}
+
+	// === 处理 usage ===
+	if event.Usage != nil {
+		c.handleUsage(event.Usage.PromptTokens, event.Usage.CompletionTokens)
+	}
+}
+
 func (c *AnthropicSSEConverter) convert() {
 	defer c.pw.Close()
 	defer c.upstream.Close()
@@ -136,65 +199,7 @@ func (c *AnthropicSSEConverter) convert() {
 		if c.ew.err != nil {
 			break
 		}
-		line := scanner.Bytes()
-
-		// SSE 分隔符，忽略
-		if len(line) == 0 {
-			continue
-		}
-
-		// 非 data: 行
-		if !bytes.HasPrefix(line, []byte("data: ")) {
-			// SSE 注释行（如 OpenAI 保活 ": ping" / ": OPENAI-KEEP-ALIVE"）原样转发为保活，
-			// 避免长生成空闲期网关→Anthropic 客户端连接静默被代理超时断开。
-			if len(line) > 0 && line[0] == ':' {
-				fmt.Fprintf(c.ew, "%s\n\n", string(line))
-			}
-			continue
-		}
-
-		payload := line[6:] // 去掉 "data: "
-
-		// [DONE] 标记
-		if bytes.Equal(payload, []byte("[DONE]")) {
-			c.finish(true, st.inTool, st.id, st.name, st.input.String())
-			continue
-		}
-
-		// 解析 OpenAI SSE chunk
-		var event OpenAIStreamEvent
-		if err := json.Unmarshal(payload, &event); err != nil {
-			continue
-		}
-
-		if len(event.Choices) == 0 {
-			continue
-		}
-
-		choice := event.Choices[0]
-		delta := choice.Delta
-
-		// === 处理 role 字段：message_start + content_block_start ===
-		c.handleRoleStart(delta.Role)
-
-		// === 处理 tool_calls ===
-		// 返回 true 表示已在 tool_calls 分支内收尾（含 finish_reason），应跳过本 chunk 后续处理
-		if c.handleToolCalls(delta.ToolCalls, choice.FinishReason, st) {
-			continue
-		}
-
-		// === 处理 content delta ===
-		c.handleContentDelta(delta.Content)
-
-		// === 处理 finish_reason ===
-		if choice.FinishReason != "" {
-			c.finish(c.hasContent || st.inTool, st.inTool, st.id, st.name, st.input.String())
-		}
-
-		// === 处理 usage ===
-		if event.Usage != nil {
-			c.handleUsage(event.Usage.PromptTokens, event.Usage.CompletionTokens)
-		}
+		c.processLine(scanner.Bytes(), st)
 	}
 
 	if err := scanner.Err(); err != nil && err != io.EOF && err != context.Canceled {
