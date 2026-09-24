@@ -169,51 +169,51 @@ func (c *AnthropicConverter) ConvertMessagesToAnthropic(messages []Message) ([]m
 	return result, system
 }
 
-// completeContentBlock 为已知的 content block type 补充缺失的必需字段。
+// blockDefaults 为每种已知的 content block type 列出缺失字段应补全的默认值。
 // 保持与原内层 switch 完全相同的语义和默认值：
-//   - source 类字段补全为 nil（Anthropic API 允许）
-//   - 其他字段补全为空字符串或空 map
-//   - 未知 block type 或无 type 的 map 不做任何补全
+//   - source / input_audio 类字段补全为 nil（Anthropic API 允许）
+//   - input 字段补全为空 map
+//   - 其他字段补全为空字符串
+//   - 未知 block type 或无 type 的 map 不做任何补全（不在本表中）
+var blockDefaults = map[string][]struct {
+	Field string
+	Value interface{}
+}{
+	"text": {
+		{"text", ""},
+	},
+	"image": {
+		{"source", nil},
+	},
+	"tool_use": {
+		{"id", ""},
+		{"name", ""},
+		{"input", map[string]interface{}{}},
+	},
+	"tool_result": {
+		{"tool_use_id", ""},
+		{"content", ""},
+	},
+	"thinking": {
+		{"thinking", ""},
+	},
+	"document": {
+		{"source", nil},
+	},
+	"input_audio": {
+		{"input_audio", nil},
+	},
+}
+
+// completeContentBlock 为已知的 content block type 补充缺失的必需字段。
 func completeContentBlock(block map[string]interface{}) {
-	if bt, ok := block["type"].(string); ok {
-		switch bt {
-		case "text":
-			if _, hasText := block["text"]; !hasText {
-				block["text"] = ""
-			}
-		case "image":
-			if _, hasSource := block["source"]; !hasSource {
-				block["source"] = nil
-			}
-		case "tool_use":
-			if _, hasID := block["id"]; !hasID {
-				block["id"] = ""
-			}
-			if _, hasName := block["name"]; !hasName {
-				block["name"] = ""
-			}
-			if _, hasInput := block["input"]; !hasInput {
-				block["input"] = map[string]interface{}{}
-			}
-		case "tool_result":
-			if _, hasToolID := block["tool_use_id"]; !hasToolID {
-				block["tool_use_id"] = ""
-			}
-			if _, hasContent := block["content"]; !hasContent {
-				block["content"] = ""
-			}
-		case "thinking":
-			if _, hasThinking := block["thinking"]; !hasThinking {
-				block["thinking"] = ""
-			}
-		case "document":
-			if _, hasSource := block["source"]; !hasSource {
-				block["source"] = nil
-			}
-		case "input_audio":
-			if _, hasAudio := block["input_audio"]; !hasAudio {
-				block["input_audio"] = nil
-			}
+	bt, ok := block["type"].(string)
+	if !ok {
+		return
+	}
+	for _, def := range blockDefaults[bt] {
+		if _, has := block[def.Field]; !has {
+			block[def.Field] = def.Value
 		}
 	}
 }
