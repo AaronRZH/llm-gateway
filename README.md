@@ -174,8 +174,6 @@ open http://localhost:8080/admin
 app:
   env: "dev"          # dev | prod
   port: 8080
-  # SSE 可能持续数分钟；保持 0，由 stream.idle_timeout 检测真正的上游卡死。
-  write_timeout: 0s
   # 整体请求预算：单个请求（含全部 fallback 候选）的总超时。
   # 超过该时间仍有候选未成功则终止并返回错误，避免 N×上游超时长时间堆积。
   # 设为 0 表示不限制（沿用各 Provider 的 timeout）。

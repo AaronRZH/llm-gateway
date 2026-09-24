@@ -43,6 +43,23 @@ func newCharUpstream(t *testing.T, status int, contentType, body string) *httpte
 	return srv
 }
 
+// newDelayedSSEUpstream 先发送响应头，再延迟输出完整 SSE。
+// 用于锁定“收到响应头后取消预算 context 会掐断 response body”的回归。
+func newDelayedSSEUpstream(t *testing.T, delay time.Duration, body string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		time.Sleep(delay)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
 // charStack 构建一套最小可用的 handler 依赖栈。
 // managerProvider 是注册到 provider.Manager 的名称，routeProvider 是 real_models 中引用的名称；
 // 二者不一致可用于模拟"路由到不存在的 provider"。
@@ -161,6 +178,21 @@ func TestHandleChatCompletion_Stream_Success(t *testing.T) {
 	}
 }
 
+func TestHandleChatCompletion_Stream_OutlivesRequestBudget(t *testing.T) {
+	sse := "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	srv := newDelayedSSEUpstream(t, 80*time.Millisecond, sse)
+	m, r, s, tok := charStack(t, srv.URL, "openai", "prov", "prov")
+	h := handleChatCompletion(m, r, s, tok, 20*time.Millisecond)
+
+	w := charInvoke(h, "/v1/chat/completions", `{"model":"vm","messages":[{"role":"user","content":"hi"}],"stream":true}`)
+	body := w.Body.String()
+	if !strings.Contains(body, `"finish_reason":"stop"`) {
+		t.Fatalf("stream must outlive non-stream request budget and retain finish_reason, got %q", body)
+	}
+}
+
 // ==================== handleAnthropicMessages ====================
 
 func TestHandleAnthropicMessages_NonStream_Success(t *testing.T) {
@@ -190,6 +222,22 @@ func TestHandleAnthropicMessages_Stream_Success(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "message_stop") {
 		t.Fatalf("expected Anthropic message_stop terminator, got %q", w.Body.String())
+	}
+}
+
+func TestHandleAnthropicMessages_Stream_OutlivesRequestBudget(t *testing.T) {
+	sse := "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	srv := newDelayedSSEUpstream(t, 80*time.Millisecond, sse)
+	m, r, s, tok := charStack(t, srv.URL, "openai", "prov", "prov")
+	h := handleAnthropicMessages(m, r, s, tok, 20*time.Millisecond)
+
+	w := charInvoke(h, "/v1/messages", `{"model":"vm","messages":[{"role":"user","content":"hi"}],"stream":true,"max_tokens":128}`)
+	body := w.Body.String()
+	if !strings.Contains(body, `"stop_reason":"end_turn"`) || !strings.Contains(body, "message_stop") {
+		t.Fatalf("stream must outlive non-stream request budget and complete normally, got %q", body)
 	}
 }
 

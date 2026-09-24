@@ -186,7 +186,6 @@ func selectChatStreamCandidate(
 	sel *router.Selection,
 	req protocol.ChatCompletionRequest,
 	reqCtx context.Context,
-	cancelBudget context.CancelFunc,
 ) (*protocol.Result, *router.Target, string, string, time.Time, error) {
 	var targetProvider string
 	var target *router.Target
@@ -204,10 +203,6 @@ func selectChatStreamCandidate(
 		res, lastErr, retryNext = resolveOpenAICandidate(log, target, req, reqCtx, lastErr)
 		if retryNext {
 			continue
-		}
-		// 流式连接已成功，释放整体预算，避免长连接被预算超时掐断
-		if cancelBudget != nil {
-			cancelBudget()
 		}
 		break
 	}
@@ -228,21 +223,20 @@ func handleChatCompletion(
 		apiKeyVal, _ := c.Get("api_key")
 		apiKey, _ := apiKeyVal.(string)
 
-		// 整体请求预算：所有 fallback 候选共享的总超时，避免 N×上游超时长时间堆积。
-		// 仅在 requestTimeout > 0 时启用；为 0 则沿用各 Provider 自身 Timeout。
-		reqCtx := c.Request.Context()
-		var cancelBudget context.CancelFunc
-		if requestTimeout > 0 {
-			reqCtx, cancelBudget = context.WithTimeout(reqCtx, requestTimeout)
-		}
-		if cancelBudget != nil {
-			defer cancelBudget()
-		}
-
 		var req protocol.ChatCompletionRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
+		}
+
+		// 整体请求预算只限制非流式请求。http.Request context 会绑定
+		// 整个 response body，流式请求若使用该 deadline 或在收到响应头后 cancel，
+		// 都会提前关闭 SSE。流式首字节超时由 Provider.ResponseHeaderTimeout 负责。
+		reqCtx := c.Request.Context()
+		var cancelBudget context.CancelFunc
+		if !req.Stream && requestTimeout > 0 {
+			reqCtx, cancelBudget = context.WithTimeout(reqCtx, requestTimeout)
+			defer cancelBudget()
 		}
 
 		// 1. 模型名 allowlist 校验
@@ -274,7 +268,7 @@ func handleChatCompletion(
 		if req.Stream {
 			// 流式响应 — 遍历候选直到连接成功
 			res, target, upstreamModel, targetProvider, start, lastErr := selectChatStreamCandidate(
-				log, sel, req, reqCtx, cancelBudget,
+				log, sel, req, reqCtx,
 			)
 
 			if res == nil || res.StreamBody == nil {
@@ -860,20 +854,19 @@ func handleAnthropicMessages(
 		apiKey, _ := apiKeyVal.(string)
 		log.Info().Msg("anthropic /messages request")
 
-		// 整体请求预算：所有 fallback 候选共享的总超时。
-		reqCtx := c.Request.Context()
-		var cancelBudget context.CancelFunc
-		if requestTimeout > 0 {
-			reqCtx, cancelBudget = context.WithTimeout(reqCtx, requestTimeout)
-		}
-		if cancelBudget != nil {
-			defer cancelBudget()
-		}
-
 		var req protocol.AnthropicRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
+		}
+
+		// 与 OpenAI handler 一致：流式 response body 不能绑定整体请求预算，
+		// 否则 deadline/cancel 会在最终 message_stop 之前提前关闭 SSE。
+		reqCtx := c.Request.Context()
+		var cancelBudget context.CancelFunc
+		if !req.Stream && requestTimeout > 0 {
+			reqCtx, cancelBudget = context.WithTimeout(reqCtx, requestTimeout)
+			defer cancelBudget()
 		}
 
 		// 1. 模型名 allowlist 校验
@@ -917,12 +910,10 @@ func handleAnthropicMessages(
 			upstreamModel = target.Model
 			targetProvider = target.ProviderName
 
-			// 使用 target 的超时时间设置 context deadline（基于整体预算 reqCtx 派生）。
-			// cancel 的 defer 注册在 handler 函数作用域上（而非本迭代），循环 break 后仍会在
-			// handler 返回时执行——这是刻意的：流式转发依赖该 context 在整个响应生命周期内存活，
-			// 若在此处提前取消会掐断长连接。
+			// target.Timeout 仅用于非流式请求。流式 response body 会继续使用
+			// request context，绑定 deadline 会在最终 message_stop 前截断长连接。
 			var cancel context.CancelFunc
-			if target.Timeout > 0 {
+			if !req.Stream && target.Timeout > 0 {
 				reqCtx, cancel = context.WithTimeout(reqCtx, target.Timeout)
 				defer cancel()
 			}
@@ -932,10 +923,6 @@ func handleAnthropicMessages(
 			protocolResult, lastErr, retryNext = resolveAnthropicCandidate(log, target, clientProtocol, req, reqCtx, lastErr)
 			if retryNext {
 				continue
-			}
-			// 流式连接已成功，释放整体预算，避免长连接被预算超时掐断
-			if cancelBudget != nil {
-				cancelBudget()
 			}
 			break
 		}

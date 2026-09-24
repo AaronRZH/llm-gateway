@@ -4,10 +4,6 @@ app:
   env: "dev" # dev | prod
   port: 8080
   read_timeout: 60s
-  # SSE 响应可能持续数分钟；http.Server 的 WriteTimeout 从请求开始计时，
-  # 不能用作流式空闲超时，否则会在模型生成末尾静默截断工具调用。
-  # 流式卡死由 stream.idle_timeout 控制。
-  write_timeout: 0s
   idle_timeout: 600s
   # 整体请求预算：单个客户端请求（含全部 fallback 候选）的总超时。
   # 超过该时间仍有候选未成功，则终止并向上游返回错误，避免 N×上游超时长时间堆积。

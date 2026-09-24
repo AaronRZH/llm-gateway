@@ -48,7 +48,6 @@ type AppConfig struct {
 	Env          string        `mapstructure:"env" yaml:"env"`
 	Port         int           `mapstructure:"port" yaml:"port"`
 	ReadTimeout  time.Duration `mapstructure:"read_timeout" yaml:"read_timeout"`
-	WriteTimeout time.Duration `mapstructure:"write_timeout" yaml:"write_timeout"`
 	IdleTimeout  time.Duration `mapstructure:"idle_timeout" yaml:"idle_timeout"`
 	// RequestTimeout 整体请求预算：单个客户端请求（含全部 fallback 候选）的总超时。
 	// 超过该时间仍有候选未成功，则终止并向上游返回错误，避免 N×上游超时长时间堆积。
@@ -181,9 +180,6 @@ func Load(path string) (*Config, error) {
 	// 默认值
 	v.SetDefault("app::port", 8080)
 	v.SetDefault("app::read_timeout", 60*time.Second)
-	// 流式响应不能设置整个请求生命周期的 WriteTimeout；否则持续输出的
-	// SSE 也会在截止时间被截断。流空闲由 stream::idle_timeout 单独约束。
-	v.SetDefault("app::write_timeout", 0*time.Second)
 	v.SetDefault("app::idle_timeout", 120*time.Second)
 	v.SetDefault("app::request_timeout", 0*time.Second)
 	v.SetDefault("stream::idle_timeout", 120*time.Second)

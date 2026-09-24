@@ -1,8 +1,6 @@
 app:
   env: "prod"
   port: 8080
-  # 长 SSE 由 stream.idle_timeout 约束，不能设置整个响应生命周期的写超时。
-  write_timeout: 0s
 # 调试开关：生产环境保持关闭，避免暴露 /debug/pprof
 debug:
   pprof_enabled: false

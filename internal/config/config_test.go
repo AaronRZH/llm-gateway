@@ -397,9 +397,6 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.App.ReadTimeout.Seconds() != 60 {
 		t.Errorf("expected read_timeout 60s, got %v", cfg.App.ReadTimeout)
 	}
-	if cfg.App.WriteTimeout != 0 {
-		t.Errorf("expected streaming-safe write_timeout 0, got %v", cfg.App.WriteTimeout)
-	}
 	if cfg.Debug.UpstreamSSELog {
 		t.Error("expected upstream SSE logging to default to disabled")
 	}
