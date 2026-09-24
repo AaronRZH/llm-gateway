@@ -222,7 +222,6 @@ func (h *Handler) RewriteAndForwardWithToolRepair(
 		return result, err
 	}
 
-
 	// 统一补发终止符：上游 [DONE] 已在扫描时被跳过，这里始终补发一个。
 	h.emitStreamTerminator(w, flusher, openAIClient)
 	return result, nil
@@ -496,7 +495,17 @@ func (h *Handler) emitToolCallsChunk(w http.ResponseWriter, flusher http.Flusher
 }
 
 func extractUsage(payload []byte) *StreamUsage {
-	// 尝试 OpenAI 格式: {"choices":[...],"usage":{"prompt_tokens":...}}
+	if u := extractOpenAIUsage(payload); u != nil {
+		return u
+	}
+	if u := extractAnthropicStartUsage(payload); u != nil {
+		return u
+	}
+	return extractAnthropicDeltaUsage(payload)
+}
+
+// extractOpenAIUsage 尝试 OpenAI 格式: {"choices":[...],"usage":{"prompt_tokens":...}}
+func extractOpenAIUsage(payload []byte) *StreamUsage {
 	var resp struct {
 		Usage struct {
 			PromptTokens     int `json:"prompt_tokens"`
@@ -504,17 +513,21 @@ func extractUsage(payload []byte) *StreamUsage {
 			TotalTokens      int `json:"total_tokens"`
 		} `json:"usage"`
 	}
-	if err := json.Unmarshal(payload, &resp); err == nil {
-		if resp.Usage.PromptTokens > 0 || resp.Usage.CompletionTokens > 0 {
-			return &StreamUsage{
-				PromptTokens:     resp.Usage.PromptTokens,
-				CompletionTokens: resp.Usage.CompletionTokens,
-				TotalTokens:      resp.Usage.TotalTokens,
-			}
-		}
+	if err := json.Unmarshal(payload, &resp); err != nil {
+		return nil
 	}
+	if resp.Usage.PromptTokens <= 0 && resp.Usage.CompletionTokens <= 0 {
+		return nil
+	}
+	return &StreamUsage{
+		PromptTokens:     resp.Usage.PromptTokens,
+		CompletionTokens: resp.Usage.CompletionTokens,
+		TotalTokens:      resp.Usage.TotalTokens,
+	}
+}
 
-	// 尝试 Anthropic 格式: message_start 同时含 "input_tokens" 和 "output_tokens"
+// extractAnthropicStartUsage 尝试 Anthropic 格式: message_start 同时含 "input_tokens" 和 "output_tokens"
+func extractAnthropicStartUsage(payload []byte) *StreamUsage {
 	var startChunk struct {
 		Type    string `json:"type"`
 		Message struct {
@@ -522,20 +535,24 @@ func extractUsage(payload []byte) *StreamUsage {
 			OutputTokens int `json:"output_tokens"`
 		} `json:"message"`
 	}
-	if err := json.Unmarshal(payload, &startChunk); err == nil && startChunk.Type == "message_start" {
-		usage := &StreamUsage{}
-		if startChunk.Message.InputTokens > 0 {
-			usage.PromptTokens = startChunk.Message.InputTokens
-		}
-		if startChunk.Message.OutputTokens > 0 {
-			usage.CompletionTokens = startChunk.Message.OutputTokens
-		}
-		if usage.PromptTokens > 0 || usage.CompletionTokens > 0 {
-			return usage
-		}
+	if err := json.Unmarshal(payload, &startChunk); err != nil || startChunk.Type != "message_start" {
+		return nil
 	}
+	usage := &StreamUsage{}
+	if startChunk.Message.InputTokens > 0 {
+		usage.PromptTokens = startChunk.Message.InputTokens
+	}
+	if startChunk.Message.OutputTokens > 0 {
+		usage.CompletionTokens = startChunk.Message.OutputTokens
+	}
+	if usage.PromptTokens <= 0 && usage.CompletionTokens <= 0 {
+		return nil
+	}
+	return usage
+}
 
-	// 尝试 Anthropic 格式: message_delta 中的 "usage" 同时含 "input_tokens" 和 "output_tokens"
+// extractAnthropicDeltaUsage 尝试 Anthropic 格式: message_delta 中的 "usage" 同时含 "input_tokens" 和 "output_tokens"
+func extractAnthropicDeltaUsage(payload []byte) *StreamUsage {
 	var deltaChunk struct {
 		Type  string `json:"type"`
 		Usage struct {
@@ -543,20 +560,20 @@ func extractUsage(payload []byte) *StreamUsage {
 			OutputTokens int `json:"output_tokens"`
 		} `json:"usage"`
 	}
-	if err := json.Unmarshal(payload, &deltaChunk); err == nil && deltaChunk.Type == "message_delta" {
-		usage := &StreamUsage{}
-		if deltaChunk.Usage.InputTokens > 0 {
-			usage.PromptTokens = deltaChunk.Usage.InputTokens
-		}
-		if deltaChunk.Usage.OutputTokens > 0 {
-			usage.CompletionTokens = deltaChunk.Usage.OutputTokens
-		}
-		if usage.PromptTokens > 0 || usage.CompletionTokens > 0 {
-			return usage
-		}
+	if err := json.Unmarshal(payload, &deltaChunk); err != nil || deltaChunk.Type != "message_delta" {
+		return nil
 	}
-
-	return nil
+	usage := &StreamUsage{}
+	if deltaChunk.Usage.InputTokens > 0 {
+		usage.PromptTokens = deltaChunk.Usage.InputTokens
+	}
+	if deltaChunk.Usage.OutputTokens > 0 {
+		usage.CompletionTokens = deltaChunk.Usage.OutputTokens
+	}
+	if usage.PromptTokens <= 0 && usage.CompletionTokens <= 0 {
+		return nil
+	}
+	return usage
 }
 
 // mergeUsage 合并增量 usage（Anthropic 流式拆分 input/output）
