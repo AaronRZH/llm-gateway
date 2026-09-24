@@ -1198,20 +1198,12 @@ func rewriteXMLToolCallsChecked(body []byte, definitions []toolcall.Definition) 
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return body, "", nil
 	}
-	choices, ok := resp["choices"].([]interface{})
-	if !ok || len(choices) == 0 {
-		return body, "", nil
-	}
-	choice0, ok := choices[0].(map[string]interface{})
+	msg, ok := extractMessageFromResp(resp)
 	if !ok {
 		return body, "", nil
 	}
-	msg, ok := choice0["message"].(map[string]interface{})
-	if !ok {
-		return body, "", nil
-	}
-	if definitions != nil {
-		if calls, err := extractOpenAIToolCalls(body); err == nil {
+	if calls, callsErr := extractOpenAIToolCalls(body); callsErr == nil {
+		if definitions != nil {
 			if validateErr := toolcall.ValidateMaps(calls, definitions); validateErr != nil {
 				raw, _ := json.Marshal(calls)
 				return body, string(raw), validateErr
@@ -1222,6 +1214,31 @@ func rewriteXMLToolCallsChecked(body []byte, definitions []toolcall.Definition) 
 	if content == "" {
 		return body, "", nil
 	}
+	return rewriteXMLToolCallsInMessage(resp, msg, content, definitions, body)
+}
+
+// extractMessageFromResp 从已解析的 JSON body 中提取 message map，用于后续 tool_calls 重写。
+// 返回 false 表示 body 不含有效 message。
+func extractMessageFromResp(resp map[string]interface{}) (map[string]interface{}, bool) {
+	choices, ok := resp["choices"].([]interface{})
+	if !ok || len(choices) == 0 {
+		return nil, false
+	}
+	choice0, ok := choices[0].(map[string]interface{})
+	if !ok {
+		return nil, false
+	}
+	msg, ok := choice0["message"].(map[string]interface{})
+	if !ok {
+		return nil, false
+	}
+	return msg, true
+}
+
+// rewriteXMLToolCallsInMessage 将 XML 工具调用从 content 提取并重写到 message 的 tool_calls 字段。
+// 直接在传入的 resp 上修改，保留其他 choices 与 id/model/usage 等字段。
+// 错误路径返回 body 原值，不修改。
+func rewriteXMLToolCallsInMessage(resp map[string]interface{}, msg map[string]interface{}, content string, definitions []toolcall.Definition, body []byte) ([]byte, string, error) {
 	result := toolcall.Normalize(content)
 	if len(result.ToolCalls) == 0 {
 		if toolcall.LooksLikeToolCall(content) {
@@ -1244,7 +1261,11 @@ func rewriteXMLToolCallsChecked(body []byte, definitions []toolcall.Definition) 
 		existing = append(existing, tc)
 	}
 	msg["tool_calls"] = existing
-	choice0["finish_reason"] = "tool_calls"
+	if choices, ok := resp["choices"].([]interface{}); ok && len(choices) > 0 {
+		if choice0, ok := choices[0].(map[string]interface{}); ok {
+			choice0["finish_reason"] = "tool_calls"
+		}
+	}
 	out, err := json.Marshal(resp)
 	if err != nil {
 		return body, content, err
