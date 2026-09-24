@@ -31,6 +31,10 @@ import (
 )
 
 func main() {
+	// Provider 配置中的 ${ENV_VAR} 会在 config.Load 时解析，
+	// 因此必须先把 .env 加载到当前进程环境。
+	loadEnvFile()
+
 	// 加载配置
 	cfg, err := config.Load("configs/config.yaml")
 	if err != nil {

@@ -368,3 +368,28 @@ func TestWrapUpstreamSSE_DisabledReturnsOriginal(t *testing.T) {
 		t.Fatal("disabled capture should return the original body")
 	}
 }
+
+func TestManagerUpdateProvider_EmptyAPIKeyPreservesRuntimeKey(t *testing.T) {
+	m := NewManager(map[string]config.ProviderConfig{
+		"p1": {BaseURL: "http://old", APIKey: "secret-one", Protocol: "openai"},
+	})
+
+	m.UpdateProvider("p1", config.ProviderConfig{BaseURL: "http://new", Protocol: "openai"})
+	got, ok := m.Get("p1")
+	if !ok {
+		t.Fatal("expected provider p1")
+	}
+	if got.apiKey != "secret-one" {
+		t.Fatalf("empty API key should preserve runtime key, got %q", got.apiKey)
+	}
+	if got.baseURL != "http://new" {
+		t.Fatalf("expected other fields to update, got base URL %q", got.baseURL)
+	}
+
+	m.UpdateProvider("p1", config.ProviderConfig{BaseURL: "http://new", APIKey: "secret-two", Protocol: "openai"})
+	m.UpdateProvider("p1", config.ProviderConfig{BaseURL: "http://newer", Protocol: "openai"})
+	got, _ = m.Get("p1")
+	if got.apiKey != "secret-two" {
+		t.Fatalf("empty API key should preserve most recently assigned key, got %q", got.apiKey)
+	}
+}

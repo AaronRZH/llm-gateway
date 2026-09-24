@@ -397,6 +397,30 @@ func (c *Config) SaveProvider(name string, p ProviderConfig) error {
 	return c.writeYAMLDoc(doc)
 }
 
+// SaveProviderPreservingAPIKey 更新 Provider 的非密钥配置，保留 YAML 中原有的 api_key 节点。
+// 用于管理端编辑时 API Key 留空的语义，同时避免将内存中已解析的真实密钥回写到 config.yaml。
+func (c *Config) SaveProviderPreservingAPIKey(name string, p ProviderConfig) error {
+	doc, err := c.readYAMLDoc()
+	if err != nil {
+		return err
+	}
+	root := doc.Content[0]
+	_, providersNode := findMappingKey(root, "providers")
+	if providersNode == nil {
+		return fmt.Errorf("providers key not found in config")
+	}
+	_, providerNode := findMappingKey(providersNode, name)
+	if providerNode == nil || providerNode.Kind != yaml.MappingNode {
+		return fmt.Errorf("provider %q not found in config", name)
+	}
+
+	setMappingKey(providerNode, "base_url", p.BaseURL)
+	setMappingKey(providerNode, "timeout", p.Timeout)
+	setMappingKey(providerNode, "protocol", p.Protocol)
+	setMappingKey(providerNode, "response_header_timeout", p.ResponseHeaderTimeout)
+	return c.writeYAMLDoc(doc)
+}
+
 // DeleteProvider 删除 Provider 配置
 func (c *Config) DeleteProvider(name string) error {
 	doc, err := c.readYAMLDoc()

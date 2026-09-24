@@ -2184,33 +2184,24 @@ func handleAdminUpdateProvider(cfg *config.Config, providerMgr *provider.Manager
 			p.ResponseHeaderTimeout = time.Duration(req.ResponseHeaderTimeout) * time.Second
 		}
 		cfg.Providers[name] = p
-		if err := cfg.SaveProvider(name, cfg.Providers[name]); err != nil {
-			log.Error().Err(err).Msg("failed to save config after updating provider")
+		var saveErr error
+		if req.APIKey == "" {
+			saveErr = cfg.SaveProviderPreservingAPIKey(name, p)
+		} else {
+			saveErr = cfg.SaveProvider(name, p)
+		}
+		if saveErr != nil {
+			log.Error().Err(saveErr).Msg("failed to save config after updating provider")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist config"})
 			return
 		}
 
 		// 立即生效：更新运行时的 Provider
-		// 解析运行时实际使用的 API Key：
-		//   - 提交了新的 api_key 时直接用该值；
-		//   - 否则从现有引用（如 ${SENSENOVA_API_KEY}）解析出实际值，避免把运行时 key 清空导致 401。
-		// 注意：providerMgr.Get 返回的是值拷贝，不能靠 SetAPIKey 改副本，必须把有效 key 直接传入 UpdateProvider。
-		runtimeKey := actualKey
-		if runtimeKey == "" {
-			ref := p.APIKey
-			if strings.HasPrefix(ref, "$") && strings.HasSuffix(ref, "}") {
-				if envVal := os.Getenv(ref[2 : len(ref)-1]); envVal != "" {
-					runtimeKey = envVal
-				} else {
-					runtimeKey = ref // 兜底：env 未加载时仍保留引用串
-				}
-			} else {
-				runtimeKey = ref
-			}
-		}
+		// 提交新 Key 时使用新值；留空时由 Manager 继承当前内存中的真实 Key。
+		// 不再从 os.Getenv 重新解析，因为写入 .env 不会刷新当前进程环境。
 		providerMgr.UpdateProvider(name, config.ProviderConfig{
 			BaseURL:               p.BaseURL,
-			APIKey:                runtimeKey,
+			APIKey:                actualKey,
 			Protocol:              p.Protocol,
 			Timeout:               p.Timeout,
 			ResponseHeaderTimeout: p.ResponseHeaderTimeout,

@@ -176,8 +176,15 @@ func (m *Manager) Get(name string) (Provider, bool) {
 	return p, ok
 }
 
-// UpdateProvider 更新或新增 Provider 配置（运行时生效）
+// UpdateProvider 更新或新增 Provider 配置（运行时生效）。
+// 已存在的 Provider 在 cfg.APIKey 为空时保留当前运行时 Key；
+// 管理端将“留空”定义为不修改 Key，不应把它重建为空密钥。
 func (m *Manager) UpdateProvider(name string, cfg config.ProviderConfig) {
+	if cfg.APIKey == "" {
+		if current, ok := m.providers[name]; ok {
+			cfg.APIKey = current.apiKey
+		}
+	}
 	p := NewProvider(cfg, m.debug)
 	p.SetName(name)
 	m.providers[name] = p

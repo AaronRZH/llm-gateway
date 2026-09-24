@@ -3,7 +3,9 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -174,6 +176,45 @@ func TestSaveProvider(t *testing.T) {
 	}
 	if _, ok := cfg2.Providers["p2"]; !ok {
 		t.Error("expected p2 saved")
+	}
+}
+
+func TestSaveProviderPreservingAPIKey(t *testing.T) {
+	path := writeTempConfig(t)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withKey := strings.Replace(string(data), "    base_url: http://example.com\n", "    base_url: http://example.com\n    api_key: ${P1_API_KEY}\n", 1)
+	if err := os.WriteFile(path, []byte(withKey), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &Config{filePath: path}
+	err = cfg.SaveProviderPreservingAPIKey("p1", ProviderConfig{
+		BaseURL:               "http://updated.example.com",
+		APIKey:                "resolved-secret-must-not-be-written",
+		Protocol:              "anthropic",
+		Timeout:               30 * time.Second,
+		ResponseHeaderTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	saved, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(saved)
+	if !strings.Contains(text, "api_key: ${P1_API_KEY}") {
+		t.Fatalf("expected original API key reference to be preserved, got:\n%s", text)
+	}
+	if strings.Contains(text, "resolved-secret-must-not-be-written") {
+		t.Fatal("resolved API key leaked into config file")
+	}
+	if !strings.Contains(text, "base_url: http://updated.example.com") || !strings.Contains(text, "protocol: anthropic") {
+		t.Fatalf("expected non-key fields to be updated, got:\n%s", text)
 	}
 }
 
