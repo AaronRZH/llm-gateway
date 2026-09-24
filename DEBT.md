@@ -31,11 +31,11 @@ go tool cover -func=coverage.out
 | 指标 | 当前值 |
 |------|--------|
 | 生产 Go 文件数 | 28 |
-| 函数/方法数 | 397 |
-| 代码行 | 8674 |
-| 平均函数复杂度 | 4.45 |
-| 最大函数复杂度 | 20（`handleCountTokens`） |
-| 最大函数行数 | 113（`handleCountTokens`） |
+| 函数/方法数 | 399 |
+| 代码行 | 8664 |
+| 平均函数复杂度 | 4.42 |
+| 最大函数复杂度 | 20（`Normalize` / `ConvertResponse` / `OpenAIStreamConverter.convert`） |
+| 最大函数行数 | 92（`Normalize` / `AnthropicSSEConverter.convert`） |
 | 测试文件数 | 26 |
 | 总语句覆盖率 | 61.3% |
 
@@ -43,7 +43,6 @@ go tool cover -func=coverage.out
 
 | 函数 | 位置 | 复杂度 | 行数 |
 |------|------|--------|------|
-| `handleCountTokens` | `cmd/gateway/handlers.go` | 20 | 113 |
 | `Normalize` | `internal/toolcall/toolcall.go` | 20 | 92 |
 | `ConvertResponse` | `internal/provider/anthropic_converter.go` | 20 | 86 |
 | `OpenAIStreamConverter.convert` | `internal/stream/anthropic_sse.go` | 20 | 79 |
@@ -52,8 +51,9 @@ go tool cover -func=coverage.out
 | `ConvertResponseWithModel` | `internal/provider/anthropic_converter.go` | 19 | 80 |
 | `completeContentBlock` | `internal/provider/anthropic_converter.go` | 19 | 43 |
 | `AdminAuth` | `internal/middleware/adminauth.go` | 18 | 70 |
+| `rewriteXMLToolCallsChecked` | `cmd/gateway/handlers.go` | 17 | 58 |
 
-> 复杂度基线已从阶段 1 的最高值 48 降至 20。`RewriteAndForwardWithToolRepair`（原 C=48）、`ConvertAnthropicMessagesToOpenAI`（原 C=23）、`handleAnthropicMessages`（原 C=28）与 `handleChatCompletion`（原 C=25）均已拆分，不再进入前 9 名。剩余热点集中在 `handleCountTokens`（C=20）和 `internal/provider` 的 `ConvertResponse` 链路。
+> 复杂度基线已从阶段 1 的最高值 48 降至 20。`RewriteAndForwardWithToolRepair`（原 C=48）、`ConvertAnthropicMessagesToOpenAI`（原 C=23）、`handleAnthropicMessages`（原 C=28）、`handleChatCompletion`（原 C=25）与 `handleCountTokens`（原 C=20）均已拆分，不再进入前 9 名。剩余热点集中在 `internal/provider` 的 `ConvertResponse` 链路和 `internal/toolcall` 的 `Normalize`。
 
 重点包覆盖率：
 
@@ -121,6 +121,7 @@ go tool cover -func=coverage.out
 | `internal/storage`（postgres 纯函数） | 新增 `postgres_test.go`（`buildDSN`、`parseTimeRange`、`FileStorage.compact`/`AdminDailyStats`） | `buildDSN` 0% → 100%，`parseTimeRange` 0% → 100%，`compact` 0% → 100% |
 | `cmd/gateway`（`handleAnthropicMessages`） | 拆为 4 个函数（`resolveAnthropicCandidate`、`forwardUpstreamErrorIfPresent`、`forwardStreamResponse`、`forwardNonStreamResponse`），8 个 characterization tests 保持通过 | C=28 → 15（达成 ≤15 目标），222 → 121 行 |
 | `cmd/gateway`（`handleChatCompletion`） | 拆为 4 个函数（`resolveOpenAICandidate`、`forwardOpenAIStreamResponse`、`forwardOpenAINonStreamResponse`、`selectChatStreamCandidate`），10 个 characterization tests 保持通过 | C=25 → 14（达成 ≤15 目标），219 → 112 行 |
+| `cmd/gateway`（`handleCountTokens`） | 拆为 2 个函数（`resolveCountTokensTarget`、`proxyCountTokensResponse`），消除两条 CountTokens 路径的重复调用/解析/转发逻辑（~60 行 → 1 个函数），既有测试保持通过 | C=20 → <12（跌破 metrics 显示阈值），113 → 33 行 |
 
 **总语句覆盖率：56.3% → 61.3%**。
 
@@ -205,10 +206,10 @@ P0 表示当前缺少足够回归保护，继续修改可能造成认证、协�
 
 **现状**
 
-- 2181 LOC、80 个函数。
+- 2171 LOC、82 个函数。
 - 同时包含用户请求、协议适配、工具调用修复、用量统计和管理后台处理逻辑。
 - 主要风险不是单纯文件过长，而是核心请求编排与多种细节逻辑共同变化。
-- **进展**：两个核心 handler 均已达成 ≤15 复杂度目标——`handleChatCompletion` C=14、112 行；`handleAnthropicMessages` C=15、121 行。编排行数略超 100 行目标（特殊说明：含大量 error 处理和注释，实际逻辑行数约 80）。
+- **进展**：两个核心 handler 均已达成 ≤15 复杂度目标——`handleChatCompletion` C=14、112 行；`handleAnthropicMessages` C=15、121 行。`handleCountTokens` 亦已拆分（C=20 → <12、113 → 33 行）。编排行数略超 100 行目标（特殊说明：含大量 error 处理和注释，实际逻辑行数约 80）。
 
 **行动**
 
